@@ -1,18 +1,40 @@
 --- a/third_party/ffmpeg/BUILD.gn
 +++ b/third_party/ffmpeg/BUILD.gn
-@@ -273,6 +273,9 @@
+@@ -238,6 +238,21 @@
+   # in many large global arrays (and associated code) into chrome.dll.
+   link_target_type = "static_library"
+ }
++
++if (is_linux) {
++  source_set("ffmpeg_vulkan_util") {
++    sources = [ "libavutil/vulkan.c" ]
++    include_dirs = [
++      platform_config_root,
++      ".",
++    ]
++    defines = [ "HAVE_AV_CONFIG_H", "_POSIX_C_SOURCE=200112", "_XOPEN_SOURCE=600", "PIC" ]
++    deps = [ "//third_party/vulkan-headers/src:vulkan_headers" ]
++    configs -= [ "//build/config/compiler:chromium_code" ]
++    configs += [ "//build/config/compiler:no_chromium_code", "//build/config/compiler:no_incompatible_pointer_warnings", ":ffmpeg_warnings" ]
++  }
++}
++
+ target(link_target_type, "ffmpeg_internal") {
+   sources = ffmpeg_c_sources + ffmpeg_gas_sources + [
+               "$platform_config_root/config.h",
+@@ -273,6 +287,9 @@
    deps = [
      ":ffmpeg_features",
      "//third_party/opus",
    ]
 +  if (is_linux) {
-+    deps += [ "//third_party/vulkan-headers/src:vulkan_headers" ]
++    deps += [ ":ffmpeg_vulkan_util", "//third_party/vulkan-headers/src:vulkan_headers" ]
 +  }
  
    configs -= [ "//build/config/compiler:chromium_code" ]
 --- a/third_party/ffmpeg/ffmpeg_generated.gni
 +++ b/third_party/ffmpeg/ffmpeg_generated.gni
-@@ -613,3 +613,16 @@
+@@ -613,3 +613,15 @@
      (is_android && current_cpu == "x86")) {
    ffmpeg_c_sources += [ "compat/strtod.c" ]
  }
@@ -26,7 +48,6 @@
 +    "libavcodec/vulkan_video.c",
 +    "libavcodec/vulkan_vp9.c",
 +    "libavutil/hwcontext_vulkan.c",
-+    "libavutil/vulkan.c",
 +  ]
 +}
 --- a/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config.h
