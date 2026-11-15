@@ -1,26 +1,30 @@
-# Taslak 03: Vulkan Video Decoding (`VkVideo`)
+# Taslak 03: Vulkan Video Decoding (`VkVideo` via FFmpeg `AV_HWDEVICE_TYPE_VULKAN`)
 
-> **Durum:** Taslak (Chromium 157 `media/gpu/` ve `media/mojo/` yapısına göre geliştirilecek)
+> **Durum:** Taslak — Firefox'un `FFmpegVulkanVideoDecoder` (`patches/drafts/reference/FFmpegVulkanVideoDecoder.{h,cpp}`) referansı baz alınarak Chromium'a uyarlanacak.
 
-## Mimari Yaklaşım
-1. **Feature Flag (`media/base/media_switches.h/.cc`):**
-   * `BASE_FEATURE(kVulkanVideoDecode, "VulkanVideoDecode", base::FEATURE_ENABLED_BY_DEFAULT);`
-2. **Vulkan Device Uzantıları (`gpu/vulkan/vulkan_device_queue.cc`):**
-   * `VK_KHR_video_queue`
-   * `VK_KHR_video_decode_queue`
-   * `VK_KHR_video_decode_h264`, `VK_KHR_video_decode_h265`, `VK_KHR_video_decode_av1` (sürücü destekliyorsa dinamik olarak etkinleştirilir)
-3. **`VulkanVideoDecoder` (`media/gpu/vulkan/`):**
-   * Chromium'un `VideoDecoderMixin` arayüzünü uygular.
-   * Bitstream ayrıştırma için Chromium'un mevcut `H264Decoder` / `H265Decoder` / `AV1Decoder` (`AcceleratedVideoDecoder` + `Accelerator` pattern) sınıflarını yeniden kullanır!
-   * Her kare için `VkVideoSessionKHR` + DPB (Decoded Picture Buffer) slotlarını yönetir ve `vkCmdDecodeVideoKHR` ile decode komutlarını Vulkan kuyruğuna (`VK_QUEUE_VIDEO_DECODE_BIT_KHR`) gönderir.
-   * Çıktı `VkImage` doğrudan `SharedImage` / DMA-BUF üzerinden Skia/ANGLE compositor'a sıfır kopya (zero-copy) ile aktarılır.
-4. **Dekoder Seçimi (`media/mojo/services/gpu_mojo_media_client_linux.cc`):**
-   * `kVulkanVideoDecode` etkinse ve GPU Vulkan Video Decode kuyruğu sunuyorsa öncelikle `VulkanVideoDecoder` seçilir; desteklenmeyen kodeklerde (ör. VP9) otomatik olarak VA-API'ye (`VaapiVideoDecoder`) düşülür.
+## Neden FFmpeg Vulkan Hwaccel?
+Sıfırdan H.264/H.265/AV1 bitstream parser + `VK_KHR_video_decode_*` komut üreticisi yazmak yerine, Chromium'un zaten kullandığı `FFmpegVideoDecoder` (`libavcodec`) üzerinden `AV_HWDEVICE_TYPE_VULKAN` donanım hızlandırmasını kullanmak çok daha temiz ve sürdürülebilirdir:
+* H.264, H.265/HEVC, AV1 (ve sürücü destekledikçe VP9) tek merkezden çözülür.
+* AMD (RADV), Intel (ANV) ve NVIDIA (proprietary Vulkan) üzerinde aynı arayüzle çalışır.
 
-## Hedeflenen Dosyalar
-* `media/base/media_switches.h` & `media/base/media_switches.cc`
-* `media/gpu/BUILD.gn`
-* `media/gpu/vulkan/vulkan_video_decoder.h` & `vulkan_video_decoder.cc`
-* `media/gpu/vulkan/vulkan_video_decode_accelerator_delegate.cc`
-* `media/mojo/services/gpu_mojo_media_client_linux.cc`
-* `gpu/vulkan/vulkan_device_queue.cc`
+## Firefox Referansından Uyarlanacak Kritik Parçalar
+1. **Fiziksel Aygıt & Modifier Pazarlığı (`InitDrmModifiers`, `SelectVulkanDecoderPhysicalDevice`):**
+   * Compositor'ın (Wayland/Ozone `zwp_linux_dmabuf_v1`) desteklediği DRM modifier'lar ile Vulkan `vkGetPhysicalDeviceImageFormatProperties2` sorgusunu kesiştirme.
+   * NVIDIA için `LINEAR` dışında `BLOCK_LINEAR` modifier fallback (`mForcedNvidiaBlockLinear`).
+2. **Çift Yol (Zero-Copy Map + Copy Ring Buffer):**
+   * **Yol A (Zero-Copy):** Dekode edilen `AVFrame` (`AV_PIX_FMT_VULKAN`) doğrudan compositor uyumlu bir DRM modifier taşıyorsa `av_hwframe_map` ile `AV_PIX_FMT_DRM_PRIME` olarak sarılır.
+   * **Yol B (GPU-to-GPU Copy Ring Buffer):** FFmpeg opaque/optimal tiling ile dekode ettiyse, 32 slotlu NV12 `VkImage` ring buffer'a `vkCmdCopyImage` ile kopyalanıp `vkGetMemoryFdKHR` + `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT` ile DMA-BUF fd olarak dışa aktarılır.
+3. **Senkronizasyon:**
+   * `AVVulkanDeviceContext.queue_flags` ile uyumlu `vkGetDeviceQueue2` kullanımı (`VUID-vkGetDeviceQueue-flags-01841`).
+
+## Chromium Tarafında Uyarlama Noktaları
+* **`third_party/ffmpeg/`:** Chromium'un gömülü FFmpeg yapılandırmasında `hwcontext_vulkan` ve `*_vulkan` hwaccel'lerin açık olduğundan emin olmak (veya sistem FFmpeg / GN config güncellemesi).
+* **`media/base/media_switches.h/.cc`:** `kVulkanVideoDecode` feature flag'i.
+* **`media/filters/ffmpeg_video_decoder.cc` (veya `media/gpu/vulkan/`):**
+  * `AVCodecContext::get_format` callback'inde `AV_PIX_FMT_VULKAN` seçimi.
+  * Çıktı `AVFrame` -> DMA-BUF fd (`gfx::NativePixmapHandle`) -> `media::VideoFrame::WrapExternalGpuMemoryBuffer` / `SharedImage` (`OzoneImageBacking`) dönüşümü.
+* **`media/mojo/services/gpu_mojo_media_client_linux.cc`:** `kVulkanVideoDecode` etkin ve GPU destekli ise önceliklendirme, aksi halde VA-API'ye düşüş.
+
+## Referans Dosyalar
+* [FFmpegVulkanVideoDecoder.h](file:///home/eren/Projects/vulcanium/patches/drafts/reference/FFmpegVulkanVideoDecoder.h)
+* [FFmpegVulkanVideoDecoder.cpp](file:///home/eren/Projects/vulcanium/patches/drafts/reference/FFmpegVulkanVideoDecoder.cpp)
