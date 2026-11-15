@@ -1,0 +1,35 @@
+--- a/media/base/media_switches.h
++++ b/media/base/media_switches.h
+@@ -470,6 +470,7 @@ MEDIA_EXPORT BASE_DECLARE_FEATURE(kPreferV4L2VideoAcceleration);
+ MEDIA_EXPORT BASE_DECLARE_FEATURE(kPulseaudioLoopbackForCast);
+ MEDIA_EXPORT BASE_DECLARE_FEATURE(kPulseaudioLoopbackForScreenShare);
+ MEDIA_EXPORT BASE_DECLARE_FEATURE(kVaapiIgnoreDriverChecks);
++MEDIA_EXPORT BASE_DECLARE_FEATURE(kVulkanVideoDecode);
+ #endif  // BUILDFLAG(IS_LINUX)
+ 
+ #if BUILDFLAG(IS_MAC)
+--- a/media/base/media_switches.cc
++++ b/media/base/media_switches.cc
+@@ -1509,6 +1509,10 @@ BASE_FEATURE(kPulseaudioLoopbackForScreenShare,
+ // Intended for manual usage only in order to gauge the status of newer driver
+ // implementations.
+ BASE_FEATURE(kVaapiIgnoreDriverChecks, base::FEATURE_DISABLED_BY_DEFAULT);
++
++// Enables Vulkan Video hardware decoding (VK_KHR_video_decode_queue / FFmpeg
++// AV_HWDEVICE_TYPE_VULKAN) on Linux when Vulkan is active.
++BASE_FEATURE(kVulkanVideoDecode, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+ #endif  // BUILDFLAG(IS_LINUX)
+ 
+--- a/media/mojo/services/gpu_mojo_media_client_linux.cc
++++ b/media/mojo/services/gpu_mojo_media_client_linux.cc
+@@ -140,7 +140,8 @@ VideoDecoderType GetPreferredLinuxVideoDecoderType(
+           // NVIDIA drivers have a broken implementation of most va_* methods,
+           // ARM & AMD aren't tested yet, and ImgTec/Qualcomm don't have a vaapi
+           // driver.
+-          if (base::FeatureList::IsEnabled(kVaapiIgnoreDriverChecks)) {
++          if (base::FeatureList::IsEnabled(kVaapiIgnoreDriverChecks) ||
++              base::FeatureList::IsEnabled(kVulkanVideoDecode)) {
+             return VideoDecoderType::kVaapi;
+           }
+           return VideoDecoderType::kUnknown;

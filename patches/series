@@ -1,14 +1,14 @@
-# Ordered list of Vulcanium patches applied on top of Chromium.
+# Ordered list of Vulcanium patches applied on top of Chromium 157.0.8103.78.
 # Paths are relative to patches/.
 
 # Branding
-# branding/0001-vulcanium-branding.patch
+branding/0001-vulcanium-branding.patch
 
 # Vulkan & ANGLE
-# vulkan/0001-angle-dmabuf-vulkan-fallback.patch
-
-# Vulkan Video Decoding (VkVideo)
-# video-decode/0001-vulkan-video-decoder-scaffold.patch
+vulkan/0001-angle-dmabuf-graceful-fallback.patch
 
 # Wayland / Ozone
-# wayland/0001-ozone-wayland-vulkan-enable.patch
+wayland/0001-ozone-wayland-vulkan-enable.patch
+
+# Vulkan Video Decoding
+video-decode/0001-enable-vulkan-video-flag-and-linux-client.patch

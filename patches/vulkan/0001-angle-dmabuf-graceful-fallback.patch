@@ -1,0 +1,13 @@
+--- a/third_party/angle/src/libANGLE/renderer/vulkan/linux/DmaBufImageSiblingVkLinux.cpp
++++ b/third_party/angle/src/libANGLE/renderer/vulkan/linux/DmaBufImageSiblingVkLinux.cpp
+@@ -609,8 +609,8 @@ angle::Result DmaBufImageSiblingVkLinux::initImpl(DisplayVk *displayVk)
+         }
+     }
+ 
+-    // Failed to find any suitable format
+-    ANGLE_VK_UNREACHABLE(displayVk);
++    // Failed to find any suitable format/modifier combination; return Stop gracefully
++    // instead of triggering a fatal GPU process crash loop.
+     return angle::Result::Stop;
+ }
+ 
