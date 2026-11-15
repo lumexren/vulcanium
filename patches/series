@@ -9,6 +9,7 @@ vulkan/0001-angle-dmabuf-graceful-fallback.patch
 
 # Wayland / Ozone
 wayland/0001-ozone-wayland-vulkan-enable.patch
+wayland/0002-wayland-gbm-vulkan-modifier-fallback.patch
 
 # Vulkan Video Decoding
 video-decode/0001-enable-vulkan-video-flag-and-linux-client.patch

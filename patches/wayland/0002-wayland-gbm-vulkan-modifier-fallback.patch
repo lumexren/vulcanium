@@ -1,0 +1,18 @@
+--- a/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
++++ b/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
+@@ -86,7 +86,14 @@ bool GbmPixmapWayland::InitializeBuffer(
+     // rendering, while wlroots would announce MOD_LINEAR and MOD_INVALID).
+     // In such cases gbm_bo allocation may fail, where we should fallback to
+     // creation without modifiers, and leave the choices to driver.
+-    if (!gbm_bo_ && buffer_manager_->AllowsImplicitModifierForFormat(format)) {
++    if (!gbm_bo_) {
++      std::vector<uint64_t> linear_mod = {DRM_FORMAT_MOD_LINEAR};
++      gbm_bo_ = gbm_device->CreateBufferWithModifiers(
++          fourcc_format, size, gbm_flags, linear_mod);
++    }
++    if (!gbm_bo_) {
++      // Final fallback to implicit modifier creation so Wayland + Vulkan
++      // doesn't lose the swapchain and render a black screen.
+       gbm_bo_ = gbm_device->CreateBuffer(fourcc_format, size, gbm_flags);
+     }
+   }
