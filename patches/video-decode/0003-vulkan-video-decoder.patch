@@ -69,29 +69,37 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,322 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "media/gpu/vulkan/vulkan_video_decoder.h"
 +
++#include <unistd.h>
++
 +#include <algorithm>
 +#include <cstring>
++#include <vector>
 +
++#include "base/files/scoped_file.h"
 +#include "base/functional/bind.h"
 +#include "base/logging.h"
 +#include "base/numerics/safe_conversions.h"
++#include "base/posix/eintr_wrapper.h"
 +#include "base/task/bind_post_task.h"
 +#include "base/task/sequenced_task_runner.h"
++#include "media/base/color_plane_layout.h"
 +#include "media/base/decoder_buffer.h"
 +#include "media/base/media_log.h"
 +#include "media/base/video_frame.h"
++#include "media/base/video_frame_layout.h"
 +#include "media/ffmpeg/ffmpeg_common.h"
 +
 +extern "C" {
 +#include <libavcodec/avcodec.h>
 +#include <libavutil/hwcontext.h>
++#include <libavutil/hwcontext_drm.h>
 +#include <libavutil/pixfmt.h>
 +}
 +
@@ -273,13 +281,72 @@
 +}
 +
 +bool VulkanVideoDecoder::EmitFrame(AVFrame* hw_frame) {
++  const gfx::Size coded_size(hw_frame->width, hw_frame->height);
++  const gfx::Rect visible_rect(coded_size);
++  const auto pts =
++      ConvertFromTimeBase(codec_context_->pkt_timebase, hw_frame->pts);
++
++  // Zero-copy path: map AV_PIX_FMT_VULKAN -> AV_PIX_FMT_DRM_PRIME and wrap
++  // exported DMA-BUF file descriptors directly into a VideoFrame.
++  if (hw_frame->format == AV_PIX_FMT_VULKAN) {
++    AVFrame* drm_frame = av_frame_alloc();
++    if (drm_frame) {
++      drm_frame->format = AV_PIX_FMT_DRM_PRIME;
++      if (av_hwframe_map(drm_frame, hw_frame, AV_HWFRAME_MAP_READ) == 0) {
++        const auto* desc =
++            reinterpret_cast<const AVDRMFrameDescriptor*>(drm_frame->data[0]);
++        if (desc && desc->nb_layers > 0 && desc->layers[0].nb_planes > 0) {
++          const AVDRMLayerDescriptor& layer = desc->layers[0];
++          std::vector<ColorPlaneLayout> planes;
++          std::vector<base::ScopedFD> dmabuf_fds;
++          bool fds_ok = true;
++          uint64_t modifier = desc->objects[0].format_modifier;
++
++          for (int i = 0; i < layer.nb_planes; ++i) {
++            int obj_idx = layer.planes[i].object_index;
++            if (obj_idx < 0 || obj_idx >= desc->nb_objects) {
++              fds_ok = false;
++              break;
++            }
++            base::ScopedFD dup_fd(HANDLE_EINTR(dup(desc->objects[obj_idx].fd)));
++            if (!dup_fd.is_valid()) {
++              fds_ok = false;
++              break;
++            }
++            planes.emplace_back(layer.planes[i].pitch, layer.planes[i].offset,
++                                desc->objects[obj_idx].size);
++            dmabuf_fds.push_back(std::move(dup_fd));
++          }
++
++          if (fds_ok) {
++            auto layout = VideoFrameLayout::CreateWithPlanes(
++                PIXEL_FORMAT_NV12, coded_size, std::move(planes),
++                VideoFrameLayout::kBufferAddressAlignment, modifier);
++            if (layout) {
++              auto video_frame = VideoFrame::WrapExternalDmabufs(
++                  *layout, visible_rect, coded_size, std::move(dmabuf_fds),
++                  pts);
++              if (video_frame) {
++                video_frame->metadata().power_efficient = true;
++                video_frame->AddDestructionObserver(base::BindOnce(
++                    [](AVFrame* frame) { av_frame_free(&frame); }, drm_frame));
++                output_cb_.Run(std::move(video_frame));
++                return true;
++              }
++            }
++          }
++        }
++      }
++      av_frame_free(&drm_frame);
++    }
++  }
++
++  // Fallback path: transfer Vulkan surface to host NV12 VideoFrame.
 +  AVFrame* sw_frame = av_frame_alloc();
 +  if (!sw_frame) {
 +    return false;
 +  }
 +
-+  // Transfer Vulkan surface to NV12/YUV420P VideoFrame; zero-copy DMA-BUF
-+  // SharedImage wrapping can be layered here via AV_PIX_FMT_DRM_PRIME.
 +  int ret = (hw_frame->format == AV_PIX_FMT_VULKAN)
 +                ? av_hwframe_transfer_data(sw_frame, hw_frame, 0)
 +                : av_frame_ref(sw_frame, hw_frame);
@@ -287,11 +354,6 @@
 +    av_frame_free(&sw_frame);
 +    return false;
 +  }
-+
-+  const gfx::Size coded_size(sw_frame->width, sw_frame->height);
-+  const gfx::Rect visible_rect(coded_size);
-+  const auto pts =
-+      ConvertFromTimeBase(codec_context_->pkt_timebase, hw_frame->pts);
 +
 +  auto video_frame = VideoFrame::CreateFrame(PIXEL_FORMAT_NV12, coded_size,
 +                                             visible_rect, coded_size, pts);
