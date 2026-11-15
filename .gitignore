@@ -1,0 +1,18 @@
+# Downloaded / extracted source & build artifacts
+src/
+pkg/
+out/
+build/
+*.tar.xz
+*.tar.gz
+*.zst
+chromium-*/
+crubit/
+
+# Upstream reference clone
+.arch-chromium-upstream/
+
+# Editor / OS
+.DS_Store
+*.swp
+*~

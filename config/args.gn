@@ -1,0 +1,31 @@
+# Vulcanium shared GN build arguments
+# Used by scripts/build.sh and merged in arch/PKGBUILD
+
+is_official_build = true
+symbol_level = 0
+treat_warnings_as_errors = false
+fatal_linker_warnings = false
+disable_fieldtrial_testing_config = true
+blink_enable_generated_code_formatting = false
+
+# Codecs & Media
+ffmpeg_branding = "Chrome"
+proprietary_codecs = true
+enable_widevine = true
+
+# Graphics / Vulkan / Wayland
+enable_vulkan = true
+use_dawn = true
+ozone_platform_wayland = true
+ozone_platform_x11 = true
+rtc_use_pipewire = true
+link_pulseaudio = true
+
+# Desktop integration
+use_qt5 = false
+use_qt6 = true
+use_sysroot = false
+use_system_libffi = true
+use_custom_libcxx = true
+use_clang_modules = false
+enable_hangout_services_extension = true
