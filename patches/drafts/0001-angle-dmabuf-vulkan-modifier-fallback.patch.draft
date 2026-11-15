@@ -1,0 +1,28 @@
+# DRAFT PATCH - Do not add to patches/series before rebasing against actual Chromium 157 source!
+# Target: third_party/angle/src/libANGLE/renderer/vulkan/linux/DmaBufImageSiblingVkLinux.cpp
+
+--- a/third_party/angle/src/libANGLE/renderer/vulkan/linux/DmaBufImageSiblingVkLinux.cpp
++++ b/third_party/angle/src/libANGLE/renderer/vulkan/linux/DmaBufImageSiblingVkLinux.cpp
+@@ -600,10 +600,19 @@ angle::Result DmaBufImageSiblingVkLinux::initImpl(DisplayVk *displayVk)
+     // DRAFT: When DRM modifier + mutable format fails feature validation on Mesa/NVIDIA,
+     // retry without VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT or fall back to non-modifier query
+     // instead of triggering an unrecoverable GPU process crash.
+-    ANGLE_VK_TRY(displayVk,
+-                 vkGetPhysicalDeviceImageFormatProperties2(
+-                     renderer->getPhysicalDevice(), &imageFormatInfo, &imageFormatProperties));
++    VkResult fmtResult = vkGetPhysicalDeviceImageFormatProperties2(
++        renderer->getPhysicalDevice(), &imageFormatInfo, &imageFormatProperties);
++    if (fmtResult == VK_ERROR_FORMAT_NOT_SUPPORTED &&
++        (imageFormatInfo.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
++    {
++        imageFormatInfo.flags &= ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
++        fmtResult = vkGetPhysicalDeviceImageFormatProperties2(
++            renderer->getPhysicalDevice(), &imageFormatInfo, &imageFormatProperties);
++    }
++    if (fmtResult != VK_SUCCESS)
++    {
++        return angle::Result::Stop;
++    }
+ 
+     return angle::Result::Continue;
+ }

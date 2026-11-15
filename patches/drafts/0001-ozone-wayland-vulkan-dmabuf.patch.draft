@@ -1,0 +1,16 @@
+# DRAFT PATCH - Do not add to patches/series before rebasing against actual Chromium 157 source!
+# Target: ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
+
+--- a/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
++++ b/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
+@@ -210,6 +210,10 @@ std::vector<gl::GLImplementationParts>
+ WaylandSurfaceFactory::GetAllowedGLImplementations() {
+   std::vector<gl::GLImplementationParts> impls;
+   if (egl_implementation_) {
++    // DRAFT: Ensure ANGLE with Vulkan backend is explicitly permitted under
++    // Ozone/Wayland alongside EGL/GLES2.
++    impls.emplace_back(gl::GLImplementationParts(
++        gl::ANGLEImplementation::kVulkan));
+     impls.emplace_back(gl::GLImplementationParts(
+         gl::ANGLEImplementation::kOpenGL));
+     impls.emplace_back(gl::GLImplementationParts(

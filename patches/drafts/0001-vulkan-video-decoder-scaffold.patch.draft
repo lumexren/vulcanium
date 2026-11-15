@@ -1,0 +1,33 @@
+# DRAFT PATCH - Do not add to patches/series before rebasing against actual Chromium 157 source!
+# Target: media/base/media_switches.h & media/base/media_switches.cc & media/mojo/services/gpu_mojo_media_client_linux.cc
+
+--- a/media/base/media_switches.h
++++ b/media/base/media_switches.h
+@@ -400,6 +400,7 @@ MEDIA_EXPORT BASE_DECLARE_FEATURE(kUseOutOfProcessVideoDecoding);
+ #if BUILDFLAG(IS_LINUX)
+ MEDIA_EXPORT BASE_DECLARE_FEATURE(kVaapiVideoDecodeLinux);
+ MEDIA_EXPORT BASE_DECLARE_FEATURE(kVaapiVideoDecodeLinuxGL);
++MEDIA_EXPORT BASE_DECLARE_FEATURE(kVulkanVideoDecode);
+ #endif  // BUILDFLAG(IS_LINUX)
+ 
+--- a/media/base/media_switches.cc
++++ b/media/base/media_switches.cc
+@@ -800,6 +800,9 @@ BASE_FEATURE(kVaapiVideoDecodeLinuxGL,
+ #if BUILDFLAG(IS_LINUX)
++BASE_FEATURE(kVulkanVideoDecode,
++             "VulkanVideoDecode",
++             base::FEATURE_ENABLED_BY_DEFAULT);
+ #endif
+ 
+--- a/media/mojo/services/gpu_mojo_media_client_linux.cc
++++ b/media/mojo/services/gpu_mojo_media_client_linux.cc
+@@ -60,6 +60,11 @@ VideoDecoderType GetPreferredLinuxVideoDecoderType(
+     const gpu::GpuPreferences& gpu_preferences) {
+   // DRAFT: Prefer VulkanVideoDecoder when kVulkanVideoDecode is enabled and
+   // the Vulkan device exposes VK_KHR_video_decode_queue.
++  if (base::FeatureList::IsEnabled(kVulkanVideoDecode) &&
++      gpu_preferences.enable_vulkan) {
++    // Check VulkanVideoSupport capability before selecting; fallback to VA-API.
++  }
+   return VideoDecoderType::kVaapi;
+ }

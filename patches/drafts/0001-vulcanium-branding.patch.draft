@@ -1,0 +1,14 @@
+# DRAFT PATCH - Do not add to patches/series before rebasing against actual Chromium 157 source!
+# Target: chrome/common/chrome_paths_linux.cc & chrome/app/chromium_strings.grd
+
+--- a/chrome/common/chrome_paths_linux.cc
++++ b/chrome/common/chrome_paths_linux.cc
+@@ -95,7 +95,7 @@ bool GetDefaultUserDataDirectory(base::FilePath* result) {
+ #elif defined(GOOGLE_CHROME_FOR_TESTING_BUILD)
+   *result = config_dir.Append("google-chrome-for-testing");
+ #else
+-  *result = config_dir.Append("chromium");
++  *result = config_dir.Append("vulcanium");
+ #endif
+   return true;
+ }
