@@ -1,0 +1,375 @@
+--- /dev/null
++++ b/media/gpu/vulkan/vulkan_video_decoder.h
+@@ -0,0 +1,66 @@
++// Copyright 2026 The Vulcanium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
++#define MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
++
++#include <memory>
++
++#include "base/memory/scoped_refptr.h"
++#include "base/sequence_checker.h"
++#include "media/base/video_decoder.h"
++#include "media/base/video_decoder_config.h"
++#include "media/ffmpeg/ffmpeg_deleters.h"
++#include "media/gpu/media_gpu_export.h"
++
++struct AVBufferRef;
++struct AVCodecContext;
++struct AVFrame;
++
++namespace media {
++
++class MediaLog;
++
++// Hardware video decoder backed by FFmpeg's AV_HWDEVICE_TYPE_VULKAN
++// (VK_KHR_video_decode_queue), supporting H.264, AV1, and VP9 on Linux.
++class MEDIA_GPU_EXPORT VulkanVideoDecoder : public VideoDecoder {
++ public:
++  static bool IsSupported(const VideoDecoderConfig& config);
++
++  explicit VulkanVideoDecoder(std::unique_ptr<MediaLog> media_log);
++  VulkanVideoDecoder(const VulkanVideoDecoder&) = delete;
++  VulkanVideoDecoder& operator=(const VulkanVideoDecoder&) = delete;
++  ~VulkanVideoDecoder() override;
++
++  // VideoDecoder implementation:
++  VideoDecoderType GetDecoderType() const override;
++  void Initialize(const VideoDecoderConfig& config,
++                  bool low_delay,
++                  CdmContext* cdm_context,
++                  InitCB init_cb,
++                  const OutputCB& output_cb,
++                  const WaitingCB& waiting_cb) override;
++  void Decode(scoped_refptr<DecoderBuffer> buffer, DecodeCB decode_cb) override;
++  void Reset(base::OnceClosure closure) override;
++
++ private:
++  bool ConfigureVulkanDecoder(const VideoDecoderConfig& config);
++  void ReleaseResources();
++  bool EmitFrame(AVFrame* hw_frame);
++
++  SEQUENCE_CHECKER(sequence_checker_);
++
++  std::unique_ptr<MediaLog> media_log_;
++  VideoDecoderConfig config_;
++  OutputCB output_cb_;
++
++  AVBufferRef* hw_device_ctx_ = nullptr;
++  std::unique_ptr<AVCodecContext, ScopedPtrAVFreeContext> codec_context_;
++  bool initialized_ = false;
++  bool eos_reached_ = false;
++};
++
++}  // namespace media
++
++#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
+--- /dev/null
++++ b/media/gpu/vulkan/vulkan_video_decoder.cc
+@@ -0,0 +1,245 @@
++// Copyright 2026 The Vulcanium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/gpu/vulkan/vulkan_video_decoder.h"
++
++#include <algorithm>
++#include <cstring>
++
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/numerics/safe_conversions.h"
++#include "base/task/bind_post_task.h"
++#include "base/task/sequenced_task_runner.h"
++#include "media/base/decoder_buffer.h"
++#include "media/base/media_log.h"
++#include "media/base/video_frame.h"
++#include "media/ffmpeg/ffmpeg_common.h"
++
++extern "C" {
++#include <libavcodec/avcodec.h>
++#include <libavutil/hwcontext.h>
++#include <libavutil/pixfmt.h>
++}
++
++namespace media {
++
++namespace {
++
++enum AVPixelFormat GetVulkanHwFormat(AVCodecContext* ctx,
++                                     const enum AVPixelFormat* pix_fmts) {
++  for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
++    if (*p == AV_PIX_FMT_VULKAN) {
++      return *p;
++    }
++  }
++  return AV_PIX_FMT_NONE;
++}
++
++}  // namespace
++
++// static
++bool VulkanVideoDecoder::IsSupported(const VideoDecoderConfig& config) {
++  if (config.is_encrypted()) {
++    return false;
++  }
++  switch (config.codec()) {
++    case VideoCodec::kH264:
++    case VideoCodec::kAV1:
++    case VideoCodec::kVP9:
++      return true;
++    default:
++      return false;
++  }
++}
++
++VulkanVideoDecoder::VulkanVideoDecoder(std::unique_ptr<MediaLog> media_log)
++    : media_log_(std::move(media_log)) {}
++
++VulkanVideoDecoder::~VulkanVideoDecoder() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  ReleaseResources();
++}
++
++VideoDecoderType VulkanVideoDecoder::GetDecoderType() const {
++  return VideoDecoderType::kFFmpeg;
++}
++
++void VulkanVideoDecoder::Initialize(const VideoDecoderConfig& config,
++                                    bool low_delay,
++                                    CdmContext* cdm_context,
++                                    InitCB init_cb,
++                                    const OutputCB& output_cb,
++                                    const WaitingCB& waiting_cb) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  InitCB bound_init_cb = base::BindPostTaskToCurrentDefault(std::move(init_cb));
++
++  if (!IsSupported(config) || !ConfigureVulkanDecoder(config)) {
++    std::move(bound_init_cb).Run(DecoderStatus::Codes::kUnsupportedConfig);
++    return;
++  }
++
++  config_ = config;
++  output_cb_ = output_cb;
++  initialized_ = true;
++  eos_reached_ = false;
++  std::move(bound_init_cb).Run(DecoderStatus::Codes::kOk);
++}
++
++bool VulkanVideoDecoder::ConfigureVulkanDecoder(
++    const VideoDecoderConfig& config) {
++  ReleaseResources();
++
++  int err = av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VULKAN,
++                                   nullptr, nullptr, 0);
++  if (err < 0 || !hw_device_ctx_) {
++    DLOG(WARNING) << "VulkanVideoDecoder: av_hwdevice_ctx_create failed: "
++                  << AVErrorToString(err);
++    return false;
++  }
++
++  codec_context_.reset(avcodec_alloc_context3(nullptr));
++  if (!codec_context_) {
++    ReleaseResources();
++    return false;
++  }
++
++  VideoDecoderConfigToAVCodecContext(config, codec_context_.get());
++  codec_context_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
++  codec_context_->get_format = GetVulkanHwFormat;
++  codec_context_->pkt_timebase = AVRational{1, 1000000};
++
++  const AVCodec* codec = avcodec_find_decoder(codec_context_->codec_id);
++  if (!codec || avcodec_open2(codec_context_.get(), codec, nullptr) < 0) {
++    DLOG(WARNING) << "VulkanVideoDecoder: avcodec_open2 failed for codec "
++                  << GetCodecName(config.codec());
++    ReleaseResources();
++    return false;
++  }
++
++  return true;
++}
++
++void VulkanVideoDecoder::ReleaseResources() {
++  codec_context_.reset();
++  if (hw_device_ctx_) {
++    av_buffer_unref(&hw_device_ctx_);
++    hw_device_ctx_ = nullptr;
++  }
++  initialized_ = false;
++}
++
++void VulkanVideoDecoder::Decode(scoped_refptr<DecoderBuffer> buffer,
++                                DecodeCB decode_cb) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  DecodeCB bound_cb = base::BindPostTaskToCurrentDefault(std::move(decode_cb));
++
++  if (!initialized_ || !codec_context_) {
++    std::move(bound_cb).Run(DecoderStatus::Codes::kFailed);
++    return;
++  }
++  if (eos_reached_) {
++    std::move(bound_cb).Run(DecoderStatus::Codes::kOk);
++    return;
++  }
++
++  AVPacket* packet = av_packet_alloc();
++  if (!packet) {
++    std::move(bound_cb).Run(DecoderStatus::Codes::kOutOfMemory);
++    return;
++  }
++
++  if (buffer->end_of_stream()) {
++    packet->data = nullptr;
++    packet->size = 0;
++  } else {
++    auto span = base::span(*buffer);
++    packet->data = const_cast<uint8_t*>(span.data());
++    packet->size = base::checked_cast<int>(span.size());
++    packet->pts =
++        ConvertToTimeBase(codec_context_->pkt_timebase, buffer->timestamp());
++  }
++
++  int ret = avcodec_send_packet(codec_context_.get(), packet);
++  av_packet_free(&packet);
++  if (ret < 0 && ret != AVERROR_EOF) {
++    std::move(bound_cb).Run(DecoderStatus::Codes::kFailed);
++    return;
++  }
++
++  AVFrame* hw_frame = av_frame_alloc();
++  if (!hw_frame) {
++    std::move(bound_cb).Run(DecoderStatus::Codes::kOutOfMemory);
++    return;
++  }
++
++  while (true) {
++    ret = avcodec_receive_frame(codec_context_.get(), hw_frame);
++    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
++      break;
++    }
++    if (ret < 0) {
++      av_frame_free(&hw_frame);
++      std::move(bound_cb).Run(DecoderStatus::Codes::kFailed);
++      return;
++    }
++    if (!EmitFrame(hw_frame)) {
++      av_frame_unref(hw_frame);
++      av_frame_free(&hw_frame);
++      std::move(bound_cb).Run(DecoderStatus::Codes::kFailed);
++      return;
++    }
++    av_frame_unref(hw_frame);
++  }
++
++  av_frame_free(&hw_frame);
++  if (buffer->end_of_stream()) {
++    eos_reached_ = true;
++  }
++  std::move(bound_cb).Run(DecoderStatus::Codes::kOk);
++}
++
++bool VulkanVideoDecoder::EmitFrame(AVFrame* hw_frame) {
++  AVFrame* sw_frame = av_frame_alloc();
++  if (!sw_frame) {
++    return false;
++  }
++
++  // Transfer Vulkan surface to NV12/YUV420P VideoFrame; zero-copy DMA-BUF
++  // SharedImage wrapping can be layered here via AV_PIX_FMT_DRM_PRIME.
++  int ret = (hw_frame->format == AV_PIX_FMT_VULKAN)
++                ? av_hwframe_transfer_data(sw_frame, hw_frame, 0)
++                : av_frame_ref(sw_frame, hw_frame);
++  if (ret < 0) {
++    av_frame_free(&sw_frame);
++    return false;
++  }
++
++  const gfx::Size coded_size(sw_frame->width, sw_frame->height);
++  const gfx::Rect visible_rect(coded_size);
++  const auto pts =
++      ConvertFromTimeBase(codec_context_->pkt_timebase, hw_frame->pts);
++
++  auto video_frame = VideoFrame::CreateFrame(PIXEL_FORMAT_NV12, coded_size,
++                                             visible_rect, coded_size, pts);
++  if (!video_frame) {
++    av_frame_free(&sw_frame);
++    return false;
++  }
++
++  // Copy Y and interleaved UV planes from transferred NV12 frame.
++  for (int plane = 0; plane < 2; ++plane) {
++    const uint8_t* src = sw_frame->data[plane];
++    int src_stride = sw_frame->linesize[plane];
++    uint8_t* dst = video_frame->writable_data(plane);
++    int dst_stride = video_frame->stride(plane);
++    int rows = (plane == 0) ? coded_size.height() : (coded_size.height() + 1) / 2;
++    int row_bytes = std::min(src_stride, dst_stride);
++    for (int y = 0; y < rows; ++y) {
++      std::memcpy(dst + y * dst_stride, src + y * src_stride, row_bytes);
++    }
++  }
++
++  video_frame->metadata().power_efficient = true;
++  av_frame_free(&sw_frame);
++  output_cb_.Run(std::move(video_frame));
++  return true;
++}
++
++void VulkanVideoDecoder::Reset(base::OnceClosure closure) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (codec_context_) {
++    avcodec_flush_buffers(codec_context_.get());
++  }
++  eos_reached_ = false;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE,
++                                                           std::move(closure));
++}
++
++}  // namespace media
+--- a/media/gpu/BUILD.gn
++++ b/media/gpu/BUILD.gn
+@@ -180,6 +180,14 @@
+     if (enable_vulkan) {
+       deps += [ "//gpu/vulkan" ]
+     }
++  }
++
++  if (is_linux && enable_vulkan) {
++    sources += [
++      "vulkan/vulkan_video_decoder.cc",
++      "vulkan/vulkan_video_decoder.h",
++    ]
++    deps += [ "//third_party/ffmpeg" ]
+   }
+ 
+   if (use_v4l2_codec) {
+--- a/media/mojo/services/gpu_mojo_media_client_linux.cc
++++ b/media/mojo/services/gpu_mojo_media_client_linux.cc
+@@ -19,6 +19,9 @@
+ #include "media/gpu/chromeos/platform_video_frame_pool.h"
+ #include "media/gpu/chromeos/simple_video_frame_converter.h"
+ #include "media/gpu/chromeos/video_decoder_pipeline.h"
++#if BUILDFLAG(ENABLE_VULKAN)
++#include "media/gpu/vulkan/vulkan_video_decoder.h"
++#endif
+ 
+ namespace media {
+ 
+@@ -166,6 +169,13 @@
+  protected:
+   std::unique_ptr<VideoDecoder> CreatePlatformVideoDecoder(
+       VideoDecoderTraits& traits) final {
++#if BUILDFLAG(ENABLE_VULKAN)
++    if (base::FeatureList::IsEnabled(kVulkanVideoDecode) &&
++        gpu_preferences_.gr_context_type == gpu::GrContextType::kVulkan) {
++      return std::make_unique<VulkanVideoDecoder>(traits.media_log->Clone());
++    }
++#endif
++
+     const auto decoder_type =
+         GetActualPlatformDecoderImplementation(gpu_preferences_, gpu_info_);
+     // The browser process guarantees this CHECK.

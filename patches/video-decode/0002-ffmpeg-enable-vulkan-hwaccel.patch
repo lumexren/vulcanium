@@ -1,0 +1,79 @@
+--- a/third_party/ffmpeg/BUILD.gn
++++ b/third_party/ffmpeg/BUILD.gn
+@@ -273,6 +273,9 @@
+   deps = [
+     ":ffmpeg_features",
+     "//third_party/opus",
+   ]
++  if (is_linux) {
++    deps += [ "//third_party/vulkan-headers/src:vulkan_headers" ]
++  }
+ 
+   configs -= [ "//build/config/compiler:chromium_code" ]
+--- a/third_party/ffmpeg/ffmpeg_generated.gni
++++ b/third_party/ffmpeg/ffmpeg_generated.gni
+@@ -613,3 +613,16 @@
+     (is_android && current_cpu == "x86")) {
+   ffmpeg_c_sources += [ "compat/strtod.c" ]
+ }
++
++if (is_linux && current_cpu == "x64" && ffmpeg_branding == "Chrome") {
++  ffmpeg_c_sources += [
++    "libavcodec/vulkan.c",
++    "libavcodec/vulkan_av1.c",
++    "libavcodec/vulkan_decode.c",
++    "libavcodec/vulkan_h264.c",
++    "libavcodec/vulkan_video.c",
++    "libavcodec/vulkan_vp9.c",
++    "libavutil/hwcontext_vulkan.c",
++    "libavutil/vulkan.c",
++  ]
++}
+--- a/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config.h
++++ b/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config.h
+@@ -643,7 +643,7 @@
+ #define CONFIG_VAAPI 0
+ #define CONFIG_VDPAU 0
+ #define CONFIG_VIDEOTOOLBOX 0
+-#define CONFIG_VULKAN 0
++#define CONFIG_VULKAN 1
+ #define CONFIG_V4L2_M2M 0
+ #define CONFIG_CHECKASM 0
+ #define CONFIG_FTRAPV 0
+@@ -811,7 +811,7 @@
+ #define CONFIG_V4L2_BUFFERS 0
+ #define CONFIG_VAAPI_1 0
+ #define CONFIG_VAAPI_ENCODE 0
+-#define CONFIG_VULKAN_1_4 0
++#define CONFIG_VULKAN_1_4 1
+ #define CONFIG_VC1DSP 0
+ #define CONFIG_VIDEODSP 1
+ #define CONFIG_VP3DSP 0
+--- a/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config_components.h
++++ b/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config_components.h
+@@ -942,7 +942,7 @@
+ #define CONFIG_AV1_VAAPI_HWACCEL 0
+ #define CONFIG_AV1_VDPAU_HWACCEL 0
+ #define CONFIG_AV1_VIDEOTOOLBOX_HWACCEL 0
+-#define CONFIG_AV1_VULKAN_HWACCEL 0
++#define CONFIG_AV1_VULKAN_HWACCEL 1
+ #define CONFIG_DPX_VULKAN_HWACCEL 0
+ #define CONFIG_FFV1_VULKAN_HWACCEL 0
+ #define CONFIG_H263_VAAPI_HWACCEL 0
+@@ -956,7 +956,7 @@
+ #define CONFIG_H264_VAAPI_HWACCEL 0
+ #define CONFIG_H264_VDPAU_HWACCEL 0
+ #define CONFIG_H264_VIDEOTOOLBOX_HWACCEL 0
+-#define CONFIG_H264_VULKAN_HWACCEL 0
++#define CONFIG_H264_VULKAN_HWACCEL 1
+ #define CONFIG_HEVC_D3D11VA_HWACCEL 0
+ #define CONFIG_HEVC_D3D11VA2_HWACCEL 0
+ #define CONFIG_HEVC_DXVA2_HWACCEL 0
+@@ -1011,6 +1011,6 @@
+ #define CONFIG_VP9_VAAPI_HWACCEL 0
+ #define CONFIG_VP9_VDPAU_HWACCEL 0
+ #define CONFIG_VP9_VIDEOTOOLBOX_HWACCEL 0
+-#define CONFIG_VP9_VULKAN_HWACCEL 0
++#define CONFIG_VP9_VULKAN_HWACCEL 1
+ #define CONFIG_VVC_VAAPI_HWACCEL 0
+ #define CONFIG_WMV3_D3D11VA_HWACCEL 0

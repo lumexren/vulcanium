@@ -12,3 +12,5 @@ wayland/0001-ozone-wayland-vulkan-enable.patch
 
 # Vulkan Video Decoding
 video-decode/0001-enable-vulkan-video-flag-and-linux-client.patch
+video-decode/0002-ffmpeg-enable-vulkan-hwaccel.patch
+video-decode/0003-vulkan-video-decoder.patch
