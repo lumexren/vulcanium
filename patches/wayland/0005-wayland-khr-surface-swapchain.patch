@@ -28,9 +28,15 @@
  };
  
  }  // namespace ui
---- a/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc	2026-11-16 09:25:47.754478506 +0300
-+++ b/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc	2026-11-16 09:25:20.978523345 +0300
-@@ -12,17 +12,24 @@
+--- a/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc
++++ b/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc
+@@ -7,22 +7,32 @@
+ #include <vulkan/vulkan_wayland.h>
+ 
+ #include "base/base_paths.h"
++#include "base/compiler_specific.h"
+ #include "base/files/file_path.h"
+ #include "base/functional/callback_helpers.h"
  #include "base/notimplemented.h"
  #include "base/notreached.h"
  #include "base/path_service.h"
@@ -59,7 +65,7 @@
  
  VulkanImplementationWayland::~VulkanImplementationWayland() {}
  
-@@ -31,6 +38,10 @@
+@@ -31,6 +41,10 @@
        VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
        VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
    };
@@ -70,19 +76,25 @@
  
    base::FilePath path;
    if (use_swiftshader()) {
-@@ -51,16 +62,53 @@
+@@ -49,18 +63,64 @@
+   return &vulkan_instance_;
+ }
  
++NO_SANITIZE("cfi-icall")
  std::unique_ptr<gpu::VulkanSurface>
  VulkanImplementationWayland::CreateViewSurface(gfx::AcceleratedWidget window) {
 -  NOTIMPLEMENTED();
 -  return nullptr;
 +  if (!connection_ || !connection_->display()) {
++    LOG(ERROR) << "CreateViewSurface: missing WaylandConnection or display";
 +    return nullptr;
 +  }
 +  WaylandWindow* wayland_window =
 +      connection_->window_manager()->GetWindow(window);
 +  if (!wayland_window || !wayland_window->root_surface() ||
 +      !wayland_window->root_surface()->surface()) {
++    LOG(ERROR) << "CreateViewSurface: missing WaylandWindow/wl_surface for widget "
++               << window;
 +    return nullptr;
 +  }
 +  auto create_wayland_surface =
@@ -90,6 +102,7 @@
 +          gpu::GetVulkanFunctionPointers()->vkGetInstanceProcAddr(
 +              vulkan_instance_.vk_instance(), "vkCreateWaylandSurfaceKHR"));
 +  if (!create_wayland_surface) {
++    LOG(ERROR) << "CreateViewSurface: vkCreateWaylandSurfaceKHR not found";
 +    return nullptr;
 +  }
 +  VkWaylandSurfaceCreateInfoKHR info = {
@@ -98,14 +111,18 @@
 +      .surface = wayland_window->root_surface()->surface(),
 +  };
 +  VkSurfaceKHR vk_surface = VK_NULL_HANDLE;
-+  if (create_wayland_surface(vulkan_instance_.vk_instance(), &info, nullptr,
-+                             &vk_surface) != VK_SUCCESS) {
++  VkResult vk_res = create_wayland_surface(vulkan_instance_.vk_instance(),
++                                           &info, nullptr, &vk_surface);
++  if (vk_res != VK_SUCCESS) {
++    LOG(ERROR) << "CreateViewSurface: vkCreateWaylandSurfaceKHR failed: "
++               << vk_res;
 +    return nullptr;
 +  }
 +  return std::make_unique<gpu::VulkanSurface>(vulkan_instance_.vk_instance(),
 +                                            window, vk_surface);
  }
  
++NO_SANITIZE("cfi-icall")
  bool VulkanImplementationWayland::GetPhysicalDevicePresentationSupport(
      VkPhysicalDevice device,
      const std::vector<VkQueueFamilyProperties>& queue_family_properties,
@@ -128,7 +145,7 @@
  }
  
  std::vector<const char*>
-@@ -71,6 +119,9 @@
+@@ -71,6 +131,9 @@
        VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
        VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
    };
