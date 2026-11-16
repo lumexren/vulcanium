@@ -1,0 +1,11 @@
+--- a/gpu/command_buffer/service/shared_image/skia_vk_ozone_image_representation.cc
++++ b/gpu/command_buffer/service/shared_image/skia_vk_ozone_image_representation.cc
+@@ -292,7 +292,7 @@ SkiaVkOzoneImageRepresentation::GetEndAccessState() {
+     DCHECK_NE(queue_family_index, VK_QUEUE_FAMILY_IGNORED);
+ 
+     return std::make_unique<skgpu::MutableTextureState>(
+-        skgpu::MutableTextureStates::MakeVulkan(VK_IMAGE_LAYOUT_UNDEFINED,
++        skgpu::MutableTextureStates::MakeVulkan(VK_IMAGE_LAYOUT_GENERAL,
+                                                 queue_family_index));
+   }
+   return nullptr;
