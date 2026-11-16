@@ -37,8 +37,8 @@
    // Represents a connection to Wayland.
    const raw_ptr<WaylandBufferManagerGpu> buffer_manager_;
  
---- a/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc	2026-11-16 09:17:41.392004889 +0300
-+++ b/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc	2026-11-16 09:17:13.224536677 +0300
+--- a/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
++++ b/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
 @@ -27,6 +27,12 @@
  #include "ui/ozone/platform/wayland/gpu/wayland_buffer_manager_gpu.h"
  #include "ui/ozone/public/native_pixmap_usage_utils.h"
@@ -52,23 +52,7 @@
  
  namespace ui {
  
-@@ -86,7 +92,14 @@
-     // rendering, while wlroots would announce MOD_LINEAR and MOD_INVALID).
-     // In such cases gbm_bo allocation may fail, where we should fallback to
-     // creation without modifiers, and leave the choices to driver.
--    if (!gbm_bo_ && buffer_manager_->AllowsImplicitModifierForFormat(format)) {
-+    if (!gbm_bo_) {
-+      std::vector<uint64_t> linear_mod = {DRM_FORMAT_MOD_LINEAR};
-+      gbm_bo_ = gbm_device->CreateBufferWithModifiers(
-+          fourcc_format, size, gbm_flags, linear_mod);
-+    }
-+    if (!gbm_bo_) {
-+      // Final fallback to implicit modifier creation so Wayland + Vulkan
-+      // doesn't lose the swapchain and render a black screen.
-       gbm_bo_ = gbm_device->CreateBuffer(fourcc_format, size, gbm_flags);
-     }
-   }
-@@ -139,27 +152,105 @@
+@@ -146,27 +152,105 @@
    return true;
  }
  
@@ -174,7 +158,7 @@
    return gbm_bo_->GetNumPlanes();
  }
  
-@@ -170,18 +261,30 @@
+@@ -177,18 +261,30 @@
  }
  
  uint64_t GbmPixmapWayland::GetFormatModifier() const {
@@ -205,7 +189,7 @@
    return gbm_bo_->GetHandle();
  }
  
-@@ -213,7 +316,7 @@
+@@ -220,7 +316,7 @@
  gfx::NativePixmapHandle GbmPixmapWayland::ExportHandle() const {
    gfx::NativePixmapHandle handle;
  
@@ -214,7 +198,7 @@
    std::vector<base::ScopedFD> scoped_fds(num_planes);
    for (size_t i = 0; i < num_planes; ++i) {
      scoped_fds[i] = base::ScopedFD(HANDLE_EINTR(dup(GetDmaBufFd(i))));
-@@ -225,7 +328,7 @@
+@@ -232,7 +328,7 @@
  
    for (size_t i = 0; i < num_planes; ++i) {
      handle.planes.emplace_back(GetDmaBufPitch(i), GetDmaBufOffset(i),
@@ -223,7 +207,7 @@
                                 std::move(scoped_fds[i]));
    }
    handle.modifier = GetFormatModifier();
-@@ -234,13 +337,13 @@
+@@ -241,13 +337,13 @@
  
  void GbmPixmapWayland::CreateDmabufBasedWlBuffer(
      const gfx::OverlayPlaneData& overlay_plane_data) {
@@ -239,29 +223,17 @@
    for (size_t i = 0; i < plane_count; ++i) {
      strides.push_back(GetDmaBufPitch(i));
      offsets.push_back(GetDmaBufOffset(i));
-@@ -255,10 +358,21 @@
+@@ -262,7 +358,9 @@
    // The wl_buffer must be destroyed once this pixmap is destroyed.
    created_wl_buffer_ = true;
  
+-  uint32_t wl_format = gbm_bo_->GetFormat();
 +  uint32_t wl_format = vulkan_handle_
 +                           ? GetFourCCFormatFromSharedImageFormat(vulkan_format_)
 +                           : gbm_bo_->GetFormat();
-+  if (!overlay_plane_data.enable_blend || overlay_plane_data.z_order == 0) {
-+    if (wl_format == DRM_FORMAT_ABGR8888) {
-+      wl_format = DRM_FORMAT_XBGR8888;
-+    } else if (wl_format == DRM_FORMAT_ARGB8888) {
-+      wl_format = DRM_FORMAT_XRGB8888;
-+    }
-+  }
-+
-   // Asks Wayland to create a wl_buffer based on the |file| fd.
-   buffer_manager_->CreateDmabufBasedBuffer(
-       std::move(fd), visible_area_size_, strides, offsets, modifiers,
--      gbm_bo_->GetFormat(), plane_count, overlay_plane_data.color_space,
-+      wl_format, plane_count, overlay_plane_data.color_space,
-       overlay_plane_data.hdr_metadata, buffer_id_);
- }
- 
+   if (!overlay_plane_data.enable_blend || overlay_plane_data.z_order == 0) {
+     if (wl_format == DRM_FORMAT_ABGR8888) {
+       wl_format = DRM_FORMAT_XBGR8888;
 --- a/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc	2026-11-16 09:17:41.395766654 +0300
 +++ b/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc	2026-11-16 09:16:34.460864189 +0300
 @@ -261,6 +261,18 @@

@@ -169,8 +169,8 @@
  
    if (!use_swiftshader())
      result.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
---- a/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc	2026-11-16 09:25:47.763296713 +0300
-+++ b/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc	2026-11-16 09:24:39.928011939 +0300
+--- a/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
++++ b/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
 @@ -146,6 +146,12 @@
      gfx::AcceleratedWidget window) {
    if (gl::IsSoftwareGLImplementation(gl::GetGLImplementationParts())) {
@@ -194,25 +194,6 @@
  }
  #endif
  
-@@ -261,6 +268,18 @@
-     return nullptr;
-   }
- #if defined(WAYLAND_GBM)
-+  if (device_queue &&
-+      (format == viz::SinglePlaneFormat::kRGBA_8888 ||
-+       format == viz::SinglePlaneFormat::kBGRA_8888 ||
-+       format == viz::SinglePlaneFormat::kRGBX_8888 ||
-+       format == viz::SinglePlaneFormat::kBGRX_8888)) {
-+    scoped_refptr<GbmPixmapWayland> vk_pixmap =
-+        base::MakeRefCounted<GbmPixmapWayland>(buffer_manager_);
-+    if (vk_pixmap->InitializeVulkanLinearBuffer(widget, device_queue, size,
-+                                                format, framebuffer_size)) {
-+      return vk_pixmap;
-+    }
-+  }
-   auto* gbm_device = buffer_manager_->GetGbmDevice();
-   if (gbm_device && gbm_device->CanCreateBufferForFormat(
-                         GetFourCCFormatFromSharedImageFormat(format))) {
 --- a/ui/ozone/platform/wayland/host/wayland_connection.h
 +++ b/ui/ozone/platform/wayland/host/wayland_connection.h
 @@ -7,6 +7,7 @@

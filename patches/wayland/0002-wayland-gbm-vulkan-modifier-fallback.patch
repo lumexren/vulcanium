@@ -1,6 +1,6 @@
 --- a/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
 +++ b/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
-@@ -86,7 +86,15 @@ bool GbmPixmapWayland::InitializeBuffer(
+@@ -86,7 +86,14 @@ bool GbmPixmapWayland::InitializeBuffer(
      // rendering, while wlroots would announce MOD_LINEAR and MOD_INVALID).
      // In such cases gbm_bo allocation may fail, where we should fallback to
      // creation without modifiers, and leave the choices to driver.
@@ -16,7 +16,7 @@
        gbm_bo_ = gbm_device->CreateBuffer(fourcc_format, size, gbm_flags);
      }
    }
-@@ -256,9 +264,18 @@ void GbmPixmapWayland::CreateDmabufBasedWlBuffer(
+@@ -256,9 +263,18 @@ void GbmPixmapWayland::CreateDmabufBasedWlBuffer(
    // The wl_buffer must be destroyed once this pixmap is destroyed.
    created_wl_buffer_ = true;
  
