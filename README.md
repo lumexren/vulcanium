@@ -20,28 +20,6 @@
 4. **Vulcanium Branding & Defaults (`patches/branding/`, `config/`)**
    - Clean `Vulcanium` branding, desktop entry, and sensible default flags (`config/vulcanium-flags.conf`).
 
-## Project Layout
-
-```text
-vulcanium/
-├── arch/                   # Arch Linux PKGBUILD & base distro patches
-├── config/
-│   ├── args.gn             # Shared GN build arguments (Vulkan, codecs, Wayland)
-│   └── vulcanium-flags.conf# Default runtime flags for Linux/Wayland/Vulkan
-├── patches/
-│   ├── series              # Ordered patch list applied on top of Chromium
-│   ├── branding/           # Vulcanium branding & UI strings
-│   ├── vulkan/             # ANGLE/Skia/Vulkan & DMA-BUF patches
-│   ├── video-decode/       # Vulkan Video Decoding (VkVideo) patches
-│   └── wayland/            # Ozone/Wayland presentation & modifier patches
-├── scripts/
-│   ├── fetch-source.sh     # Download & extract Chromium tarball (+ git init for patch dev)
-│   ├── apply-patches.sh    # Apply patches listed in patches/series
-│   ├── new-patch.sh        # Export git diff from src/ into patches/
-│   └── build.sh            # Standalone gn + ninja build script
-└── src/                    # (gitignored) Downloaded tarballs & extracted Chromium source
-```
-
 ## Quick Start
 
 ### 1. Fetch & Prepare Chromium Source (for patch development or standalone builds)
