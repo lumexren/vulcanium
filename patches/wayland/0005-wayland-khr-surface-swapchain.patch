@@ -53,7 +53,9 @@
 +VulkanImplementationWayland::VulkanImplementationWayland(
 +    bool use_swiftshader,
 +    WaylandConnection* connection)
-+    : gpu::VulkanImplementation(use_swiftshader), connection_(connection) {}
++    : gpu::VulkanImplementation(use_swiftshader),
++      vulkan_instance_(connection != nullptr),
++      connection_(connection) {}
  
  VulkanImplementationWayland::~VulkanImplementationWayland() {}
  
@@ -204,3 +206,25 @@
      }
  #endif
      if (!connection_->Initialize(use_threaded_polling)) {
+--- a/gpu/ipc/service/gpu_init.cc
++++ b/gpu/ipc/service/gpu_init.cc
+@@ -220,6 +220,8 @@
+ // Android WebView is allowed for now because it CHECKs on context loss.
+ void DisableInProcessGpuVulkan(GpuFeatureInfo* gpu_feature_info,
+                                GpuPreferences* gpu_preferences) {
++  // Allowed in Vulcanium for native VK_KHR_wayland_surface WSI support.
++  return;
+   if (gpu_feature_info->status_values[GPU_FEATURE_TYPE_VULKAN] ==
+           kGpuFeatureStatusEnabled ||
+       gpu_preferences->gr_context_type == GrContextType::kVulkan) {
+@@ -1287,6 +1289,11 @@
+ #endif  // BUILDFLAG(IS_OZONE)
+ 
++  // Initialize Vulkan in-process for native VK_KHR_wayland_surface WSI.
++  if (gpu_feature_info_.IsFeatureEnabled(GPU_FEATURE_TYPE_VULKAN)) {
++    InitializeVulkan();
++  }
++
+   // We try to fall back to a valid GrContextType after GpuFeatureInfo is
+   // computed.
+   if (!TryFallbackGrContextTypesIfNeeded(gpu_feature_info_, gpu_preferences_,
