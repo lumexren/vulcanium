@@ -509,6 +509,18 @@ _read_flags() {
 _read_flags "/etc/vulcanium/default-flags.conf"
 _read_flags "${XDG_CONFIG_HOME:-$HOME/.config}/vulcanium-flags.conf"
 
+# NVIDIA proprietary Wayland GBM + ANGLE-Vulkan currently produces transparent
+# AB24 buffers on KWin/Mutter; use XWayland unless user explicitly set --ozone-platform=.
+if [[ -n "${WAYLAND_DISPLAY:-}" && -e /proc/driver/nvidia/version ]]; then
+  _has_ozone_override=0
+  for f in "${_flags[@]}" "$@"; do
+    [[ "$f" == --ozone-platform=* ]] && _has_ozone_override=1
+  done
+  if (( !_has_ozone_override )); then
+    _flags+=("--ozone-platform=x11")
+  fi
+fi
+
 export CHROME_WRAPPER="$(readlink -f "$0")"
 exec /usr/lib/vulcanium/vulcanium "${_flags[@]}" "$@"
 EOF
