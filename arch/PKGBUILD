@@ -456,6 +456,13 @@ build() {
   # https://crbug.com/957519#c122
   CXXFLAGS=${CXXFLAGS/-Wp,-D_GLIBCXX_ASSERTIONS}
 
+  # Portable x86_64 release builds (avoid -march=native SIGILL on other CPUs)
+  if [[ -n ${VULCANIUM_PORTABLE:-} ]]; then
+    CFLAGS=${CFLAGS//-march=native/-march=x86-64 -mtune=generic}
+    CXXFLAGS=${CXXFLAGS//-march=native/-march=x86-64 -mtune=generic}
+    RUSTFLAGS=${RUSTFLAGS//-C target-cpu=native/}
+  fi
+
   if [[ $CARCH == aarch64 ]] || [[ $CARCH == riscv64 ]]; then
     # On aarch64 and riscv64, certain files (e.g. in libvpx and libyuv) needs to
     # be compiled with additional arch features (e.g. dotprod, sve, sme, rvv)
