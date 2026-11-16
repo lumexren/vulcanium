@@ -1,6 +1,16 @@
 --- a/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
 +++ b/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
-@@ -86,7 +86,14 @@ bool GbmPixmapWayland::InitializeBuffer(
+@@ -73,7 +73,8 @@ bool GbmPixmapWayland::InitializeBuffer(
+     // mechanism for determine which modifiers produce artifacts we should
+     // default |DRM_FORMAT_MOD_LINEAR| here.
+     if (gbm_flags & GBM_BO_USE_LINEAR ||
+-        gbm_flags & GBM_BO_USE_FRONT_RENDERING) {
++        gbm_flags & GBM_BO_USE_FRONT_RENDERING ||
++        gbm_flags & GBM_BO_USE_SCANOUT) {
+       modifiers = {DRM_FORMAT_MOD_LINEAR};
+     }
+     gbm_bo_ = gbm_device->CreateBufferWithModifiers(fourcc_format, size,
+@@ -86,7 +87,15 @@ bool GbmPixmapWayland::InitializeBuffer(
      // rendering, while wlroots would announce MOD_LINEAR and MOD_INVALID).
      // In such cases gbm_bo allocation may fail, where we should fallback to
      // creation without modifiers, and leave the choices to driver.
