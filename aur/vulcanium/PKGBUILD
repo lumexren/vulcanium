@@ -412,7 +412,7 @@ build() {
   # https://crbug.com/957519#c122
   CXXFLAGS=${CXXFLAGS/-Wp,-D_GLIBCXX_ASSERTIONS}
 
-  # Portable x86_64 release builds (avoid -march=native SIGILL on other CPUs)
+  # Portable x86_64 release builds
   if [[ -n ${VULCANIUM_PORTABLE:-} ]]; then
     CFLAGS=${CFLAGS//-march=native/-march=x86-64 -mtune=generic}
     CXXFLAGS=${CXXFLAGS//-march=native/-march=x86-64 -mtune=generic}
