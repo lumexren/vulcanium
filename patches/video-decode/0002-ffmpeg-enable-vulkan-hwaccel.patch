@@ -1,6 +1,6 @@
 --- a/third_party/ffmpeg/BUILD.gn
 +++ b/third_party/ffmpeg/BUILD.gn
-@@ -238,6 +238,24 @@
+@@ -239,6 +239,24 @@
    # in many large global arrays (and associated code) into chrome.dll.
    link_target_type = "static_library"
  }
@@ -18,15 +18,23 @@
 +    }
 +    deps = [ "//third_party/vulkan-headers/src:vulkan_headers" ]
 +    configs -= [ "//build/config/compiler:chromium_code" ]
-+    configs += [ "//build/config/compiler:no_chromium_code", "//build/config/compiler:no_incompatible_pointer_warnings", ":ffmpeg_warnings" ]
++    configs += [ "//build/config/compiler:no_chromium_code", "//build/config/compiler:no_incompatible_pointer_warnings", ":ffmpeg_warnings", "//build/config/sanitizers:cfi_icall_disable" ]
 +  }
 +}
 +
  target(link_target_type, "ffmpeg_internal") {
    sources = ffmpeg_c_sources + ffmpeg_gas_sources + [
                "$platform_config_root/config.h",
-@@ -273,6 +290,9 @@
-   deps = [
+@@ -257,7 +275,7 @@
+     "FFMPEG_CONFIGURATION=NULL",
+   ]
+ 
+-  if (is_component_ffmpeg) {
++  if (is_component_ffmpeg || is_linux) {
+     configs += [ "//build/config/sanitizers:cfi_icall_disable" ]
+   }
+ 
+@@ -274,6 +292,9 @@
      ":ffmpeg_features",
      "//third_party/opus",
    ]
@@ -35,6 +43,7 @@
 +  }
  
    configs -= [ "//build/config/compiler:chromium_code" ]
+   configs += [
 --- a/third_party/ffmpeg/ffmpeg_generated.gni
 +++ b/third_party/ffmpeg/ffmpeg_generated.gni
 @@ -613,3 +613,15 @@
