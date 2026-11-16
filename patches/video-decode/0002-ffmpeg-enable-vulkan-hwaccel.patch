@@ -1,6 +1,6 @@
 --- a/third_party/ffmpeg/BUILD.gn
 +++ b/third_party/ffmpeg/BUILD.gn
-@@ -239,6 +239,24 @@
+@@ -239,6 +239,52 @@
    # in many large global arrays (and associated code) into chrome.dll.
    link_target_type = "static_library"
  }
@@ -20,12 +20,40 @@
 +    configs -= [ "//build/config/compiler:chromium_code" ]
 +    configs += [ "//build/config/compiler:no_chromium_code", "//build/config/compiler:no_incompatible_pointer_warnings", ":ffmpeg_warnings", "//build/config/sanitizers:cfi_icall_disable" ]
 +  }
++  source_set("ffmpeg_hevc_vulkan") {
++    sources = [
++      "libavcodec/hevc/cabac.c",
++      "libavcodec/hevc/data.c",
++      "libavcodec/hevc/dsp.c",
++      "libavcodec/hevc/filter.c",
++      "libavcodec/hevc/hevcdec.c",
++      "libavcodec/hevc/mvs.c",
++      "libavcodec/hevc/parse.c",
++      "libavcodec/hevc/pred.c",
++      "libavcodec/hevc/ps.c",
++      "libavcodec/hevc/refs.c",
++      "libavcodec/hevc/sei.c",
++      "libavcodec/x86/h26x/h2656dsp.c",
++      "libavcodec/x86/hevc/dsp_init.c",
++      "libavcodec/x86/hevc/pred_init.c",
++    ]
++    include_dirs = [
++      platform_config_root,
++      ".",
++    ]
++    defines = [ "HAVE_AV_CONFIG_H", "_POSIX_C_SOURCE=200112", "_XOPEN_SOURCE=600", "PIC" ]
++    if (is_official_build) {
++      defines += [ "CHROMIUM_NO_LOGGING" ]
++    }
++    configs -= [ "//build/config/compiler:chromium_code" ]
++    configs += [ "//build/config/compiler:no_chromium_code", "//build/config/compiler:no_incompatible_pointer_warnings", ":ffmpeg_warnings", "//build/config/sanitizers:cfi_icall_disable" ]
++  }
 +}
 +
  target(link_target_type, "ffmpeg_internal") {
    sources = ffmpeg_c_sources + ffmpeg_gas_sources + [
                "$platform_config_root/config.h",
-@@ -257,7 +275,7 @@
+@@ -257,7 +303,7 @@
      "FFMPEG_CONFIGURATION=NULL",
    ]
  
@@ -34,19 +62,19 @@
      configs += [ "//build/config/sanitizers:cfi_icall_disable" ]
    }
  
-@@ -274,6 +292,9 @@
+@@ -274,6 +320,9 @@
      ":ffmpeg_features",
      "//third_party/opus",
    ]
 +  if (is_linux) {
-+    deps += [ ":ffmpeg_vulkan_util", "//third_party/vulkan-headers/src:vulkan_headers" ]
++    deps += [ ":ffmpeg_vulkan_util", ":ffmpeg_hevc_vulkan", "//third_party/vulkan-headers/src:vulkan_headers" ]
 +  }
  
    configs -= [ "//build/config/compiler:chromium_code" ]
    configs += [
 --- a/third_party/ffmpeg/ffmpeg_generated.gni
 +++ b/third_party/ffmpeg/ffmpeg_generated.gni
-@@ -613,3 +613,76 @@
+@@ -613,3 +613,63 @@
      (is_android && current_cpu == "x86")) {
    ffmpeg_c_sources += [ "compat/strtod.c" ]
  }
@@ -55,21 +83,11 @@
 +  ffmpeg_c_sources += [
 +    "libavcodec/av1_parse.c",
 +    "libavcodec/av1dec.c",
++    "libavcodec/bsf/vp9_superframe_split.c",
 +    "libavcodec/cbs.c",
 +    "libavcodec/cbs_av1.c",
 +    "libavcodec/cbs_bsf.c",
 +    "libavcodec/cbs_vp9.c",
-+    "libavcodec/hevc/cabac.c",
-+    "libavcodec/hevc/data.c",
-+    "libavcodec/hevc/dsp.c",
-+    "libavcodec/hevc/filter.c",
-+    "libavcodec/hevc/hevcdec.c",
-+    "libavcodec/hevc/mvs.c",
-+    "libavcodec/hevc/parse.c",
-+    "libavcodec/hevc/pred.c",
-+    "libavcodec/hevc/ps.c",
-+    "libavcodec/hevc/refs.c",
-+    "libavcodec/hevc/sei.c",
 +    "libavcodec/vp9.c",
 +    "libavcodec/vp9block.c",
 +    "libavcodec/vp9data.c",
@@ -89,9 +107,6 @@
 +    "libavcodec/vulkan_hevc.c",
 +    "libavcodec/vulkan_video.c",
 +    "libavcodec/vulkan_vp9.c",
-+    "libavcodec/x86/h26x/h2656dsp.c",
-+    "libavcodec/x86/hevc/dsp_init.c",
-+    "libavcodec/x86/hevc/pred_init.c",
 +    "libavcodec/x86/vp9dsp_init.c",
 +    "libavcodec/x86/vp9dsp_init_10bpp.c",
 +    "libavcodec/x86/vp9dsp_init_12bpp.c",
@@ -178,6 +193,15 @@
  #define CONFIG_VP3DSP 0
 --- a/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config_components.h
 +++ b/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config_components.h
+@@ -51,7 +51,7 @@
+ #define CONFIG_VP9_METADATA_BSF 0
+ #define CONFIG_VP9_RAW_REORDER_BSF 0
+ #define CONFIG_VP9_SUPERFRAME_BSF 0
+-#define CONFIG_VP9_SUPERFRAME_SPLIT_BSF 0
++#define CONFIG_VP9_SUPERFRAME_SPLIT_BSF 1
+ #define CONFIG_VVC_METADATA_BSF 0
+ #define CONFIG_VVC_MP4TOANNEXB_BSF 0
+ #define CONFIG_AASC_DECODER 0
 @@ -145,7 +145,7 @@
  #define CONFIG_H264_QSV_DECODER 0
  #define CONFIG_H264_RKMPP_DECODER 0
@@ -252,3 +276,11 @@
      &ff_aac_decoder,
      &ff_flac_decoder,
      &ff_mp3_decoder,
+--- a/third_party/ffmpeg/chromium/config/Chrome/linux/x64/libavcodec/bsf_list.c
++++ b/third_party/ffmpeg/chromium/config/Chrome/linux/x64/libavcodec/bsf_list.c
+@@ -1,4 +1,5 @@
+ static const FFBitStreamFilter * const bitstream_filters[] = {
+     &ff_source_bsf,
+     &ff_sink_bsf,
++    &ff_vp9_superframe_split_bsf,
+     NULL };
