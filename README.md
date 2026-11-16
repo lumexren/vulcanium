@@ -9,6 +9,8 @@ Chromium `157.0.8103.78` patch set and Arch Linux packaging focused on native **
   - DMA-BUF linear modifier fallback and `VK_IMAGE_LAYOUT_GENERAL` transitions.
 - **Vulkan Video Decoding (`patches/video-decode/`):**
   - `VulkanVideoDecoder` backed by FFmpeg Vulkan hwaccel for H.264, HEVC/H.265, VP9, and AV1 with zero-copy DMA-BUF frame wrapping.
+- **Vulkan Video Encoding (`patches/video-encode/`):**
+  - `VulkanVideoEncodeAccelerator` backed by FFmpeg `h264_vulkan` and `hevc_vulkan` (`VK_KHR_video_encode_queue`) for H.264 and HEVC/H.265 hardware encoding.
 - **Isolated Branding & Defaults (`patches/branding/`, `config/`):**
   - Separate profile directory, `/usr/bin/vulcanium` launcher, and default Wayland/Vulkan/zero-copy runtime flags.
 

@@ -21,3 +21,7 @@ wayland/0006-wayland-vulkan-surface-alpha-and-windowing.patch
 video-decode/0001-enable-vulkan-video-flag-and-linux-client.patch
 video-decode/0002-ffmpeg-enable-vulkan-hwaccel.patch
 video-decode/0003-vulkan-video-decoder.patch
+
+# Vulkan Video Encoding
+video-encode/0001-ffmpeg-enable-vulkan-encode.patch
+video-encode/0002-vulkan-video-encode-accelerator.patch

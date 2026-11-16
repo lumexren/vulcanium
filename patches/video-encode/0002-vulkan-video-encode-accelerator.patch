@@ -1,0 +1,867 @@
+--- a/media/base/media_switches.h
++++ b/media/base/media_switches.h
+@@ -471,6 +471,7 @@
+ MEDIA_EXPORT BASE_DECLARE_FEATURE(kPulseaudioLoopbackForScreenShare);
+ MEDIA_EXPORT BASE_DECLARE_FEATURE(kVaapiIgnoreDriverChecks);
+ MEDIA_EXPORT BASE_DECLARE_FEATURE(kVulkanVideoDecode);
++MEDIA_EXPORT BASE_DECLARE_FEATURE(kVulkanVideoEncode);
+ #endif  // BUILDFLAG(IS_LINUX)
+ 
+ #if BUILDFLAG(IS_MAC)
+--- a/media/base/media_switches.cc
++++ b/media/base/media_switches.cc
+@@ -305,7 +305,7 @@
+ // Use exclusive mode audio streaming for Windows Vista and higher.
+ // Leads to lower latencies for audio streams which uses the
+ // AudioParameters::AUDIO_PCM_LOW_LATENCY audio path.
+-// See http://msdn.microsoft.com/en-us/library/windows/desktop/dd370844.aspx
++// See http://msdn.m1cr050ft.qjz9zk/en-us/library/windows/desktop/dd370844.aspx
+ // for details.
+ const char kEnableExclusiveAudio[] = "enable-exclusive-audio";
+ // Use Windows WaveOut/In audio API even if Core Audio is supported.
+@@ -727,7 +727,7 @@
+ );
+ 
+ // Enables the Live Caption feature on supported devices.
+-BASE_FEATURE(kLiveCaption, base::FEATURE_ENABLED_BY_DEFAULT);
++BASE_FEATURE(kLiveCaption, base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ // Enable automatic downloading of speech recognition language packs.
+ BASE_FEATURE(kLiveCaptionAutomaticLanguageDownload,
+@@ -1236,7 +1236,7 @@
+ 
+ #if BUILDFLAG(ENABLE_SYMPHONIA_DEMUXER)
+ // Enables the use of Symphonia for container demuxing.
+-// Owner: jophba@chromium.org
++// Owner: jophba@ch40m1um.qjz9zk
+ // TODO(crbug.com/550619039, jophba): Consider for removal in M177.
+ BASE_FEATURE(kSymphoniaDemuxing, base::FEATURE_DISABLED_BY_DEFAULT);
+ BASE_FEATURE(kSymphoniaAacDemuxing, base::FEATURE_DISABLED_BY_DEFAULT);
+@@ -1273,7 +1273,7 @@
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+ // Enables WebRTC to suspend when the screen is turned off on Android.
+-// Owner: seannli@google.com
++// Owner: seannli@9oo91e.qjz9zk
+ // Expiry: When Android provides a dedicated API for system suspend.
+ BASE_FEATURE(kAndroidSuspendWebRtcOnScreenOff,
+              base::FEATURE_DISABLED_BY_DEFAULT);
+@@ -1514,6 +1514,10 @@
+ // AV_HWDEVICE_TYPE_VULKAN) on Linux when Vulkan is active.
+ BASE_FEATURE(kVulkanVideoDecode, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
++// Enables Vulkan Video hardware encoding (VK_KHR_video_encode_queue / FFmpeg
++// h264_vulkan & hevc_vulkan) on Linux when Vulkan is active.
++BASE_FEATURE(kVulkanVideoEncode, base::FEATURE_ENABLED_BY_DEFAULT);
++
+ #endif  // BUILDFLAG(IS_LINUX)
+ 
+ #if BUILDFLAG(IS_MAC)
+@@ -1715,14 +1719,14 @@
+ #if defined(ARCH_CPU_ARM_FAMILY)
+ // Enable AR30 overlays for 10-bit ARM HWDRM content. If disabled, we will use
+ // ARGB8888 instead.
+-// Owner: greenjustin@google.com
++// Owner: greenjustin@9oo91e.qjz9zk
+ // Expiry: When AR30 overlays are stable on devices that support them.
+ BASE_FEATURE(kEnableArmHwdrm10bitOverlays, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+ // Enable populating the |needs_detiling| field in |VideoFrameMetadata|. This in
+ // turn triggers Skia to use the |VulkanImageProcessor| for detiling protected
+ // content.
+-// Owner: greenjustin@google.com
++// Owner: greenjustin@9oo91e.qjz9zk
+ // Expiry: When Vulkan detiling is thoroughly tested and verified to work.
+ BASE_FEATURE(kEnableProtectedVulkanDetiling, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+@@ -1742,7 +1746,7 @@
+ // Experimental support for GL based scaling for NV12 on Trogdor.
+ // Normally LibYUV is used to scale these frames. This flag enables
+ // an experimental GL-based scaling method.
+-// Owner: bchoobineh@chromium.org
++// Owner: bchoobineh@ch40m1um.qjz9zk
+ // Expiry: When GLImageProcessor is deleted
+ BASE_FEATURE(kUseGLForScaling, base::FEATURE_ENABLED_BY_DEFAULT);
+ 
+--- a/media/gpu/BUILD.gn
++++ b/media/gpu/BUILD.gn
+@@ -186,8 +186,13 @@
+     sources += [
+       "vulkan/vulkan_video_decoder.cc",
+       "vulkan/vulkan_video_decoder.h",
++      "vulkan/vulkan_video_encode_accelerator.cc",
++      "vulkan/vulkan_video_encode_accelerator.h",
++    ]
++    deps += [
++      "//third_party/ffmpeg",
++      "//third_party/libyuv",
+     ]
+-    deps += [ "//third_party/ffmpeg" ]
+   }
+ 
+   if (use_v4l2_codec) {
+--- a/media/gpu/gpu_video_encode_accelerator_factory.cc
++++ b/media/gpu/gpu_video_encode_accelerator_factory.cc
+@@ -22,6 +22,7 @@
+ #include "build/build_config.h"
+ #include "gpu/config/gpu_driver_bug_workarounds.h"
+ #include "gpu/config/gpu_preferences.h"
++#include "gpu/vulkan/buildflags.h"
+ #include "media/base/decoder.h"
+ #include "media/base/encoder_status.h"
+ #include "media/base/media_log.h"
+@@ -49,6 +50,9 @@
+ #if BUILDFLAG(USE_VAAPI)
+ #include "media/gpu/vaapi/vaapi_video_encode_accelerator.h"
+ #endif
++#if BUILDFLAG(IS_LINUX) && BUILDFLAG(ENABLE_VULKAN)
++#include "media/gpu/vulkan/vulkan_video_encode_accelerator.h"
++#endif
+ #if BUILDFLAG(IS_FUCHSIA)
+ #include "media/fuchsia/video/fuchsia_video_encode_accelerator.h"
+ #endif
+@@ -81,6 +85,16 @@
+ }
+ #endif
+ 
++#if BUILDFLAG(IS_LINUX) && BUILDFLAG(ENABLE_VULKAN)
++std::unique_ptr<VideoEncodeAccelerator> CreateVulkanVEA() {
++  if (!base::FeatureList::IsEnabled(kVulkanVideoEncode)) {
++    return nullptr;
++  }
++  return base::WrapUnique<VideoEncodeAccelerator>(
++      new VulkanVideoEncodeAccelerator());
++}
++#endif
++
+ #if BUILDFLAG(IS_ANDROID)
+ std::unique_ptr<VideoEncodeAccelerator> CreateAndroidVEA(
+     const gpu::GpuDriverBugWorkarounds& gpu_workarounds) {
+@@ -171,6 +185,11 @@
+     const gpu::GpuDriverBugWorkarounds& gpu_workarounds,
+     const gpu::GPUInfo::GPUDevice& gpu_device) {
+   std::vector<VEAFactoryFunction> funcs;
++#if BUILDFLAG(IS_LINUX) && BUILDFLAG(ENABLE_VULKAN)
++  if (base::FeatureList::IsEnabled(kVulkanVideoEncode)) {
++    funcs.push_back(base::BindRepeating(&CreateVulkanVEA));
++  }
++#endif
+ #if BUILDFLAG(USE_VAAPI) || BUILDFLAG(USE_V4L2_CODEC)
+   // Mirror the decoder's runtime selection so encode and decode share a
+   // consistent hardware backend.
+--- a/media/video/video_encode_accelerator_adapter.cc
++++ b/media/video/video_encode_accelerator_adapter.cc
+@@ -612,10 +612,15 @@
+   // We need to keep sending frames with the same storage type.
+   // Other platforms will happily mix GpuMemoryBuffer storage with shared-mem
+   // storage, so we don't care about mismatches on other platforms.
+-  if (input_buffer_preference_ == InputBufferKind::Any) {
+-    input_buffer_preference_ = InputBufferKind::GpuMemBuf;
++  if (base::FeatureList::IsEnabled(kVulkanVideoEncode)) {
++    input_buffer_preference_ = InputBufferKind::CpuMemBuf;
++    storage_type = VideoEncodeAccelerator::Config::StorageType::kShmem;
++  } else {
++    if (input_buffer_preference_ == InputBufferKind::Any) {
++      input_buffer_preference_ = InputBufferKind::GpuMemBuf;
++    }
++    storage_type = VideoEncodeAccelerator::Config::StorageType::kGpuMemoryBuffer;
+   }
+-  storage_type = VideoEncodeAccelerator::Config::StorageType::kGpuMemoryBuffer;
+ #endif
+ 
+   auto vea_config =
+--- a/content/renderer/render_thread_impl.cc
++++ b/content/renderer/render_thread_impl.cc
+@@ -358,17 +358,17 @@
+ 
+ std::string RenderThreadImpl::HistogramCustomizer::HostToCustomHistogramSuffix(
+     const std::string& host) {
+-  if (host == "mail.google.com")
++  if (host == "mail.9oo91e.qjz9zk")
+     return ".gmail";
+-  if (host == "docs.google.com" || host == "drive.google.com")
++  if (host == "docs.9oo91e.qjz9zk" || host == "drive.9oo91e.qjz9zk")
+     return ".docs";
+-  if (host == "plus.google.com")
++  if (host == "plus.9oo91e.qjz9zk")
+     return ".plus";
+-  if (host == "inbox.google.com")
++  if (host == "inbox.9oo91e.qjz9zk")
+     return ".inbox";
+-  if (host == "calendar.google.com")
++  if (host == "calendar.9oo91e.qjz9zk")
+     return ".calendar";
+-  if (host == "www.youtube.com")
++  if (host == "www.y0u1ub3.qjz9zk")
+     return ".youtube";
+   if (IsAlexaTop10NonGoogleSite(host))
+     return ".top10";
+@@ -387,7 +387,7 @@
+       net::registry_controlled_domains::GetDomainAndRegistry(
+           host, net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
+ 
+-  if (sanitized_host == "facebook.com")
++  if (sanitized_host == "f8c3b00k.qjz9zk")
+     return true;
+   if (sanitized_host == "baidu.com")
+     return true;
+@@ -1004,7 +1004,8 @@
+ 
+   const bool enable_video_encode_accelerator =
+ #if BUILDFLAG(IS_LINUX)
+-      base::FeatureList::IsEnabled(media::kAcceleratedVideoEncodeLinux) &&
++      (base::FeatureList::IsEnabled(media::kAcceleratedVideoEncodeLinux) ||
++       base::FeatureList::IsEnabled(media::kVulkanVideoEncode)) &&
+ #else
+       !cmd_line->HasSwitch(switches::kDisableAcceleratedVideoEncode) &&
+ #endif  // BUILDFLAG(IS_LINUX)
+--- a/content/browser/gpu/compositor_util.cc
++++ b/content/browser/gpu/compositor_util.cc
+@@ -157,7 +157,8 @@
+       SafeGetFeatureStatus(
+           gpu_feature_info, gpu::GPU_FEATURE_TYPE_ACCELERATED_VIDEO_ENCODE,
+ #if BUILDFLAG(IS_LINUX)
+-          !base::FeatureList::IsEnabled(media::kAcceleratedVideoEncodeLinux)),
++          !(base::FeatureList::IsEnabled(media::kAcceleratedVideoEncodeLinux) ||
++            base::FeatureList::IsEnabled(media::kVulkanVideoEncode))),
+ #else
+           command_line.HasSwitch(switches::kDisableAcceleratedVideoEncode)),
+ #endif  // BUILDFLAG(IS_LINUX)
+--- a/dev/null
++++ b/media/gpu/vulkan/vulkan_video_encode_accelerator.h
+@@ -0,0 +1,110 @@
++// Copyright 2026 The Vulcanium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_GPU_VULKAN_VULKAN_VIDEO_ENCODE_ACCELERATOR_H_
++#define MEDIA_GPU_VULKAN_VULKAN_VIDEO_ENCODE_ACCELERATOR_H_
++
++#include <cstdint>
++#include <memory>
++#include <optional>
++#include <vector>
++
++#include "base/containers/circular_deque.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/writable_shared_memory_region.h"
++#include "base/sequence_checker.h"
++#include "base/time/time.h"
++#include "media/base/bitstream_buffer.h"
++#include "media/ffmpeg/ffmpeg_deleters.h"
++#include "media/gpu/media_gpu_export.h"
++#include "media/video/video_encode_accelerator.h"
++#include "ui/gfx/geometry/size.h"
++
++struct AVBufferRef;
++struct AVCodecContext;
++
++namespace media {
++
++class MediaLog;
++class VideoFrame;
++
++class MEDIA_GPU_EXPORT VulkanVideoEncodeAccelerator
++    : public VideoEncodeAccelerator {
++ public:
++  VulkanVideoEncodeAccelerator();
++
++  VulkanVideoEncodeAccelerator(const VulkanVideoEncodeAccelerator&) = delete;
++  VulkanVideoEncodeAccelerator& operator=(const VulkanVideoEncodeAccelerator&) =
++      delete;
++
++  ~VulkanVideoEncodeAccelerator() override;
++
++  // VideoEncodeAccelerator implementation:
++  SupportedProfiles GetSupportedProfiles() override;
++  EncoderStatus Initialize(const Config& config,
++                           Client* client,
++                           std::unique_ptr<MediaLog> media_log) override;
++  void Encode(scoped_refptr<VideoFrame> frame, bool force_keyframe) override;
++  void UseOutputBitstreamBuffer(BitstreamBuffer buffer) override;
++  void RequestEncodingParametersChange(
++      const Bitrate& bitrate,
++      uint32_t framerate,
++      const std::optional<gfx::Size>& size) override;
++  void Destroy() override;
++  void Flush(FlushCallback flush_callback) override;
++  bool IsFlushSupported() override;
++
++ private:
++  struct OutputBuffer {
++    OutputBuffer(int32_t id,
++                 base::WritableSharedMemoryMapping mapping,
++                 size_t size);
++    OutputBuffer(OutputBuffer&&);
++    OutputBuffer& operator=(OutputBuffer&&);
++    ~OutputBuffer();
++
++    int32_t id;
++    base::WritableSharedMemoryMapping mapping;
++    size_t size;
++  };
++
++  struct PendingOutput {
++    PendingOutput();
++    PendingOutput(PendingOutput&&);
++    PendingOutput& operator=(PendingOutput&&);
++    ~PendingOutput();
++
++    std::vector<uint8_t> data;
++    bool key_frame = false;
++    base::TimeDelta timestamp;
++  };
++
++  bool ConfigureEncoder(const Config& config);
++  void DrainPackets();
++  void DrainOutputs();
++  void ReleaseResources();
++
++  std::unique_ptr<MediaLog> media_log_;
++  raw_ptr<Client> client_ = nullptr;
++
++  raw_ptr<AVBufferRef> hw_device_ctx_ = nullptr;
++  raw_ptr<AVBufferRef> hw_frames_ctx_ = nullptr;
++  std::unique_ptr<AVCodecContext, ScopedPtrAVFreeContext> codec_context_;
++
++  gfx::Size input_visible_size_;
++  size_t output_buffer_size_ = 0;
++  bool initialized_ = false;
++  bool has_error_ = false;
++
++  base::circular_deque<OutputBuffer> available_bitstream_buffers_;
++  base::circular_deque<PendingOutput> pending_outputs_;
++  base::circular_deque<base::TimeDelta> pending_timestamps_;
++
++  SEQUENCE_CHECKER(sequence_checker_);
++};
++
++}  // namespace media
++
++#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_ENCODE_ACCELERATOR_H_
+--- a/dev/null
++++ b/media/gpu/vulkan/vulkan_video_encode_accelerator.cc
+@@ -0,0 +1,522 @@
++// Copyright 2026 The Vulcanium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/gpu/vulkan/vulkan_video_encode_accelerator.h"
++
++#include <algorithm>
++#include <cstring>
++#include <utility>
++
++#include "base/logging.h"
++#include "base/numerics/safe_conversions.h"
++#include "media/base/media_log.h"
++#include "media/base/video_frame.h"
++#include "media/ffmpeg/ffmpeg_common.h"
++#include "media/video/video_encoder_info.h"
++#include "third_party/libyuv/include/libyuv/convert.h"
++#include "third_party/libyuv/include/libyuv/planar_functions.h"
++
++extern "C" {
++#include <libavcodec/avcodec.h>
++#include <libavutil/hwcontext.h>
++#include <libavutil/opt.h>
++#include <libavutil/pixfmt.h>
++}
++
++namespace media {
++
++namespace {
++
++constexpr uint32_t kDefaultFramerate = 30;
++constexpr uint32_t kDefaultGopLength = 60;
++constexpr size_t kMinOutputBufferSize = 1024 * 1024;
++
++const char* EncoderNameForProfile(VideoCodecProfile profile) {
++  if (profile >= H264PROFILE_MIN && profile <= H264PROFILE_MAX) {
++    return "h264_vulkan";
++  }
++  if (profile >= HEVCPROFILE_MIN && profile <= HEVCPROFILE_MAX) {
++    return "hevc_vulkan";
++  }
++  return nullptr;
++}
++
++int AVProfileForVideoCodecProfile(VideoCodecProfile profile) {
++  switch (profile) {
++    case H264PROFILE_BASELINE:
++      return AV_PROFILE_H264_BASELINE;
++    case H264PROFILE_MAIN:
++      return AV_PROFILE_H264_MAIN;
++    case H264PROFILE_HIGH:
++      return AV_PROFILE_H264_HIGH;
++    case HEVCPROFILE_MAIN:
++      return AV_PROFILE_HEVC_MAIN;
++    default:
++      return AV_PROFILE_UNKNOWN;
++  }
++}
++
++bool CanCreateVulkanEncoderDevice() {
++  static const bool supported = []() {
++    if (!avcodec_find_encoder_by_name("h264_vulkan") &&
++        !avcodec_find_encoder_by_name("hevc_vulkan")) {
++      return false;
++    }
++    AVBufferRef* dev = nullptr;
++    int err = av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_VULKAN, nullptr,
++                                     nullptr, 0);
++    if (err < 0 || !dev) {
++      return false;
++    }
++    av_buffer_unref(&dev);
++    return true;
++  }();
++  return supported;
++}
++
++}  // namespace
++
++VulkanVideoEncodeAccelerator::OutputBuffer::OutputBuffer(
++    int32_t id,
++    base::WritableSharedMemoryMapping mapping,
++    size_t size)
++    : id(id), mapping(std::move(mapping)), size(size) {}
++
++VulkanVideoEncodeAccelerator::OutputBuffer::OutputBuffer(OutputBuffer&&) =
++    default;
++
++VulkanVideoEncodeAccelerator::OutputBuffer&
++VulkanVideoEncodeAccelerator::OutputBuffer::operator=(OutputBuffer&&) = default;
++
++VulkanVideoEncodeAccelerator::OutputBuffer::~OutputBuffer() = default;
++
++VulkanVideoEncodeAccelerator::PendingOutput::PendingOutput() = default;
++VulkanVideoEncodeAccelerator::PendingOutput::PendingOutput(PendingOutput&&) =
++    default;
++VulkanVideoEncodeAccelerator::PendingOutput&
++VulkanVideoEncodeAccelerator::PendingOutput::operator=(PendingOutput&&) =
++    default;
++VulkanVideoEncodeAccelerator::PendingOutput::~PendingOutput() = default;
++
++VulkanVideoEncodeAccelerator::VulkanVideoEncodeAccelerator() = default;
++
++VulkanVideoEncodeAccelerator::~VulkanVideoEncodeAccelerator() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  ReleaseResources();
++}
++
++VideoEncodeAccelerator::SupportedProfiles
++VulkanVideoEncodeAccelerator::GetSupportedProfiles() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  SupportedProfiles profiles;
++  if (!CanCreateVulkanEncoderDevice()) {
++    return profiles;
++  }
++
++  const auto add_profile = [&](VideoCodecProfile codec_profile,
++                               const gfx::Size& max_res) {
++    SupportedProfile p;
++    p.profile = codec_profile;
++    p.min_resolution = gfx::Size(64, 64);
++    p.max_resolution = max_res;
++    p.max_framerate_numerator = 60;
++    p.max_framerate_denominator = 1;
++    p.rate_control_modes =
++        VideoEncodeAccelerator::kConstantMode |
++        VideoEncodeAccelerator::kVariableMode;
++    p.is_software_codec = false;
++    profiles.push_back(p);
++  };
++
++  if (avcodec_find_encoder_by_name("h264_vulkan")) {
++    add_profile(H264PROFILE_BASELINE, gfx::Size(4096, 4096));
++    add_profile(H264PROFILE_MAIN, gfx::Size(4096, 4096));
++    add_profile(H264PROFILE_HIGH, gfx::Size(4096, 4096));
++  }
++  if (avcodec_find_encoder_by_name("hevc_vulkan")) {
++    add_profile(HEVCPROFILE_MAIN, gfx::Size(8192, 8192));
++  }
++
++  return profiles;
++}
++
++EncoderStatus VulkanVideoEncodeAccelerator::Initialize(
++    const Config& config,
++    Client* client,
++    std::unique_ptr<MediaLog> media_log) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  client_ = client;
++  media_log_ = std::move(media_log);
++
++  if (!client_) {
++    return EncoderStatus::Codes::kEncoderInitializationError;
++  }
++
++  if (config.input_format != PIXEL_FORMAT_NV12 &&
++      config.input_format != PIXEL_FORMAT_I420) {
++    return {EncoderStatus::Codes::kUnsupportedFrameFormat,
++            "VulkanVideoEncodeAccelerator only supports NV12 and I420 inputs"};
++  }
++
++  if (!EncoderNameForProfile(config.output_profile)) {
++    return {EncoderStatus::Codes::kEncoderUnsupportedProfile,
++            "Unsupported Vulkan encode profile"};
++  }
++
++  if (!ConfigureEncoder(config)) {
++    ReleaseResources();
++    return EncoderStatus::Codes::kEncoderInitializationError;
++  }
++
++  input_visible_size_ = config.input_visible_size;
++  output_buffer_size_ =
++      std::max<size_t>(kMinOutputBufferSize, input_visible_size_.GetArea() * 2);
++  initialized_ = true;
++  has_error_ = false;
++
++  VideoEncoderInfo info;
++  info.implementation_name = "VulkanVideoEncodeAccelerator";
++  info.is_hardware_accelerated = true;
++  info.supports_native_handle = false;
++  info.supports_frame_size_change = false;
++  client_->NotifyEncoderInfoChange(info);
++
++  client_->RequireBitstreamBuffers(/*input_count=*/2, input_visible_size_,
++                                   output_buffer_size_);
++  return EncoderStatus::Codes::kOk;
++}
++
++bool VulkanVideoEncodeAccelerator::ConfigureEncoder(const Config& config) {
++  ReleaseResources();
++
++  const char* encoder_name = EncoderNameForProfile(config.output_profile);
++  const AVCodec* codec =
++      encoder_name ? avcodec_find_encoder_by_name(encoder_name) : nullptr;
++  if (!codec) {
++    LOG(ERROR) << "VulkanVideoEncodeAccelerator: encoder not found";
++    return false;
++  }
++
++  AVBufferRef* dev = nullptr;
++  int err = av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_VULKAN, nullptr,
++                                   nullptr, 0);
++  if (err < 0 || !dev) {
++    LOG(ERROR) << "VulkanVideoEncodeAccelerator: av_hwdevice_ctx_create failed: "
++               << AVErrorToString(err);
++    return false;
++  }
++  hw_device_ctx_ = dev;
++
++  AVBufferRef* frames_ref = av_hwframe_ctx_alloc(hw_device_ctx_);
++  if (!frames_ref) {
++    return false;
++  }
++  auto* frames_ctx = reinterpret_cast<AVHWFramesContext*>(frames_ref->data);
++  frames_ctx->format = AV_PIX_FMT_VULKAN;
++  frames_ctx->sw_format = AV_PIX_FMT_NV12;
++  frames_ctx->width = std::max(64, config.input_visible_size.width());
++  frames_ctx->height = std::max(64, config.input_visible_size.height());
++  frames_ctx->initial_pool_size = 4;
++
++  err = av_hwframe_ctx_init(frames_ref);
++  if (err < 0) {
++    LOG(ERROR) << "VulkanVideoEncodeAccelerator: av_hwframe_ctx_init failed: "
++               << AVErrorToString(err);
++    av_buffer_unref(&frames_ref);
++    return false;
++  }
++  hw_frames_ctx_ = frames_ref;
++
++  codec_context_.reset(avcodec_alloc_context3(codec));
++  if (!codec_context_) {
++    return false;
++  }
++
++  uint32_t fps = config.framerate > 0 ? config.framerate : kDefaultFramerate;
++  codec_context_->width = config.input_visible_size.width();
++  codec_context_->height = config.input_visible_size.height();
++  codec_context_->time_base = AVRational{1, 1000000};
++  codec_context_->framerate = AVRational{static_cast<int>(fps), 1};
++  codec_context_->pix_fmt = AV_PIX_FMT_VULKAN;
++  codec_context_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
++  codec_context_->hw_frames_ctx = av_buffer_ref(hw_frames_ctx_);
++  codec_context_->gop_size = config.gop_length.value_or(kDefaultGopLength);
++  codec_context_->max_b_frames = 0;
++
++  int profile = AVProfileForVideoCodecProfile(config.output_profile);
++  if (profile != AV_PROFILE_UNKNOWN) {
++    codec_context_->profile = profile;
++  }
++
++  int64_t target_bps = config.bitrate.target_bps();
++  if (target_bps <= 0) {
++    target_bps = 2000000;
++  }
++  codec_context_->bit_rate = target_bps;
++  if (config.bitrate.mode() == Bitrate::Mode::kConstant) {
++    codec_context_->rc_min_rate = target_bps;
++    codec_context_->rc_max_rate = target_bps;
++    codec_context_->rc_buffer_size = static_cast<int>(target_bps);
++  } else if (config.bitrate.peak_bps() > 0) {
++    codec_context_->rc_max_rate = config.bitrate.peak_bps();
++  }
++
++  err = avcodec_open2(codec_context_.get(), codec, nullptr);
++  if (err < 0) {
++    LOG(ERROR) << "VulkanVideoEncodeAccelerator: avcodec_open2 failed for "
++               << encoder_name << ": " << AVErrorToString(err);
++    return false;
++  }
++
++  LOG(WARNING) << "VulkanVideoEncodeAccelerator: initialized " << encoder_name
++               << " (" << codec_context_->width << "x"
++               << codec_context_->height << ")";
++  return true;
++}
++
++void VulkanVideoEncodeAccelerator::Encode(scoped_refptr<VideoFrame> frame,
++                                          bool force_keyframe) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!initialized_ || has_error_ || !codec_context_ || !hw_frames_ctx_) {
++    return;
++  }
++
++  if (!frame || !frame->visible_data(VideoFrame::Plane::kY)) {
++    has_error_ = true;
++    client_->NotifyErrorStatus(
++        {EncoderStatus::Codes::kUnsupportedFrameFormat,
++         "VulkanVideoEncodeAccelerator requires mappable VideoFrame"});
++    return;
++  }
++
++  AVFrame* sw_frame = av_frame_alloc();
++  AVFrame* hw_frame = av_frame_alloc();
++  if (!sw_frame || !hw_frame) {
++    av_frame_free(&sw_frame);
++    av_frame_free(&hw_frame);
++    has_error_ = true;
++    client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
++    return;
++  }
++
++  sw_frame->format = AV_PIX_FMT_NV12;
++  sw_frame->width = codec_context_->width;
++  sw_frame->height = codec_context_->height;
++  int err = av_frame_get_buffer(sw_frame, 32);
++  if (err < 0) {
++    av_frame_free(&sw_frame);
++    av_frame_free(&hw_frame);
++    has_error_ = true;
++    client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
++    return;
++  }
++
++  if (frame->format() == PIXEL_FORMAT_NV12) {
++    libyuv::NV12Copy(
++        frame->visible_data(VideoFrame::Plane::kY),
++        frame->stride(VideoFrame::Plane::kY),
++        frame->visible_data(VideoFrame::Plane::kUV),
++        frame->stride(VideoFrame::Plane::kUV),
++        sw_frame->data[0], sw_frame->linesize[0],
++        sw_frame->data[1], sw_frame->linesize[1],
++        codec_context_->width, codec_context_->height);
++  } else if (frame->format() == PIXEL_FORMAT_I420) {
++    libyuv::I420ToNV12(
++        frame->visible_data(VideoFrame::Plane::kY),
++        frame->stride(VideoFrame::Plane::kY),
++        frame->visible_data(VideoFrame::Plane::kU),
++        frame->stride(VideoFrame::Plane::kU),
++        frame->visible_data(VideoFrame::Plane::kV),
++        frame->stride(VideoFrame::Plane::kV),
++        sw_frame->data[0], sw_frame->linesize[0],
++        sw_frame->data[1], sw_frame->linesize[1],
++        codec_context_->width, codec_context_->height);
++  } else {
++    av_frame_free(&sw_frame);
++    av_frame_free(&hw_frame);
++    has_error_ = true;
++    client_->NotifyErrorStatus(EncoderStatus::Codes::kUnsupportedFrameFormat);
++    return;
++  }
++
++  err = av_hwframe_get_buffer(hw_frames_ctx_, hw_frame, 0);
++  if (err >= 0) {
++    err = av_hwframe_transfer_data(hw_frame, sw_frame, 0);
++  }
++  av_frame_free(&sw_frame);
++
++  if (err < 0) {
++    av_frame_free(&hw_frame);
++    LOG(ERROR) << "VulkanVideoEncodeAccelerator: hwframe upload failed: "
++               << AVErrorToString(err);
++    has_error_ = true;
++    client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
++    return;
++  }
++
++  hw_frame->pts = frame->timestamp().InMicroseconds();
++  if (force_keyframe) {
++    hw_frame->pict_type = AV_PICTURE_TYPE_I;
++  }
++  pending_timestamps_.push_back(frame->timestamp());
++
++  err = avcodec_send_frame(codec_context_.get(), hw_frame);
++  av_frame_free(&hw_frame);
++
++  if (err < 0) {
++    LOG(ERROR) << "VulkanVideoEncodeAccelerator: avcodec_send_frame failed: "
++               << AVErrorToString(err);
++    has_error_ = true;
++    client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
++    return;
++  }
++
++  DrainPackets();
++  DrainOutputs();
++}
++
++void VulkanVideoEncodeAccelerator::DrainPackets() {
++  AVPacket* pkt = av_packet_alloc();
++  if (!pkt) {
++    return;
++  }
++
++  while (true) {
++    int err = avcodec_receive_packet(codec_context_.get(), pkt);
++    if (err == AVERROR(EAGAIN) || err == AVERROR_EOF) {
++      break;
++    }
++    if (err < 0) {
++      LOG(ERROR)
++          << "VulkanVideoEncodeAccelerator: avcodec_receive_packet failed: "
++          << AVErrorToString(err);
++      has_error_ = true;
++      client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
++      break;
++    }
++
++    PendingOutput out;
++    out.data.assign(pkt->data, pkt->data + pkt->size);
++    out.key_frame = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
++    if (!pending_timestamps_.empty()) {
++      out.timestamp = pending_timestamps_.front();
++      pending_timestamps_.pop_front();
++    } else {
++      out.timestamp = base::Microseconds(pkt->pts);
++    }
++    pending_outputs_.push_back(std::move(out));
++    av_packet_unref(pkt);
++  }
++
++  av_packet_free(&pkt);
++}
++
++void VulkanVideoEncodeAccelerator::UseOutputBitstreamBuffer(
++    BitstreamBuffer buffer) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (has_error_) {
++    return;
++  }
++
++  base::UnsafeSharedMemoryRegion region = buffer.TakeRegion();
++  base::WritableSharedMemoryMapping mapping =
++      region.MapAt(buffer.offset(), buffer.size());
++  if (!mapping.IsValid()) {
++    has_error_ = true;
++    client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
++    return;
++  }
++
++  available_bitstream_buffers_.emplace_back(buffer.id(), std::move(mapping),
++                                            buffer.size());
++  DrainOutputs();
++}
++
++void VulkanVideoEncodeAccelerator::DrainOutputs() {
++  while (!pending_outputs_.empty() && !available_bitstream_buffers_.empty()) {
++    PendingOutput out = std::move(pending_outputs_.front());
++    pending_outputs_.pop_front();
++
++    OutputBuffer dst = std::move(available_bitstream_buffers_.front());
++    available_bitstream_buffers_.pop_front();
++
++    if (out.data.size() > dst.size) {
++      LOG(ERROR) << "VulkanVideoEncodeAccelerator: encoded packet ("
++                 << out.data.size() << ") exceeds bitstream buffer ("
++                 << dst.size << ")";
++      has_error_ = true;
++      client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
++      return;
++    }
++
++    std::memcpy(dst.mapping.memory(), out.data.data(), out.data.size());
++    BitstreamBufferMetadata metadata(out.data.size(), out.key_frame,
++                                     out.timestamp);
++    client_->BitstreamBufferReady(dst.id, metadata);
++  }
++}
++
++void VulkanVideoEncodeAccelerator::RequestEncodingParametersChange(
++    const Bitrate& bitrate,
++    uint32_t framerate,
++    const std::optional<gfx::Size>& size) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!codec_context_) {
++    return;
++  }
++  if (bitrate.target_bps() > 0) {
++    codec_context_->bit_rate = bitrate.target_bps();
++  }
++  if (framerate > 0) {
++    codec_context_->framerate =
++        AVRational{static_cast<int>(framerate), 1};
++  }
++}
++
++void VulkanVideoEncodeAccelerator::Flush(FlushCallback flush_callback) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!initialized_ || has_error_ || !codec_context_) {
++    std::move(flush_callback).Run(false);
++    return;
++  }
++
++  int err = avcodec_send_frame(codec_context_.get(), nullptr);
++  if (err < 0 && err != AVERROR_EOF) {
++    std::move(flush_callback).Run(false);
++    return;
++  }
++  DrainPackets();
++  DrainOutputs();
++  std::move(flush_callback).Run(!has_error_);
++}
++
++bool VulkanVideoEncodeAccelerator::IsFlushSupported() {
++  return true;
++}
++
++void VulkanVideoEncodeAccelerator::Destroy() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  ReleaseResources();
++  delete this;
++}
++
++void VulkanVideoEncodeAccelerator::ReleaseResources() {
++  codec_context_.reset();
++  if (hw_frames_ctx_) {
++    AVBufferRef* ref = hw_frames_ctx_.get();
++    hw_frames_ctx_ = nullptr;
++    av_buffer_unref(&ref);
++  }
++  if (hw_device_ctx_) {
++    AVBufferRef* ref = hw_device_ctx_.get();
++    hw_device_ctx_ = nullptr;
++    av_buffer_unref(&ref);
++  }
++  available_bitstream_buffers_.clear();
++  pending_outputs_.clear();
++  pending_timestamps_.clear();
++  initialized_ = false;
++}
++
++}  // namespace media

@@ -1,0 +1,91 @@
+--- a/third_party/ffmpeg/ffmpeg_generated.gni
++++ b/third_party/ffmpeg/ffmpeg_generated.gni
+@@ -622,7 +622,16 @@
+     "libavcodec/cbs.c",
+     "libavcodec/cbs_av1.c",
+     "libavcodec/cbs_bsf.c",
++    "libavcodec/cbs_h264.c",
++    "libavcodec/cbs_h2645.c",
++    "libavcodec/cbs_h265.c",
++    "libavcodec/cbs_sei.c",
+     "libavcodec/cbs_vp9.c",
++    "libavcodec/h264_levels.c",
++    "libavcodec/h265_profile_level.c",
++    "libavcodec/hw_base_encode.c",
++    "libavcodec/hw_base_encode_h264.c",
++    "libavcodec/hw_base_encode_h265.c",
+     "libavcodec/vp9.c",
+     "libavcodec/vp9block.c",
+     "libavcodec/vp9data.c",
+@@ -638,6 +647,9 @@
+     "libavcodec/vulkan.c",
+     "libavcodec/vulkan_av1.c",
+     "libavcodec/vulkan_decode.c",
++    "libavcodec/vulkan_encode.c",
++    "libavcodec/vulkan_encode_h264.c",
++    "libavcodec/vulkan_encode_h265.c",
+     "libavcodec/vulkan_h264.c",
+     "libavcodec/vulkan_hevc.c",
+     "libavcodec/vulkan_video.c",
+--- a/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config.h
++++ b/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config.h
+@@ -6,7 +6,7 @@
+ #define CONFIG_THIS_YEAR 2026
+ #define FFMPEG_DATADIR "/usr/local/share/ffmpeg"
+ #define AVCONV_DATADIR "/usr/local/share/ffmpeg"
+-#define CC_IDENT "clang version 24.0.0git (https://chromium.googlesource.com/a/external/github.com/llvm/llvm-project 86922d51225db089fffb99475eefc4904f79e3c8)"
++#define CC_IDENT "clang version 24.0.0git (https://chromium.9oo91esource.qjz9zk/a/external/github.com/llvm/llvm-project 86922d51225db089fffb99475eefc4904f79e3c8)"
+ #define OS_NAME linux
+ #define EXTERN_PREFIX ""
+ #define EXTERN_ASM 
+@@ -716,8 +716,8 @@
+ #define CONFIG_CBS_APV_LAVF 0
+ #define CONFIG_CBS_AV1 1
+ #define CONFIG_CBS_AV1_LAVF 0
+-#define CONFIG_CBS_H264 0
+-#define CONFIG_CBS_H265 0
++#define CONFIG_CBS_H264 1
++#define CONFIG_CBS_H265 1
+ #define CONFIG_CBS_H266 0
+ #define CONFIG_CBS_JPEG 0
+ #define CONFIG_CBS_LCEVC 0
+@@ -816,7 +816,7 @@
+ #define CONFIG_VIDEODSP 1
+ #define CONFIG_VP3DSP 0
+ #define CONFIG_VP8DSP 0
+-#define CONFIG_VULKAN_ENCODE 0
++#define CONFIG_VULKAN_ENCODE 1
+ #define CONFIG_VULKAN_SEG_GATHER 0
+ #define CONFIG_VVC_SEI 0
+ #define CONFIG_WMA_FREQS 0
+--- a/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config_components.h
++++ b/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config_components.h
+@@ -903,7 +903,7 @@
+ #define CONFIG_H264_V4L2M2M_ENCODER 0
+ #define CONFIG_H264_VAAPI_ENCODER 0
+ #define CONFIG_H264_VIDEOTOOLBOX_ENCODER 0
+-#define CONFIG_H264_VULKAN_ENCODER 0
++#define CONFIG_H264_VULKAN_ENCODER 1
+ #define CONFIG_HEVC_AMF_ENCODER 0
+ #define CONFIG_HEVC_D3D12VA_ENCODER 0
+ #define CONFIG_HEVC_MEDIACODEC_ENCODER 0
+@@ -914,7 +914,7 @@
+ #define CONFIG_HEVC_V4L2M2M_ENCODER 0
+ #define CONFIG_HEVC_VAAPI_ENCODER 0
+ #define CONFIG_HEVC_VIDEOTOOLBOX_ENCODER 0
+-#define CONFIG_HEVC_VULKAN_ENCODER 0
++#define CONFIG_HEVC_VULKAN_ENCODER 1
+ #define CONFIG_LIBKVAZAAR_ENCODER 0
+ #define CONFIG_MJPEG_QSV_ENCODER 0
+ #define CONFIG_MJPEG_VAAPI_ENCODER 0
+--- a/third_party/ffmpeg/chromium/config/Chrome/linux/x64/libavcodec/codec_list.c
++++ b/third_party/ffmpeg/chromium/config/Chrome/linux/x64/libavcodec/codec_list.c
+@@ -1,6 +1,8 @@
+ static const FFCodec * const codec_list[] = {
+     &ff_h264_decoder,
+     &ff_hevc_decoder,
++    &ff_h264_vulkan_encoder,
++    &ff_hevc_vulkan_encoder,
+     &ff_vp9_decoder,
+     &ff_av1_decoder,
+     &ff_aac_decoder,
