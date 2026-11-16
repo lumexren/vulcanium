@@ -72,7 +72,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,337 @@
+@@ -0,0 +1,352 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -128,6 +128,9 @@
 +      {H264PROFILE_MIN, H264PROFILE_MAX, gfx::Size(64, 64),
 +       gfx::Size(4096, 4096), /*allow_encrypted=*/false,
 +       /*require_encrypted=*/false},
++      {HEVCPROFILE_MIN, HEVCPROFILE_MAX, gfx::Size(64, 64),
++       gfx::Size(8192, 8192), /*allow_encrypted=*/false,
++       /*require_encrypted=*/false},
 +      {VP9PROFILE_MIN, VP9PROFILE_MAX, gfx::Size(64, 64),
 +       gfx::Size(8192, 8192), /*allow_encrypted=*/false,
 +       /*require_encrypted=*/false},
@@ -144,6 +147,7 @@
 +  }
 +  switch (config.codec()) {
 +    case VideoCodec::kH264:
++    case VideoCodec::kHEVC:
 +    case VideoCodec::kAV1:
 +    case VideoCodec::kVP9:
 +      return true;
@@ -192,8 +196,8 @@
 +  int err = av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_VULKAN,
 +                                   nullptr, nullptr, 0);
 +  if (err < 0 || !hw_device_ctx_) {
-+    DLOG(WARNING) << "VulkanVideoDecoder: av_hwdevice_ctx_create failed: "
-+                  << AVErrorToString(err);
++    LOG(ERROR) << "VulkanVideoDecoder: av_hwdevice_ctx_create failed: "
++               << AVErrorToString(err);
 +    return false;
 +  }
 +
@@ -204,17 +208,28 @@
 +  }
 +
 +  VideoDecoderConfigToAVCodecContext(config, codec_context_.get());
++  av_freep(&codec_context_->codec_whitelist);
++  codec_context_->codec_whitelist = av_strdup("h264,hevc,vp9,av1");
 +  codec_context_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
 +  codec_context_->get_format = GetVulkanHwFormat;
 +  codec_context_->pkt_timebase = AVRational{1, 1000000};
 +
 +  const AVCodec* codec = avcodec_find_decoder(codec_context_->codec_id);
-+  if (!codec || avcodec_open2(codec_context_.get(), codec, nullptr) < 0) {
-+    DLOG(WARNING) << "VulkanVideoDecoder: avcodec_open2 failed for codec "
-+                  << GetCodecName(config.codec());
++  if (!codec) {
++    LOG(ERROR) << "VulkanVideoDecoder: avcodec_find_decoder failed for codec "
++               << GetCodecName(config.codec());
 +    ReleaseResources();
 +    return false;
 +  }
++  err = avcodec_open2(codec_context_.get(), codec, nullptr);
++  if (err < 0) {
++    LOG(ERROR) << "VulkanVideoDecoder: avcodec_open2 failed for codec "
++               << GetCodecName(config.codec()) << ": " << AVErrorToString(err);
++    ReleaseResources();
++    return false;
++  }
++  LOG(WARNING) << "VulkanVideoDecoder: initialized " << codec->name
++               << " for " << GetCodecName(config.codec());
 +
 +  return true;
 +}
