@@ -5,6 +5,7 @@ out/
 build/
 *.tar.xz
 *.tar.gz
+*.pkg.tar*
 *.zst
 chromium-*/
 crubit/
