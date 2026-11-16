@@ -37,7 +37,7 @@ body:
     attributes:
       label: What Works?
       options:
-        - label: Launches natively on Wayland (`Ozone platform: wayland`)
+        - label: "Launches natively on Wayland (`Ozone platform: wayland`)"
         - label: "`GaneshVulkan` + `ANGLE_VULKAN` active in `chrome://gpu`"
         - label: WebGPU works
         - label: "`VulkanVideoDecoder` hardware decoding works (H.264 / HEVC / VP9 / AV1)"
