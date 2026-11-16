@@ -422,13 +422,12 @@
  
  namespace media {
  
-@@ -166,6 +169,13 @@
+@@ -166,6 +169,12 @@
   protected:
    std::unique_ptr<VideoDecoder> CreatePlatformVideoDecoder(
        VideoDecoderTraits& traits) final {
 +#if BUILDFLAG(ENABLE_VULKAN)
-+    if (base::FeatureList::IsEnabled(kVulkanVideoDecode) &&
-+        gpu_preferences_.gr_context_type == gpu::GrContextType::kVulkan) {
++    if (base::FeatureList::IsEnabled(kVulkanVideoDecode)) {
 +      return std::make_unique<VulkanVideoDecoder>(traits.media_log->Clone());
 +    }
 +#endif
