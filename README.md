@@ -42,6 +42,6 @@ makepkg -si
 
 ## Notes & Limitations
 
-- **Base Version:** Targets Chromium `157.0.8103.78`.
-- **In-Process GPU (`--in-process-gpu`):** Enabled by default in `config/vulcanium-flags.conf` so `VK_KHR_wayland_surface` on the GPU thread can share the browser process's `wl_display` and `wl_surface` handles directly.
-- **Tested Environment:** Arch Linux, KDE Plasma Wayland (KWin), NVIDIA RTX 3060 (`620.70.06`).
+- Targets Chromium `157.0.8103.78`.
+- Uses `--in-process-gpu` so `VK_KHR_wayland_surface` shares Wayland surface handles directly.
+- Tested on Arch Linux, KDE Plasma Wayland, and NVIDIA RTX 3060.
