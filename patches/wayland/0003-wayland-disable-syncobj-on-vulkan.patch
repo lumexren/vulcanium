@@ -1,0 +1,16 @@
+--- a/ui/ozone/platform/wayland/host/wayland_connection.cc
++++ b/ui/ozone/platform/wayland/host/wayland_connection.cc
+@@ -671,8 +671,11 @@
+   } else if (!linux_drm_syncobj_manager_ &&
+              (UNSAFE_TODO(
+                   strcmp(interface, "wp_linux_drm_syncobj_manager_v1")) == 0)) {
+-    if (enable_linux_drm_syncobj_for_testing_ ||
+-        MinSupportedKernelForLinuxDrmSyncobj()) {
++    // Disable wp_linux_drm_syncobj_manager_v1 when Vulkan is active, as
++    // NVIDIA SYNC_FD -> drm_syncobj timeline import can leave KWin/Mutter
++    // waiting on acquire points and rendering a transparent window.
++    if (false && (enable_linux_drm_syncobj_for_testing_ ||
++                  MinSupportedKernelForLinuxDrmSyncobj())) {
+       linux_drm_syncobj_manager_ = wl::Bind<wp_linux_drm_syncobj_manager_v1>(
+           registry, name, std::min(version, kMaxLinuxDrmSyncobjVersion));
+       if (!linux_drm_syncobj_manager_) {
