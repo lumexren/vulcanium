@@ -10,42 +10,6 @@
  #if BUILDFLAG(IS_MAC)
 --- a/media/base/media_switches.cc
 +++ b/media/base/media_switches.cc
-@@ -305,7 +305,7 @@
- // Use exclusive mode audio streaming for Windows Vista and higher.
- // Leads to lower latencies for audio streams which uses the
- // AudioParameters::AUDIO_PCM_LOW_LATENCY audio path.
--// See http://msdn.microsoft.com/en-us/library/windows/desktop/dd370844.aspx
-+// See http://msdn.m1cr050ft.qjz9zk/en-us/library/windows/desktop/dd370844.aspx
- // for details.
- const char kEnableExclusiveAudio[] = "enable-exclusive-audio";
- // Use Windows WaveOut/In audio API even if Core Audio is supported.
-@@ -727,7 +727,7 @@
- );
- 
- // Enables the Live Caption feature on supported devices.
--BASE_FEATURE(kLiveCaption, base::FEATURE_ENABLED_BY_DEFAULT);
-+BASE_FEATURE(kLiveCaption, base::FEATURE_DISABLED_BY_DEFAULT);
- 
- // Enable automatic downloading of speech recognition language packs.
- BASE_FEATURE(kLiveCaptionAutomaticLanguageDownload,
-@@ -1236,7 +1236,7 @@
- 
- #if BUILDFLAG(ENABLE_SYMPHONIA_DEMUXER)
- // Enables the use of Symphonia for container demuxing.
--// Owner: jophba@chromium.org
-+// Owner: jophba@ch40m1um.qjz9zk
- // TODO(crbug.com/550619039, jophba): Consider for removal in M177.
- BASE_FEATURE(kSymphoniaDemuxing, base::FEATURE_DISABLED_BY_DEFAULT);
- BASE_FEATURE(kSymphoniaAacDemuxing, base::FEATURE_DISABLED_BY_DEFAULT);
-@@ -1273,7 +1273,7 @@
-              base::FEATURE_DISABLED_BY_DEFAULT);
- 
- // Enables WebRTC to suspend when the screen is turned off on Android.
--// Owner: seannli@google.com
-+// Owner: seannli@9oo91e.qjz9zk
- // Expiry: When Android provides a dedicated API for system suspend.
- BASE_FEATURE(kAndroidSuspendWebRtcOnScreenOff,
-              base::FEATURE_DISABLED_BY_DEFAULT);
 @@ -1514,6 +1514,10 @@
  // AV_HWDEVICE_TYPE_VULKAN) on Linux when Vulkan is active.
  BASE_FEATURE(kVulkanVideoDecode, base::FEATURE_ENABLED_BY_DEFAULT);
@@ -57,32 +21,6 @@
  #endif  // BUILDFLAG(IS_LINUX)
  
  #if BUILDFLAG(IS_MAC)
-@@ -1715,14 +1719,14 @@
- #if defined(ARCH_CPU_ARM_FAMILY)
- // Enable AR30 overlays for 10-bit ARM HWDRM content. If disabled, we will use
- // ARGB8888 instead.
--// Owner: greenjustin@google.com
-+// Owner: greenjustin@9oo91e.qjz9zk
- // Expiry: When AR30 overlays are stable on devices that support them.
- BASE_FEATURE(kEnableArmHwdrm10bitOverlays, base::FEATURE_ENABLED_BY_DEFAULT);
- 
- // Enable populating the |needs_detiling| field in |VideoFrameMetadata|. This in
- // turn triggers Skia to use the |VulkanImageProcessor| for detiling protected
- // content.
--// Owner: greenjustin@google.com
-+// Owner: greenjustin@9oo91e.qjz9zk
- // Expiry: When Vulkan detiling is thoroughly tested and verified to work.
- BASE_FEATURE(kEnableProtectedVulkanDetiling, base::FEATURE_ENABLED_BY_DEFAULT);
- 
-@@ -1742,7 +1746,7 @@
- // Experimental support for GL based scaling for NV12 on Trogdor.
- // Normally LibYUV is used to scale these frames. This flag enables
- // an experimental GL-based scaling method.
--// Owner: bchoobineh@chromium.org
-+// Owner: bchoobineh@ch40m1um.qjz9zk
- // Expiry: When GLImageProcessor is deleted
- BASE_FEATURE(kUseGLForScaling, base::FEATURE_ENABLED_BY_DEFAULT);
- 
 --- a/media/gpu/BUILD.gn
 +++ b/media/gpu/BUILD.gn
 @@ -186,8 +186,13 @@
@@ -172,39 +110,6 @@
    auto vea_config =
 --- a/content/renderer/render_thread_impl.cc
 +++ b/content/renderer/render_thread_impl.cc
-@@ -358,17 +358,17 @@
- 
- std::string RenderThreadImpl::HistogramCustomizer::HostToCustomHistogramSuffix(
-     const std::string& host) {
--  if (host == "mail.google.com")
-+  if (host == "mail.9oo91e.qjz9zk")
-     return ".gmail";
--  if (host == "docs.google.com" || host == "drive.google.com")
-+  if (host == "docs.9oo91e.qjz9zk" || host == "drive.9oo91e.qjz9zk")
-     return ".docs";
--  if (host == "plus.google.com")
-+  if (host == "plus.9oo91e.qjz9zk")
-     return ".plus";
--  if (host == "inbox.google.com")
-+  if (host == "inbox.9oo91e.qjz9zk")
-     return ".inbox";
--  if (host == "calendar.google.com")
-+  if (host == "calendar.9oo91e.qjz9zk")
-     return ".calendar";
--  if (host == "www.youtube.com")
-+  if (host == "www.y0u1ub3.qjz9zk")
-     return ".youtube";
-   if (IsAlexaTop10NonGoogleSite(host))
-     return ".top10";
-@@ -387,7 +387,7 @@
-       net::registry_controlled_domains::GetDomainAndRegistry(
-           host, net::registry_controlled_domains::INCLUDE_PRIVATE_REGISTRIES);
- 
--  if (sanitized_host == "facebook.com")
-+  if (sanitized_host == "f8c3b00k.qjz9zk")
-     return true;
-   if (sanitized_host == "baidu.com")
-     return true;
 @@ -1004,7 +1004,8 @@
  
    const bool enable_video_encode_accelerator =
