@@ -1,0 +1,13 @@
+--- a/chrome/browser/ui/startup/bad_flags_prompt.cc
++++ b/chrome/browser/ui/startup/bad_flags_prompt.cc
+@@ -158,10 +158,6 @@
+     // updating components won't be performed until shutdown.
+     switches::kDisableBestEffortTasks,
+ 
+-    // GPU sanboxing isn't implemented for the Web GPU API yet meaning it would
+-    // be possible to read GPU data for other Chromium processes.
+-    switches::kEnableUnsafeWebGPU,
+-
+ #if BUILDFLAG(IS_WIN)
+     // These flags allow loading libraries from specified paths, which may
+     // compromise process integrity and security.
