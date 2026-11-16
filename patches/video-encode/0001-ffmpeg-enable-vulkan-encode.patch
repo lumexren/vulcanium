@@ -29,15 +29,6 @@
      "libavcodec/vulkan_video.c",
 --- a/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config.h
 +++ b/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config.h
-@@ -6,7 +6,7 @@
- #define CONFIG_THIS_YEAR 2026
- #define FFMPEG_DATADIR "/usr/local/share/ffmpeg"
- #define AVCONV_DATADIR "/usr/local/share/ffmpeg"
--#define CC_IDENT "clang version 24.0.0git (https://chromium.googlesource.com/a/external/github.com/llvm/llvm-project 86922d51225db089fffb99475eefc4904f79e3c8)"
-+#define CC_IDENT "clang version 24.0.0git (https://chromium.9oo91esource.qjz9zk/a/external/github.com/llvm/llvm-project 86922d51225db089fffb99475eefc4904f79e3c8)"
- #define OS_NAME linux
- #define EXTERN_PREFIX ""
- #define EXTERN_ASM 
 @@ -716,8 +716,8 @@
  #define CONFIG_CBS_APV_LAVF 0
  #define CONFIG_CBS_AV1 1
