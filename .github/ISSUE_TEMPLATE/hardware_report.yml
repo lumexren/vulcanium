@@ -1,0 +1,50 @@
+name: Hardware Compatibility Report
+description: Share test results on AMD, Intel, NVIDIA, or different Wayland compositors
+title: "[Compat]: "
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Vulcanium is currently primarily tested on NVIDIA + KDE Plasma (KWin). Reports from AMD, Intel, and other compositors help verify what works out of the box!
+
+  - type: input
+    id: hardware
+    attributes:
+      label: GPU & Driver / Mesa Version
+      placeholder: "e.g. Radeon RX 6700 XT, Mesa RADV 25.x"
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: Distro & Wayland Compositor
+      placeholder: "e.g. Arch Linux, Hyprland 0.48"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Vulcanium Version / Package
+      placeholder: "e.g. vulcanium-bin 157.0.8103.78-1"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: What Works?
+      options:
+        - label: Launches natively on Wayland (`Ozone platform: wayland`)
+        - label: "`GaneshVulkan` + `ANGLE_VULKAN` active in `chrome://gpu`"
+        - label: WebGPU works
+        - label: "`VulkanVideoDecoder` hardware decoding works (H.264 / HEVC / VP9 / AV1)"
+        - label: Windowing (resize, minimize/maximize, popups, tooltips) works cleanly
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes & Observations
+      description: Mention which codecs worked, any flags you had to change, or any glitches noticed.

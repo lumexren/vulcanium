@@ -1,0 +1,85 @@
+name: Bug Report
+description: Report a crash, rendering glitch, Wayland issue, or hardware video decoding problem
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please provide your GPU, driver, and compositor details so we can reproduce and diagnose the issue.
+
+  - type: dropdown
+    id: package
+    attributes:
+      label: Package / Build Type
+      options:
+        - vulcanium (AUR)
+        - vulcanium-bin (AUR / GitHub Release)
+        - ungoogled-vulcanium (AUR)
+        - helium-vulcanium (AUR)
+        - Manual / Custom build
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Vulcanium Version
+      placeholder: "e.g. 157.0.8103.78-1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: gpu_vendor
+    attributes:
+      label: GPU Vendor
+      options:
+        - NVIDIA
+        - AMD
+        - Intel
+        - Hybrid / Multi-GPU
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: gpu_driver
+    attributes:
+      label: GPU Model & Driver / Mesa Version
+      placeholder: "e.g. RTX 4070 / NVIDIA 620.70.06 or RX 7800 XT / Mesa 25.x"
+    validations:
+      required: true
+
+  - type: input
+    id: compositor
+    attributes:
+      label: Distro & Wayland Compositor
+      placeholder: "e.g. Arch Linux, KDE Plasma 6 (KWin), Hyprland, Sway, GNOME Mutter"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug clearly (black screen, crash, stutter, windowing glitch, VkVideo fallback, etc.).
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Launch vulcanium with ...
+        2. Open ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Terminal Output / chrome://gpu / chrome://media-internals
+      description: Paste any relevant terminal errors, `vulkaninfo --summary`, or `chrome://gpu` status.
+      render: text
