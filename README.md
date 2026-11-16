@@ -45,3 +45,4 @@ makepkg -si
 - Targets Chromium `157.0.8103.78`.
 - Uses `--in-process-gpu` so `VK_KHR_wayland_surface` shares Wayland surface handles directly.
 - Tested on Arch Linux, KDE Plasma Wayland, and NVIDIA RTX 3060.
+- **Do not enable VA-API flags (`VaapiOnNvidiaGPUs`, `VaapiVideoDecoder`, `AcceleratedVideoDecodeLinuxGL`, etc.) alongside `VulkanVideoDecode`:** on NVIDIA with `libva-nvidia-driver`, VA-API conflicts with Vulkan video decoding and can cause green flashing during video playback. If your `~/.config/chromium-flags.conf` (or `vulcanium-flags.conf`) has VA-API flags enabled, remove them or add `--disable-features=VaapiVideoDecoder,VaapiVideoEncoder,VaapiVideoDecodeLinuxGL,VaapiOnNvidiaGPUs,AcceleratedVideoDecodeLinuxGL`.
