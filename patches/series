@@ -3,6 +3,7 @@
 
 # Branding
 branding/0001-vulcanium-branding.patch
+branding/0002-hide-unsafe-webgpu-bad-flag-banner.patch
 
 # Vulkan & ANGLE
 vulkan/0001-angle-dmabuf-graceful-fallback.patch
@@ -14,6 +15,7 @@ wayland/0002-wayland-gbm-vulkan-modifier-fallback.patch
 wayland/0003-wayland-disable-syncobj-on-vulkan.patch
 wayland/0004-wayland-vulkan-linear-dmabuf-pixmap.patch
 wayland/0005-wayland-khr-surface-swapchain.patch
+wayland/0006-wayland-vulkan-surface-alpha-and-windowing.patch
 
 # Vulkan Video Decoding
 video-decode/0001-enable-vulkan-video-flag-and-linux-client.patch
