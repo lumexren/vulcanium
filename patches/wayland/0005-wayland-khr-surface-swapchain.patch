@@ -254,9 +254,19 @@
  };
  
  }  // namespace ui
---- a/ui/ozone/platform/wayland/ozone_platform_wayland.cc	2026-11-16 09:25:47.757851661 +0300
-+++ b/ui/ozone/platform/wayland/ozone_platform_wayland.cc	2026-11-16 09:24:41.720034478 +0300
-@@ -280,8 +280,9 @@
+--- a/ui/ozone/platform/wayland/ozone_platform_wayland.cc
++++ b/ui/ozone/platform/wayland/ozone_platform_wayland.cc
+@@ -260,6 +260,9 @@
+     KeyboardLayoutEngineManager::SetKeyboardLayoutEngine(
+         keyboard_layout_engine_.get());
+     connection_ = std::make_unique<WaylandConnection>();
++    if (features::IsUsingVulkan() && args.single_process) {
++      connection_->set_use_vulkan_surface(true);
++    }
+ 
+     // wl_egl requires single_process and it needs to watch wayland event on gpu
+     // thread. In this case we need thread polling event watcher on browser
+@@ -280,8 +283,9 @@
        drm_render_node_fd = drm_render_node.PassFD();
      }
      if (use_threaded_polling) {

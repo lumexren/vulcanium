@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.h
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,69 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -13,6 +13,7 @@
 +#include "base/functional/callback.h"
 +#include "base/memory/scoped_refptr.h"
 +#include "base/sequence_checker.h"
++#include "media/base/supported_video_decoder_config.h"
 +#include "media/base/video_decoder.h"
 +#include "media/base/video_decoder_config.h"
 +#include "media/ffmpeg/ffmpeg_deleters.h"
@@ -31,6 +32,7 @@
 +class MEDIA_GPU_EXPORT VulkanVideoDecoder : public VideoDecoder {
 + public:
 +  static bool IsSupported(const VideoDecoderConfig& config);
++  static SupportedVideoDecoderConfigs GetSupportedConfigs();
 +
 +  explicit VulkanVideoDecoder(std::unique_ptr<MediaLog> media_log);
 +  VulkanVideoDecoder(const VulkanVideoDecoder&) = delete;
@@ -70,7 +72,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,337 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -119,6 +121,21 @@
 +}
 +
 +}  // namespace
++
++// static
++SupportedVideoDecoderConfigs VulkanVideoDecoder::GetSupportedConfigs() {
++  return {
++      {H264PROFILE_MIN, H264PROFILE_MAX, gfx::Size(64, 64),
++       gfx::Size(4096, 4096), /*allow_encrypted=*/false,
++       /*require_encrypted=*/false},
++      {VP9PROFILE_MIN, VP9PROFILE_MAX, gfx::Size(64, 64),
++       gfx::Size(8192, 8192), /*allow_encrypted=*/false,
++       /*require_encrypted=*/false},
++      {AV1PROFILE_MIN, AV1PROFILE_MAX, gfx::Size(64, 64),
++       gfx::Size(8192, 8192), /*allow_encrypted=*/false,
++       /*require_encrypted=*/false},
++  };
++}
 +
 +// static
 +bool VulkanVideoDecoder::IsSupported(const VideoDecoderConfig& config) {
@@ -395,21 +412,21 @@
 +}  // namespace media
 --- a/media/gpu/BUILD.gn
 +++ b/media/gpu/BUILD.gn
-@@ -180,6 +180,14 @@
-     if (enable_vulkan) {
-       deps += [ "//gpu/vulkan" ]
+@@ -182,6 +182,14 @@
      }
-+  }
-+
+   }
+ 
 +  if (is_linux && enable_vulkan) {
 +    sources += [
 +      "vulkan/vulkan_video_decoder.cc",
 +      "vulkan/vulkan_video_decoder.h",
 +    ]
 +    deps += [ "//third_party/ffmpeg" ]
-   }
- 
++  }
++
    if (use_v4l2_codec) {
+     public_deps += [ "//media/gpu/v4l2" ]
+   }
 --- a/media/mojo/services/gpu_mojo_media_client_linux.cc
 +++ b/media/mojo/services/gpu_mojo_media_client_linux.cc
 @@ -19,6 +19,9 @@
@@ -422,7 +439,17 @@
  
  namespace media {
  
-@@ -166,6 +169,12 @@
+@@ -140,7 +143,8 @@
+           // NVIDIA drivers have a broken implementation of most va_* methods,
+           // ARM & AMD aren't tested yet, and ImgTec/Qualcomm don't have a vaapi
+           // driver.
+-          if (base::FeatureList::IsEnabled(kVaapiIgnoreDriverChecks)) {
++          if (base::FeatureList::IsEnabled(kVaapiIgnoreDriverChecks) ||
++              base::FeatureList::IsEnabled(kVulkanVideoDecode)) {
+             return VideoDecoderType::kVaapi;
+           }
+           return VideoDecoderType::kUnknown;
+@@ -166,6 +170,12 @@
   protected:
    std::unique_ptr<VideoDecoder> CreatePlatformVideoDecoder(
        VideoDecoderTraits& traits) final {
@@ -435,3 +462,28 @@
      const auto decoder_type =
          GetActualPlatformDecoderImplementation(gpu_preferences_, gpu_info_);
      // The browser process guarantees this CHECK.
+@@ -203,6 +213,12 @@
+       mojo::PendingRemote<mojom::VideoDecoder> oop_video_decoder,
+       base::OnceCallback<void(mojo::PendingRemote<mojom::VideoDecoder>)> cb)
+       final {
++#if BUILDFLAG(ENABLE_VULKAN)
++    if (base::FeatureList::IsEnabled(kVulkanVideoDecode)) {
++      std::move(cb).Run(std::move(oop_video_decoder));
++      return;
++    }
++#endif
+     switch (
+         GetActualPlatformDecoderImplementation(gpu_preferences_, gpu_info_)) {
+       case VideoDecoderType::kOutOfProcess:
+@@ -218,6 +234,11 @@
+ 
+   std::optional<SupportedVideoDecoderConfigs>
+   GetPlatformSupportedVideoDecoderConfigs() final {
++#if BUILDFLAG(ENABLE_VULKAN)
++    if (base::FeatureList::IsEnabled(kVulkanVideoDecode)) {
++      return VulkanVideoDecoder::GetSupportedConfigs();
++    }
++#endif
+     VideoDecoderType decoder_implementation =
+         GetActualPlatformDecoderImplementation(gpu_preferences_, gpu_info_);
+     base::UmaHistogramEnumeration("Media.VaapiLinux.SupportedVideoDecoder",
