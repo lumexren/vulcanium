@@ -13,6 +13,7 @@ wayland/0001-ozone-wayland-vulkan-enable.patch
 wayland/0002-wayland-gbm-vulkan-modifier-fallback.patch
 wayland/0003-wayland-disable-syncobj-on-vulkan.patch
 wayland/0004-wayland-vulkan-linear-dmabuf-pixmap.patch
+wayland/0005-wayland-khr-surface-swapchain.patch
 
 # Vulkan Video Decoding
 video-decode/0001-enable-vulkan-video-flag-and-linux-client.patch

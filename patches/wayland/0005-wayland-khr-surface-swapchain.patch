@@ -1,0 +1,206 @@
+--- a/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.h	2026-11-16 09:25:47.752851600 +0300
++++ b/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.h	2026-11-16 09:24:33.756934168 +0300
+@@ -7,14 +7,18 @@
+ 
+ #include <memory>
+ 
++#include "base/memory/raw_ptr.h"
+ #include "gpu/vulkan/vulkan_implementation.h"
+ #include "gpu/vulkan/vulkan_instance.h"
+ 
+ namespace ui {
+ 
++class WaylandConnection;
++
+ class VulkanImplementationWayland : public gpu::VulkanImplementation {
+  public:
+-  explicit VulkanImplementationWayland(bool use_swiftshader = false);
++  explicit VulkanImplementationWayland(bool use_swiftshader = false,
++                                       WaylandConnection* connection = nullptr);
+   ~VulkanImplementationWayland() override;
+ 
+   VulkanImplementationWayland(const VulkanImplementationWayland&) = delete;
+@@ -50,6 +54,7 @@
+ 
+  private:
+   gpu::VulkanInstance vulkan_instance_;
++  raw_ptr<WaylandConnection> connection_ = nullptr;
+ };
+ 
+ }  // namespace ui
+--- a/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc	2026-11-16 09:25:47.754478506 +0300
++++ b/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc	2026-11-16 09:25:20.978523345 +0300
+@@ -12,17 +12,24 @@
+ #include "base/notimplemented.h"
+ #include "base/notreached.h"
+ #include "base/path_service.h"
++#include "gpu/vulkan/vulkan_function_pointers.h"
+ #include "gpu/vulkan/vulkan_image.h"
+ #include "gpu/vulkan/vulkan_instance.h"
+ #include "gpu/vulkan/vulkan_surface.h"
+ #include "gpu/vulkan/vulkan_util.h"
+ #include "ui/gfx/gpu_fence.h"
+ #include "ui/gfx/gpu_memory_buffer_handle.h"
++#include "ui/ozone/platform/wayland/host/wayland_connection.h"
++#include "ui/ozone/platform/wayland/host/wayland_surface.h"
++#include "ui/ozone/platform/wayland/host/wayland_window.h"
++#include "ui/ozone/platform/wayland/host/wayland_window_manager.h"
+ 
+ namespace ui {
+ 
+-VulkanImplementationWayland::VulkanImplementationWayland(bool use_swiftshader)
+-    : gpu::VulkanImplementation(use_swiftshader) {}
++VulkanImplementationWayland::VulkanImplementationWayland(
++    bool use_swiftshader,
++    WaylandConnection* connection)
++    : gpu::VulkanImplementation(use_swiftshader), connection_(connection) {}
+ 
+ VulkanImplementationWayland::~VulkanImplementationWayland() {}
+ 
+@@ -31,6 +38,10 @@
+       VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
+       VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
+   };
++  if (using_surface && connection_) {
++    required_extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
++    required_extensions.push_back(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME);
++  }
+ 
+   base::FilePath path;
+   if (use_swiftshader()) {
+@@ -51,16 +62,53 @@
+ 
+ std::unique_ptr<gpu::VulkanSurface>
+ VulkanImplementationWayland::CreateViewSurface(gfx::AcceleratedWidget window) {
+-  NOTIMPLEMENTED();
+-  return nullptr;
++  if (!connection_ || !connection_->display()) {
++    return nullptr;
++  }
++  WaylandWindow* wayland_window =
++      connection_->window_manager()->GetWindow(window);
++  if (!wayland_window || !wayland_window->root_surface() ||
++      !wayland_window->root_surface()->surface()) {
++    return nullptr;
++  }
++  auto create_wayland_surface =
++      reinterpret_cast<PFN_vkCreateWaylandSurfaceKHR>(
++          gpu::GetVulkanFunctionPointers()->vkGetInstanceProcAddr(
++              vulkan_instance_.vk_instance(), "vkCreateWaylandSurfaceKHR"));
++  if (!create_wayland_surface) {
++    return nullptr;
++  }
++  VkWaylandSurfaceCreateInfoKHR info = {
++      .sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR,
++      .display = connection_->display(),
++      .surface = wayland_window->root_surface()->surface(),
++  };
++  VkSurfaceKHR vk_surface = VK_NULL_HANDLE;
++  if (create_wayland_surface(vulkan_instance_.vk_instance(), &info, nullptr,
++                             &vk_surface) != VK_SUCCESS) {
++    return nullptr;
++  }
++  return std::make_unique<gpu::VulkanSurface>(vulkan_instance_.vk_instance(),
++                                            window, vk_surface);
+ }
+ 
+ bool VulkanImplementationWayland::GetPhysicalDevicePresentationSupport(
+     VkPhysicalDevice device,
+     const std::vector<VkQueueFamilyProperties>& queue_family_properties,
+     uint32_t queue_family_index) {
+-  NOTIMPLEMENTED();
+-  return false;
++  if (!connection_ || !connection_->display()) {
++    return false;
++  }
++  auto get_presentation_support =
++      reinterpret_cast<PFN_vkGetPhysicalDeviceWaylandPresentationSupportKHR>(
++          gpu::GetVulkanFunctionPointers()->vkGetInstanceProcAddr(
++              vulkan_instance_.vk_instance(),
++              "vkGetPhysicalDeviceWaylandPresentationSupportKHR"));
++  if (!get_presentation_support) {
++    return false;
++  }
++  return get_presentation_support(device, queue_family_index,
++                                  connection_->display()) == VK_TRUE;
+ }
+ 
+ std::vector<const char*>
+@@ -71,6 +119,9 @@
+       VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
+       VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+   };
++  if (connection_) {
++    result.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
++  }
+ 
+   if (!use_swiftshader())
+     result.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+--- a/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc	2026-11-16 09:25:47.763296713 +0300
++++ b/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc	2026-11-16 09:24:39.928011939 +0300
+@@ -146,6 +146,12 @@
+     gfx::AcceleratedWidget window) {
+   if (gl::IsSoftwareGLImplementation(gl::GetGLImplementationParts())) {
+     return nullptr;
++  } else if (connection_ &&
++             gl::GetGLImplementationParts().angle ==
++                 gl::ANGLEImplementation::kVulkan) {
++    // Use native VK_KHR_wayland_surface (SkiaOutputDeviceVulkan) when
++    // running in-process GPU with ANGLE Vulkan.
++    return nullptr;
+   } else {
+ #if defined(WAYLAND_GBM)
+   // If there is a gbm device available, use surfaceless gl surface.
+@@ -245,7 +251,8 @@
+ std::unique_ptr<gpu::VulkanImplementation>
+ WaylandSurfaceFactory::CreateVulkanImplementation(bool use_swiftshader,
+                                                   bool allow_protected_memory) {
+-  return std::make_unique<VulkanImplementationWayland>(use_swiftshader);
++  return std::make_unique<VulkanImplementationWayland>(use_swiftshader,
++                                                       connection_);
+ }
+ #endif
+ 
+@@ -261,6 +268,18 @@
+     return nullptr;
+   }
+ #if defined(WAYLAND_GBM)
++  if (device_queue &&
++      (format == viz::SinglePlaneFormat::kRGBA_8888 ||
++       format == viz::SinglePlaneFormat::kBGRA_8888 ||
++       format == viz::SinglePlaneFormat::kRGBX_8888 ||
++       format == viz::SinglePlaneFormat::kBGRX_8888)) {
++    scoped_refptr<GbmPixmapWayland> vk_pixmap =
++        base::MakeRefCounted<GbmPixmapWayland>(buffer_manager_);
++    if (vk_pixmap->InitializeVulkanLinearBuffer(widget, device_queue, size,
++                                                format, framebuffer_size)) {
++      return vk_pixmap;
++    }
++  }
+   auto* gbm_device = buffer_manager_->GetGbmDevice();
+   if (gbm_device && gbm_device->CanCreateBufferForFormat(
+                         GetFourCCFormatFromSharedImageFormat(format))) {
+--- a/ui/ozone/platform/wayland/host/wayland_connection.h	2026-11-16 09:25:47.755851637 +0300
++++ b/ui/ozone/platform/wayland/host/wayland_connection.h	2026-11-16 09:25:16.726470838 +0300
+@@ -74,6 +74,7 @@
+ 
+ class WaylandConnection {
+  public:
++  friend class VulkanImplementationWayland;
+   WaylandConnection();
+   WaylandConnection(const WaylandConnection&) = delete;
+   WaylandConnection& operator=(const WaylandConnection&) = delete;
+--- a/ui/ozone/platform/wayland/ozone_platform_wayland.cc	2026-11-16 09:25:47.757851661 +0300
++++ b/ui/ozone/platform/wayland/ozone_platform_wayland.cc	2026-11-16 09:24:41.720034478 +0300
+@@ -280,8 +280,9 @@
+       drm_render_node_fd = drm_render_node.PassFD();
+     }
+     if (use_threaded_polling) {
+-      // If gbm is used, wl_egl is not used so threaded polling is not required.
+-      use_threaded_polling = drm_node_path.empty();
++      // Keep threaded polling enabled in single-process / in-process-gpu mode
++      // so Wayland WSI (VK_KHR_wayland_surface) on the GPU thread is safe.
++      use_threaded_polling = true;
+     }
+ #endif
+     if (!connection_->Initialize(use_threaded_polling)) {
