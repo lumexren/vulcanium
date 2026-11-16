@@ -1,16 +1,6 @@
 --- a/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
 +++ b/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
-@@ -73,7 +73,8 @@ bool GbmPixmapWayland::InitializeBuffer(
-     // mechanism for determine which modifiers produce artifacts we should
-     // default |DRM_FORMAT_MOD_LINEAR| here.
-     if (gbm_flags & GBM_BO_USE_LINEAR ||
--        gbm_flags & GBM_BO_USE_FRONT_RENDERING) {
-+        gbm_flags & GBM_BO_USE_FRONT_RENDERING ||
-+        gbm_flags & GBM_BO_USE_SCANOUT) {
-       modifiers = {DRM_FORMAT_MOD_LINEAR};
-     }
-     gbm_bo_ = gbm_device->CreateBufferWithModifiers(fourcc_format, size,
-@@ -86,7 +87,15 @@ bool GbmPixmapWayland::InitializeBuffer(
+@@ -86,7 +86,15 @@ bool GbmPixmapWayland::InitializeBuffer(
      // rendering, while wlroots would announce MOD_LINEAR and MOD_INVALID).
      // In such cases gbm_bo allocation may fail, where we should fallback to
      // creation without modifiers, and leave the choices to driver.
@@ -26,3 +16,23 @@
        gbm_bo_ = gbm_device->CreateBuffer(fourcc_format, size, gbm_flags);
      }
    }
+@@ -256,9 +264,18 @@ void GbmPixmapWayland::CreateDmabufBasedWlBuffer(
+   // The wl_buffer must be destroyed once this pixmap is destroyed.
+   created_wl_buffer_ = true;
+ 
++  uint32_t wl_format = gbm_bo_->GetFormat();
++  if (!overlay_plane_data.enable_blend || overlay_plane_data.z_order == 0) {
++    if (wl_format == DRM_FORMAT_ABGR8888) {
++      wl_format = DRM_FORMAT_XBGR8888;
++    } else if (wl_format == DRM_FORMAT_ARGB8888) {
++      wl_format = DRM_FORMAT_XRGB8888;
++    }
++  }
++
+   // Asks Wayland to create a wl_buffer based on the |file| fd.
+   buffer_manager_->CreateDmabufBasedBuffer(
+       std::move(fd), visible_area_size_, strides, offsets, modifiers,
+-      gbm_bo_->GetFormat(), plane_count, overlay_plane_data.color_space,
++      wl_format, plane_count, overlay_plane_data.color_space,
+       overlay_plane_data.hdr_metadata, buffer_id_);
+ }
