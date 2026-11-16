@@ -84,8 +84,8 @@ optdepends=('pipewire: WebRTC desktop sharing under Wayland'
             'qt6-base: Qt support'
             'org.freedesktop.secrets: password storage backend on GNOME, KDE and Xfce'
             'upower: Battery Status API support')
-provides=('ungoogled-chromium')
-conflicts=('ungoogled-vulcanium-bin')
+provides=('chromium' 'ungoogled-chromium')
+conflicts=('chromium' 'ungoogled-chromium' 'ungoogled-vulcanium-bin')
 options=('!lto') # Chromium adds its own flags for ThinLTO
 source=(https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$pkgver-lite.tar.xz
         "git+https://chromium.googlesource.com/external/github.com/google/crubit.git#commit=$_crubit_rev"
@@ -436,14 +436,14 @@ build() {
 package() {
   cd chromium-$pkgver
 
-  install -Dv out/Release/chrome "$pkgdir/usr/lib/ungoogled-vulcanium/ungoogled-vulcanium"
-  install -Dv out/Release/chromedriver "$pkgdir/usr/bin/ungoogled-vulcanium-chromedriver"
-  install -Dvm4755 out/Release/chrome_sandbox "$pkgdir/usr/lib/ungoogled-vulcanium/chrome-sandbox"
+  install -Dv out/Release/chrome "$pkgdir/usr/lib/chromium/chromium"
+  install -Dv out/Release/chromedriver "$pkgdir/usr/bin/chromedriver"
+  install -Dvm4755 out/Release/chrome_sandbox "$pkgdir/usr/lib/chromium/chrome-sandbox"
   install -Dvm644 "$srcdir/vulcanium/config/vulcanium-flags.conf" \
-    "$pkgdir/etc/ungoogled-vulcanium/default-flags.conf"
+    "$pkgdir/etc/chromium/default-flags.conf"
 
   install -dm755 "$pkgdir/usr/bin"
-  cat > "$pkgdir/usr/bin/ungoogled-vulcanium" << 'EOF'
+  cat > "$pkgdir/usr/bin/chromium" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -460,18 +460,18 @@ _read_flags() {
   done < "$f"
 }
 
-_read_flags "/etc/ungoogled-vulcanium/default-flags.conf"
-_read_flags "${XDG_CONFIG_HOME:-$HOME/.config}/ungoogled-vulcanium-flags.conf"
+_read_flags "/etc/chromium/default-flags.conf"
+_read_flags "${XDG_CONFIG_HOME:-$HOME/.config}/chromium-flags.conf"
 
 export CHROME_WRAPPER="$(readlink -f "$0")"
-exec /usr/lib/ungoogled-vulcanium/ungoogled-vulcanium "${_flags[@]}" "$@"
+exec /usr/lib/chromium/chromium "${_flags[@]}" "$@"
 EOF
-  chmod 755 "$pkgdir/usr/bin/ungoogled-vulcanium"
+  chmod 755 "$pkgdir/usr/bin/chromium"
 
   install -Dvm644 chrome/installer/linux/common/desktop.template \
-    "$pkgdir/usr/share/applications/ungoogled-vulcanium.desktop"
+    "$pkgdir/usr/share/applications/chromium.desktop"
   install -Dvm644 chrome/app/resources/manpage.1.in \
-    "$pkgdir/usr/share/man/man1/ungoogled-vulcanium.1"
+    "$pkgdir/usr/share/man/man1/chromium.1"
   sed -i \
     -e 's/@@MENUNAME/Chromium/g' \
     -e 's/@@PACKAGE/chromium/g' \
@@ -480,8 +480,8 @@ EOF
     -e 's/@@startup_wm_class/chromium/g' \
     -e 's|@@uri_scheme|x-scheme-handler/chromium;|g' \
     -e 's/@@extra_desktop_entries//g' \
-    "$pkgdir/usr/share/applications/ungoogled-vulcanium.desktop" \
-    "$pkgdir/usr/share/man/man1/ungoogled-vulcanium.1"
+    "$pkgdir/usr/share/applications/chromium.desktop" \
+    "$pkgdir/usr/share/man/man1/chromium.1"
 
   # Fill in common Chrome/Chromium AppData template with Chromium info
   (
@@ -491,7 +491,7 @@ EOF
     export $(grep -o '^[A-Z_]*' $info_file)
     sed -E -e 's/@@([A-Z_]*)/\${\1}/g' -e '/<update_contact>/d' $tmpl_file | envsubst
   ) \
-  | install -Dvm644 /dev/stdin "$pkgdir/usr/share/metainfo/ungoogled-vulcanium.appdata.xml"
+  | install -Dvm644 /dev/stdin "$pkgdir/usr/share/metainfo/chromium.appdata.xml"
 
   local toplevel_files=(
     chrome_100_percent.pak
@@ -515,22 +515,22 @@ EOF
     toplevel_files+=(icudtl.dat)
   fi
 
-  cp "${toplevel_files[@]/#/out/Release/}" "$pkgdir/usr/lib/ungoogled-vulcanium/"
-  install -Dvm644 -t "$pkgdir/usr/lib/ungoogled-vulcanium/locales" out/Release/locales/*.pak
+  cp "${toplevel_files[@]/#/out/Release/}" "$pkgdir/usr/lib/chromium/"
+  install -Dvm644 -t "$pkgdir/usr/lib/chromium/locales" out/Release/locales/*.pak
 
   for size in 24 48 64 128 256; do
     install -Dvm644 "chrome/app/theme/chromium/product_logo_$size.png" \
-      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/ungoogled-vulcanium.png"
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/chromium.png"
   done
 
   for size in 16 32; do
     install -Dvm644 "chrome/app/theme/default_100_percent/chromium/product_logo_$size.png" \
-      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/ungoogled-vulcanium.png"
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/chromium.png"
   done
 
   # chromium uses the icon name "chromium-browser" internally
   # https://github.com/chromium/chromium/blob/160.0.8155.1/chrome/browser/shell_integration_linux.cc#L604
-  # (skipped in ungoogled-vulcanium to avoid file conflict with extra/chromium)
+  ln -s chromium.png "$pkgdir/usr/share/icons/hicolor/48x48/apps/chromium-browser.png"
 
   install -Dvm644 LICENSE "$pkgdir/usr/share/licenses/chromium/LICENSE"
 }
