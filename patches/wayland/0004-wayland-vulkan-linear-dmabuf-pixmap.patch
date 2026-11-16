@@ -1,0 +1,285 @@
+--- a/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.h	2026-11-16 09:17:41.391011083 +0300
++++ b/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.h	2026-11-16 09:16:09.535419045 +0300
+@@ -19,6 +19,10 @@
+ #include "ui/gfx/native_ui_types.h"
+ #include "ui/ozone/public/native_pixmap_usage.h"
+ 
++namespace gpu {
++class VulkanDeviceQueue;
++}  // namespace gpu
++
+ namespace ui {
+ 
+ class WaylandBufferManagerGpu;
+@@ -53,6 +57,13 @@
+                                   viz::SharedImageFormat format,
+                                   gfx::NativePixmapHandle handle);
+ 
++  bool InitializeVulkanLinearBuffer(
++      gfx::AcceleratedWidget widget,
++      gpu::VulkanDeviceQueue* device_queue,
++      gfx::Size size,
++      viz::SharedImageFormat format,
++      std::optional<gfx::Size> visible_area_size = std::nullopt);
++
+   // gfx::NativePixmap overrides:
+   bool AreDmaBufFdsValid() const override;
+   int GetDmaBufFd(size_t plane) const override;
+@@ -80,6 +91,11 @@
+   // gbm_bo wrapper for struct gbm_bo.
+   std::unique_ptr<GbmBuffer> gbm_bo_;
+ 
++  // Direct Vulkan-allocated linear DMA-BUF handle (bypasses gbm_bo_).
++  std::optional<gfx::NativePixmapHandle> vulkan_handle_;
++  viz::SharedImageFormat vulkan_format_;
++  gfx::Size vulkan_size_;
++
+   // Represents a connection to Wayland.
+   const raw_ptr<WaylandBufferManagerGpu> buffer_manager_;
+ 
+--- a/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc	2026-11-16 09:17:41.392004889 +0300
++++ b/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc	2026-11-16 09:17:13.224536677 +0300
+@@ -27,6 +27,12 @@
+ #include "ui/ozone/platform/wayland/gpu/wayland_buffer_manager_gpu.h"
+ #include "ui/ozone/public/native_pixmap_usage_utils.h"
+ #include "ui/ozone/public/ozone_platform.h"
++#include "gpu/vulkan/buildflags.h"
++
++#if BUILDFLAG(ENABLE_VULKAN)
++#include "gpu/vulkan/vulkan_device_queue.h"
++#include "gpu/vulkan/vulkan_image.h"
++#endif
+ 
+ namespace ui {
+ 
+@@ -86,7 +92,14 @@
+     // rendering, while wlroots would announce MOD_LINEAR and MOD_INVALID).
+     // In such cases gbm_bo allocation may fail, where we should fallback to
+     // creation without modifiers, and leave the choices to driver.
+-    if (!gbm_bo_ && buffer_manager_->AllowsImplicitModifierForFormat(format)) {
++    if (!gbm_bo_) {
++      std::vector<uint64_t> linear_mod = {DRM_FORMAT_MOD_LINEAR};
++      gbm_bo_ = gbm_device->CreateBufferWithModifiers(
++          fourcc_format, size, gbm_flags, linear_mod);
++    }
++    if (!gbm_bo_) {
++      // Final fallback to implicit modifier creation so Wayland + Vulkan
++      // doesn't lose the swapchain and render a black screen.
+       gbm_bo_ = gbm_device->CreateBuffer(fourcc_format, size, gbm_flags);
+     }
+   }
+@@ -139,27 +152,105 @@
+   return true;
+ }
+ 
++bool GbmPixmapWayland::InitializeVulkanLinearBuffer(
++    gfx::AcceleratedWidget widget,
++    gpu::VulkanDeviceQueue* device_queue,
++    gfx::Size size,
++    viz::SharedImageFormat format,
++    std::optional<gfx::Size> visible_area_size) {
++#if BUILDFLAG(ENABLE_VULKAN)
++  if (!device_queue) {
++    return false;
++  }
++  VkFormat vk_format = VK_FORMAT_UNDEFINED;
++  if (format == viz::SinglePlaneFormat::kRGBA_8888 ||
++      format == viz::SinglePlaneFormat::kRGBX_8888) {
++    vk_format = VK_FORMAT_R8G8B8A8_UNORM;
++  } else if (format == viz::SinglePlaneFormat::kBGRA_8888 ||
++             format == viz::SinglePlaneFormat::kBGRX_8888) {
++    vk_format = VK_FORMAT_B8G8R8A8_UNORM;
++  } else {
++    return false;
++  }
++
++  constexpr VkImageUsageFlags kUsage =
++      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
++      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++  auto vk_image = gpu::VulkanImage::CreateWithExternalMemoryAndModifiers(
++      device_queue, size, vk_format, {DRM_FORMAT_MOD_LINEAR}, kUsage, 0);
++  if (!vk_image) {
++    return false;
++  }
++
++  base::ScopedFD fd =
++      vk_image->GetMemoryFd(VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
++  if (!fd.is_valid()) {
++    vk_image->Destroy();
++    return false;
++  }
++
++  gfx::NativePixmapHandle handle;
++  const auto& layout = vk_image->layouts()[0];
++  uint32_t stride = layout.rowPitch > 0 ? static_cast<uint32_t>(layout.rowPitch)
++                                        : static_cast<uint32_t>(size.width() * 4);
++  uint64_t plane_size = layout.size > 0
++                            ? static_cast<uint64_t>(layout.size)
++                            : static_cast<uint64_t>(stride) * size.height();
++  handle.planes.emplace_back(stride, static_cast<uint64_t>(layout.offset),
++                             plane_size, std::move(fd));
++  handle.modifier = vk_image->modifier();
++  vk_image->Destroy();
++
++  widget_ = widget;
++  vulkan_handle_ = std::move(handle);
++  vulkan_format_ = format;
++  vulkan_size_ = size;
++  visible_area_size_ = visible_area_size.value_or(size);
++  return true;
++#else
++  return false;
++#endif
++}
++
+ bool GbmPixmapWayland::AreDmaBufFdsValid() const {
++  if (vulkan_handle_) {
++    return !vulkan_handle_->planes.empty() && vulkan_handle_->planes[0].fd.is_valid();
++  }
+   return gbm_bo_->AreFdsValid();
+ }
+ 
+ int GbmPixmapWayland::GetDmaBufFd(size_t plane) const {
++  if (vulkan_handle_) {
++    return vulkan_handle_->planes[plane].fd.get();
++  }
+   return gbm_bo_->GetPlaneFd(plane);
+ }
+ 
+ uint32_t GbmPixmapWayland::GetDmaBufPitch(size_t plane) const {
++  if (vulkan_handle_) {
++    return vulkan_handle_->planes[plane].stride;
++  }
+   return gbm_bo_->GetPlaneStride(plane);
+ }
+ 
+ size_t GbmPixmapWayland::GetDmaBufOffset(size_t plane) const {
++  if (vulkan_handle_) {
++    return vulkan_handle_->planes[plane].offset;
++  }
+   return gbm_bo_->GetPlaneOffset(plane);
+ }
+ 
+ size_t GbmPixmapWayland::GetDmaBufPlaneSize(size_t plane) const {
++  if (vulkan_handle_) {
++    return vulkan_handle_->planes[plane].size;
++  }
+   return gbm_bo_->GetPlaneSize(plane);
+ }
+ 
+ size_t GbmPixmapWayland::GetNumberOfPlanes() const {
++  if (vulkan_handle_) {
++    return vulkan_handle_->planes.size();
++  }
+   return gbm_bo_->GetNumPlanes();
+ }
+ 
+@@ -170,18 +261,30 @@
+ }
+ 
+ uint64_t GbmPixmapWayland::GetFormatModifier() const {
++  if (vulkan_handle_) {
++    return vulkan_handle_->modifier;
++  }
+   return gbm_bo_->GetFormatModifier();
+ }
+ 
+ viz::SharedImageFormat GbmPixmapWayland::GetSharedImageFormat() const {
++  if (vulkan_handle_) {
++    return vulkan_format_;
++  }
+   return gbm_bo_->GetSharedImageFormat();
+ }
+ 
+ gfx::Size GbmPixmapWayland::GetBufferSize() const {
++  if (vulkan_handle_) {
++    return vulkan_size_;
++  }
+   return gbm_bo_->GetSize();
+ }
+ 
+ uint32_t GbmPixmapWayland::GetUniqueId() const {
++  if (vulkan_handle_) {
++    return buffer_id_;
++  }
+   return gbm_bo_->GetHandle();
+ }
+ 
+@@ -213,7 +316,7 @@
+ gfx::NativePixmapHandle GbmPixmapWayland::ExportHandle() const {
+   gfx::NativePixmapHandle handle;
+ 
+-  const size_t num_planes = gbm_bo_->GetNumPlanes();
++  const size_t num_planes = GetNumberOfPlanes();
+   std::vector<base::ScopedFD> scoped_fds(num_planes);
+   for (size_t i = 0; i < num_planes; ++i) {
+     scoped_fds[i] = base::ScopedFD(HANDLE_EINTR(dup(GetDmaBufFd(i))));
+@@ -225,7 +328,7 @@
+ 
+   for (size_t i = 0; i < num_planes; ++i) {
+     handle.planes.emplace_back(GetDmaBufPitch(i), GetDmaBufOffset(i),
+-                               gbm_bo_->GetPlaneSize(i),
++                               GetDmaBufPlaneSize(i),
+                                std::move(scoped_fds[i]));
+   }
+   handle.modifier = GetFormatModifier();
+@@ -234,13 +337,13 @@
+ 
+ void GbmPixmapWayland::CreateDmabufBasedWlBuffer(
+     const gfx::OverlayPlaneData& overlay_plane_data) {
+-  uint64_t modifier = gbm_bo_->GetFormatModifier();
++  uint64_t modifier = GetFormatModifier();
+ 
+   std::vector<uint32_t> strides;
+   std::vector<uint32_t> offsets;
+   std::vector<uint64_t> modifiers;
+ 
+-  size_t plane_count = gbm_bo_->GetNumPlanes();
++  size_t plane_count = GetNumberOfPlanes();
+   for (size_t i = 0; i < plane_count; ++i) {
+     strides.push_back(GetDmaBufPitch(i));
+     offsets.push_back(GetDmaBufOffset(i));
+@@ -255,10 +358,21 @@
+   // The wl_buffer must be destroyed once this pixmap is destroyed.
+   created_wl_buffer_ = true;
+ 
++  uint32_t wl_format = vulkan_handle_
++                           ? GetFourCCFormatFromSharedImageFormat(vulkan_format_)
++                           : gbm_bo_->GetFormat();
++  if (!overlay_plane_data.enable_blend || overlay_plane_data.z_order == 0) {
++    if (wl_format == DRM_FORMAT_ABGR8888) {
++      wl_format = DRM_FORMAT_XBGR8888;
++    } else if (wl_format == DRM_FORMAT_ARGB8888) {
++      wl_format = DRM_FORMAT_XRGB8888;
++    }
++  }
++
+   // Asks Wayland to create a wl_buffer based on the |file| fd.
+   buffer_manager_->CreateDmabufBasedBuffer(
+       std::move(fd), visible_area_size_, strides, offsets, modifiers,
+-      gbm_bo_->GetFormat(), plane_count, overlay_plane_data.color_space,
++      wl_format, plane_count, overlay_plane_data.color_space,
+       overlay_plane_data.hdr_metadata, buffer_id_);
+ }
+ 
+--- a/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc	2026-11-16 09:17:41.395766654 +0300
++++ b/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc	2026-11-16 09:16:34.460864189 +0300
+@@ -261,6 +261,18 @@
+     return nullptr;
+   }
+ #if defined(WAYLAND_GBM)
++  if (device_queue &&
++      (format == viz::SinglePlaneFormat::kRGBA_8888 ||
++       format == viz::SinglePlaneFormat::kBGRA_8888 ||
++       format == viz::SinglePlaneFormat::kRGBX_8888 ||
++       format == viz::SinglePlaneFormat::kBGRX_8888)) {
++    scoped_refptr<GbmPixmapWayland> vk_pixmap =
++        base::MakeRefCounted<GbmPixmapWayland>(buffer_manager_);
++    if (vk_pixmap->InitializeVulkanLinearBuffer(widget, device_queue, size,
++                                                format, framebuffer_size)) {
++      return vk_pixmap;
++    }
++  }
+   auto* gbm_device = buffer_manager_->GetGbmDevice();
+   if (gbm_device && gbm_device->CanCreateBufferForFormat(
+                         GetFourCCFormatFromSharedImageFormat(format))) {
