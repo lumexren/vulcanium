@@ -76,7 +76,21 @@
  
    base::FilePath path;
    if (use_swiftshader()) {
-@@ -49,18 +63,64 @@
+@@ -42,25 +56,77 @@
+     path = base::FilePath("libvulkan.so.1");
+   }
+ 
+-  return vulkan_instance_.Initialize(path, required_extensions, {});
++  if (!vulkan_instance_.Initialize(path, required_extensions, {})) {
++    return false;
++  }
++  if (using_surface && connection_) {
++    connection_->set_use_vulkan_surface(true);
++  }
++  return true;
+ }
+ 
+ gpu::VulkanInstance* VulkanImplementationWayland::GetVulkanInstance() {
    return &vulkan_instance_;
  }
  
@@ -145,7 +159,7 @@
  }
  
  std::vector<const char*>
-@@ -71,6 +131,9 @@
+@@ -71,6 +137,9 @@
        VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
        VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
    };
@@ -199,9 +213,17 @@
    auto* gbm_device = buffer_manager_->GetGbmDevice();
    if (gbm_device && gbm_device->CanCreateBufferForFormat(
                          GetFourCCFormatFromSharedImageFormat(format))) {
---- a/ui/ozone/platform/wayland/host/wayland_connection.h	2026-11-16 09:25:47.755851637 +0300
-+++ b/ui/ozone/platform/wayland/host/wayland_connection.h	2026-11-16 09:25:16.726470838 +0300
-@@ -74,6 +74,7 @@
+--- a/ui/ozone/platform/wayland/host/wayland_connection.h
++++ b/ui/ozone/platform/wayland/host/wayland_connection.h
+@@ -7,6 +7,7 @@
+ 
+ #include <time.h>
+ 
++#include <atomic>
+ #include <memory>
+ #include <ostream>
+ #include <string>
+@@ -74,6 +75,7 @@
  
  class WaylandConnection {
   public:
@@ -209,6 +231,29 @@
    WaylandConnection();
    WaylandConnection(const WaylandConnection&) = delete;
    WaylandConnection& operator=(const WaylandConnection&) = delete;
+@@ -307,6 +309,13 @@
+ 
+   struct wl_registry* GetRegistry();
+ 
++  bool use_vulkan_surface() const {
++    return use_vulkan_surface_.load(std::memory_order_relaxed);
++  }
++  void set_use_vulkan_surface(bool use_vulkan_surface) {
++    use_vulkan_surface_.store(use_vulkan_surface, std::memory_order_relaxed);
++  }
++
+  private:
+   friend class WaylandConnectionTestApi;
+ 
+@@ -504,6 +513,8 @@
+   // Global Wayland interfaces available in the current session, with their
+   // versions.
+   std::vector<std::pair<std::string, uint32_t>> available_globals_;
++
++  std::atomic<bool> use_vulkan_surface_{false};
+ };
+ 
+ }  // namespace ui
 --- a/ui/ozone/platform/wayland/ozone_platform_wayland.cc	2026-11-16 09:25:47.757851661 +0300
 +++ b/ui/ozone/platform/wayland/ozone_platform_wayland.cc	2026-11-16 09:24:41.720034478 +0300
 @@ -280,8 +280,9 @@

@@ -1,0 +1,68 @@
+--- a/gpu/vulkan/vulkan_surface.cc
++++ b/gpu/vulkan/vulkan_surface.cc
+@@ -312,8 +312,8 @@
+   transform_ = transform;
+ 
+   const VkCompositeAlphaFlagBitsKHR kCompositeAlphaBits[] = {
+-      VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+       VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
++      VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+       VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
+       VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+   };
+--- a/ui/ozone/platform/wayland/host/wayland_surface.h
++++ b/ui/ozone/platform/wayland/host/wayland_surface.h
+@@ -202,6 +202,7 @@
+   // Returns whether or not changes require a commit to the wl_surface, or
+   // std::nullopt if it fails to apply the pending state.
+   std::optional<bool> ApplyPendingState();
++  void ApplyVulkanSurfaceState(const gfx::Size& buffer_size_px, float scale);
+ 
+   // Commits the underlying wl_surface, triggers a wayland connection flush if
+   // |flush| is true.
+--- a/ui/ozone/platform/wayland/host/wayland_surface.cc
++++ b/ui/ozone/platform/wayland/host/wayland_surface.cc
+@@ -814,6 +814,16 @@
+   apply_state_immediately_ = true;
+ }
+ 
++void WaylandSurface::ApplyVulkanSurfaceState(const gfx::Size& buffer_size_px,
++                                             float scale) {
++  if (buffer_size_px.IsEmpty()) {
++    return;
++  }
++  pending_state_.buffer_size_px = buffer_size_px;
++  pending_state_.buffer_scale_float = scale;
++  ApplyPendingState();
++}
++
+ WaylandSurface::State::State() = default;
+ 
+ WaylandSurface::State::~State() = default;
+--- a/ui/ozone/platform/wayland/host/wayland_window.cc
++++ b/ui/ozone/platform/wayland/host/wayland_window.cc
+@@ -1585,6 +1585,13 @@
+   if (req.serial != -1) {
+     AckConfigure(req.serial);
+   }
++  if (connection_->use_vulkan_surface()) {
++    root_surface_->ApplyVulkanSurfaceState(
++        gfx::ScaleToRoundedSize(req.state.bounds_dip.size(),
++                                req.state.window_scale),
++        req.state.window_scale);
++    connection_->Flush();
++  }
+ }
+ 
+ void WaylandWindow::MaybeApplyLatestStateRequest(bool force) {
+@@ -1674,6 +1681,10 @@
+   constexpr int64_t kLatchAllWithoutVizSeq = -2;
+   ProcessSequencePoint(kLatchAllWithoutVizSeq);
+ 
++  if (connection_->use_vulkan_surface()) {
++    ProcessSequencePoint(INT64_MAX);
++  }
++
+   // Latch in tests immediately if the test config is set.
+   // Otherwise, such tests as interactive_ui_tests fail.
+   if (UseTestConfigForPlatformWindows() && latch_immediately_for_testing_) {
