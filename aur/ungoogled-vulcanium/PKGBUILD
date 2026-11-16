@@ -448,6 +448,24 @@ package() {
 set -euo pipefail
 
 declare -a _flags=()
+declare -a _enable_features=()
+declare -a _disable_features=()
+
+_push_flag() {
+  local tok="$1"
+  case "$tok" in
+    --enable-features=*)
+      _enable_features+=("${tok#--enable-features=}")
+      ;;
+    --disable-features=*)
+      _disable_features+=("${tok#--disable-features=}")
+      ;;
+    *)
+      _flags+=("$tok")
+      ;;
+  esac
+}
+
 _read_flags() {
   local f="$1"
   [[ -f "$f" ]] || return 0
@@ -455,16 +473,26 @@ _read_flags() {
     line="${line%%#*}"
     [[ -n "${line//[[:space:]]/}" ]] || continue
     for tok in $line; do
-      _flags+=("$tok")
+      _push_flag "$tok"
     done
   done < "$f"
 }
 
 _read_flags "/etc/chromium/default-flags.conf"
 _read_flags "${XDG_CONFIG_HOME:-$HOME/.config}/chromium-flags.conf"
+for arg in "$@"; do
+  _push_flag "$arg"
+done
+
+if (( ${#_enable_features[@]} > 0 )); then
+  _flags+=("--enable-features=$(IFS=,; echo "${_enable_features[*]}")")
+fi
+if (( ${#_disable_features[@]} > 0 )); then
+  _flags+=("--disable-features=$(IFS=,; echo "${_disable_features[*]}")")
+fi
 
 export CHROME_WRAPPER="$(readlink -f "$0")"
-exec /usr/lib/chromium/chromium "${_flags[@]}" "$@"
+exec /usr/lib/chromium/chromium "${_flags[@]}"
 EOF
   chmod 755 "$pkgdir/usr/bin/chromium"
 
