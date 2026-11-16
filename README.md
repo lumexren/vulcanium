@@ -12,6 +12,17 @@ Chromium `157.0.8103.78` patch set and Arch Linux packaging focused on native **
 - **Isolated Branding & Defaults (`patches/branding/`, `config/`):**
   - Separate profile directory, `/usr/bin/vulcanium` launcher, and default Wayland/Vulkan/zero-copy runtime flags.
 
+## Screenshots
+
+### Graphics Feature Status (`chrome://gpu`)
+![Graphics Feature Status](docs/screenshots/chrome-gpu.png)
+
+### Driver Information (`GaneshVulkan` + `ANGLE_VULKAN`)
+![Driver Information](docs/screenshots/driver-info.png)
+
+### Video Acceleration Information (`H.264`, `HEVC`, `VP9`, `AV1`)
+![Video Acceleration Information](docs/screenshots/video-acceleration.png)
+
 ## Build
 
 ### Arch Linux (`makepkg`)
