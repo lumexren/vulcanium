@@ -16,7 +16,7 @@ body:
         - vulcanium (AUR)
         - vulcanium-bin (AUR / GitHub Release)
         - ungoogled-vulcanium (AUR)
-        - helium-vulcanium (AUR)
+        - helcanium (AUR)
         - Manual / Custom build
     validations:
       required: true

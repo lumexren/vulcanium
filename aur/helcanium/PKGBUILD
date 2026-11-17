@@ -1,6 +1,6 @@
 # Maintainer: lumexren <lumexren@gmail.com>
 
-pkgname=helium-vulcanium
+pkgname=helcanium
 pkgver=157.0.8103.78
 pkgrel=1
 _launcher_ver=8
@@ -83,7 +83,7 @@ optdepends=('pipewire: WebRTC desktop sharing under Wayland'
             'org.freedesktop.secrets: password storage backend on GNOME, KDE and Xfce'
             'upower: Battery Status API support')
 provides=('helium-browser')
-conflicts=('helium-vulcanium-bin')
+conflicts=('helcanium-bin')
 options=('!lto') # Chromium adds its own flags for ThinLTO
 source=(https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$pkgver-lite.tar.xz
         "git+https://chromium.googlesource.com/external/github.com/google/crubit.git#commit=$_crubit_rev"
@@ -424,6 +424,13 @@ build() {
   # https://crbug.com/957519#c122
   CXXFLAGS=${CXXFLAGS/-Wp,-D_GLIBCXX_ASSERTIONS}
 
+  # Portable x86_64 release builds
+  if [[ -n ${VULCANIUM_PORTABLE:-} ]]; then
+    CFLAGS=${CFLAGS//-march=native/-march=x86-64 -mtune=generic}
+    CXXFLAGS=${CXXFLAGS//-march=native/-march=x86-64 -mtune=generic}
+    RUSTFLAGS=${RUSTFLAGS//-C target-cpu=native/}
+  fi
+
   (
     cd ../crubit
     _rustc_libs="$_rust_sysroot/lib/rustlib/$(rustc --print host-tuple)/lib"
@@ -443,18 +450,45 @@ build() {
 package() {
   cd chromium-$pkgver
 
-  install -Dv out/Release/chrome "$pkgdir/usr/lib/helium-vulcanium/helium-vulcanium"
-  install -Dv out/Release/chromedriver "$pkgdir/usr/bin/helium-vulcanium-chromedriver"
-  install -Dvm4755 out/Release/chrome_sandbox "$pkgdir/usr/lib/helium-vulcanium/chrome-sandbox"
+  install -Dv out/Release/chrome "$pkgdir/usr/lib/helcanium/helcanium"
+  install -Dv out/Release/chromedriver "$pkgdir/usr/bin/helcanium-chromedriver"
+  install -Dvm4755 out/Release/chrome_sandbox "$pkgdir/usr/lib/helcanium/chrome-sandbox"
   install -Dvm644 "$srcdir/vulcanium/config/vulcanium-flags.conf" \
-    "$pkgdir/etc/helium-vulcanium/default-flags.conf"
+    "$pkgdir/etc/helcanium/default-flags.conf"
 
   install -dm755 "$pkgdir/usr/bin"
-  cat > "$pkgdir/usr/bin/helium-vulcanium" << 'EOF'
+  cat > "$pkgdir/usr/bin/helcanium" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 declare -a _flags=()
+declare -a _enable_features=()
+declare -a _disable_features=()
+
+_push_flag() {
+  local tok="$1"
+  case "$tok" in
+    --enable-features=*)
+      local IFS=, feat
+      for feat in ${tok#--enable-features=}; do
+        case "$feat" in
+          VaapiOnNvidiaGPUs|VaapiVideoDecoder|VaapiVideoEncoder|VaapiVideoDecodeLinuxGL|AcceleratedVideoDecodeLinuxGL|"")
+            ;;
+          *)
+            _enable_features+=("$feat")
+            ;;
+        esac
+      done
+      ;;
+    --disable-features=*)
+      _disable_features+=("${tok#--disable-features=}")
+      ;;
+    *)
+      _flags+=("$tok")
+      ;;
+  esac
+}
+
 _read_flags() {
   local f="$1"
   [[ -f "$f" ]] || return 0
@@ -462,23 +496,35 @@ _read_flags() {
     line="${line%%#*}"
     [[ -n "${line//[[:space:]]/}" ]] || continue
     for tok in $line; do
-      _flags+=("$tok")
+      _push_flag "$tok"
     done
   done < "$f"
 }
 
-_read_flags "/etc/helium-vulcanium/default-flags.conf"
-_read_flags "${XDG_CONFIG_HOME:-$HOME/.config}/helium-vulcanium-flags.conf"
+_read_flags "/etc/helcanium/default-flags.conf"
+_read_flags "${XDG_CONFIG_HOME:-$HOME/.config}/helcanium-flags.conf"
+for arg in "$@"; do
+  _push_flag "$arg"
+done
+
+_disable_features+=("VaapiVideoDecoder,VaapiVideoEncoder,VaapiVideoDecodeLinuxGL,VaapiOnNvidiaGPUs,AcceleratedVideoDecodeLinuxGL")
+
+if (( ${#_enable_features[@]} > 0 )); then
+  _flags+=("--enable-features=$(IFS=,; echo "${_enable_features[*]}")")
+fi
+if (( ${#_disable_features[@]} > 0 )); then
+  _flags+=("--disable-features=$(IFS=,; echo "${_disable_features[*]}")")
+fi
 
 export CHROME_WRAPPER="$(readlink -f "$0")"
-exec /usr/lib/helium-vulcanium/helium-vulcanium "${_flags[@]}" "$@"
+exec /usr/lib/helcanium/helcanium "${_flags[@]}"
 EOF
-  chmod 755 "$pkgdir/usr/bin/helium-vulcanium"
+  chmod 755 "$pkgdir/usr/bin/helcanium"
 
   install -Dvm644 chrome/installer/linux/common/desktop.template \
-    "$pkgdir/usr/share/applications/helium-vulcanium.desktop"
+    "$pkgdir/usr/share/applications/helcanium.desktop"
   install -Dvm644 chrome/app/resources/manpage.1.in \
-    "$pkgdir/usr/share/man/man1/helium-vulcanium.1"
+    "$pkgdir/usr/share/man/man1/helcanium.1"
   sed -i \
     -e 's/@@MENUNAME/Chromium/g' \
     -e 's/@@PACKAGE/chromium/g' \
@@ -487,8 +533,8 @@ EOF
     -e 's/@@startup_wm_class/chromium/g' \
     -e 's|@@uri_scheme|x-scheme-handler/chromium;|g' \
     -e 's/@@extra_desktop_entries//g' \
-    "$pkgdir/usr/share/applications/helium-vulcanium.desktop" \
-    "$pkgdir/usr/share/man/man1/helium-vulcanium.1"
+    "$pkgdir/usr/share/applications/helcanium.desktop" \
+    "$pkgdir/usr/share/man/man1/helcanium.1"
 
   # Fill in common Chrome/Chromium AppData template with Chromium info
   (
@@ -498,7 +544,7 @@ EOF
     export $(grep -o '^[A-Z_]*' $info_file)
     sed -E -e 's/@@([A-Z_]*)/\${\1}/g' -e '/<update_contact>/d' $tmpl_file | envsubst
   ) \
-  | install -Dvm644 /dev/stdin "$pkgdir/usr/share/metainfo/helium-vulcanium.appdata.xml"
+  | install -Dvm644 /dev/stdin "$pkgdir/usr/share/metainfo/helcanium.appdata.xml"
 
   local toplevel_files=(
     chrome_100_percent.pak
@@ -522,22 +568,22 @@ EOF
     toplevel_files+=(icudtl.dat)
   fi
 
-  cp "${toplevel_files[@]/#/out/Release/}" "$pkgdir/usr/lib/helium-vulcanium/"
-  install -Dvm644 -t "$pkgdir/usr/lib/helium-vulcanium/locales" out/Release/locales/*.pak
+  cp "${toplevel_files[@]/#/out/Release/}" "$pkgdir/usr/lib/helcanium/"
+  install -Dvm644 -t "$pkgdir/usr/lib/helcanium/locales" out/Release/locales/*.pak
 
   for size in 24 48 64 128 256; do
     install -Dvm644 "chrome/app/theme/chromium/product_logo_$size.png" \
-      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/helium-vulcanium.png"
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/helcanium.png"
   done
 
   for size in 16 32; do
     install -Dvm644 "chrome/app/theme/default_100_percent/chromium/product_logo_$size.png" \
-      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/helium-vulcanium.png"
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/helcanium.png"
   done
 
   # chromium uses the icon name "chromium-browser" internally
   # https://github.com/chromium/chromium/blob/160.0.8155.1/chrome/browser/shell_integration_linux.cc#L604
-  # (skipped in helium-vulcanium to avoid file conflict with extra/chromium)
+  # (skipped in helcanium to avoid file conflict with extra/chromium)
 
   install -Dvm644 LICENSE "$pkgdir/usr/share/licenses/chromium/LICENSE"
 }
