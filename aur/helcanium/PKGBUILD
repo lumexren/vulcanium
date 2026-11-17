@@ -365,9 +365,9 @@ build() {
     _flags+=('icu_use_data_file=false')
   fi
 
-  # Append ungoogled chromium flags to _flags array
-  _ungoogled_repo="$srcdir/ungoogled-chromium-$_uc_ver"
-  readarray -t -O ${#_flags[@]} _flags < "${_ungoogled_repo}/flags.gn"
+  # Append Helium flags to _flags array
+  _helium_repo="$srcdir/helium"
+  readarray -t -O ${#_flags[@]} _flags < "${_helium_repo}/flags.gn"
 
   if (( _system_clang )); then
     local _clang_version=$(
@@ -524,12 +524,12 @@ EOF
   install -Dvm644 chrome/app/resources/manpage.1.in \
     "$pkgdir/usr/share/man/man1/helcanium.1"
   sed -i \
-    -e 's/@@MENUNAME/Chromium/g' \
-    -e 's/@@PACKAGE/chromium/g' \
-    -e 's/@@desktop_exec/chromium/g' \
-    -e 's/@@desktop_icon/chromium/g' \
-    -e 's/@@startup_wm_class/chromium/g' \
-    -e 's|@@uri_scheme|x-scheme-handler/chromium;|g' \
+    -e 's/@@MENUNAME/Helcanium/g' \
+    -e 's/@@PACKAGE/helcanium/g' \
+    -e 's/@@desktop_exec/helcanium/g' \
+    -e 's/@@desktop_icon/helcanium/g' \
+    -e 's/@@startup_wm_class/helcanium/g' \
+    -e 's|@@uri_scheme|x-scheme-handler/helcanium;|g' \
     -e 's/@@extra_desktop_entries//g' \
     "$pkgdir/usr/share/applications/helcanium.desktop" \
     "$pkgdir/usr/share/man/man1/helcanium.1"
@@ -570,20 +570,16 @@ EOF
   install -Dvm644 -t "$pkgdir/usr/lib/helcanium/locales" out/Release/locales/*.pak
 
   for size in 24 48 64 128 256; do
-    install -Dvm644 "chrome/app/theme/chromium/product_logo_$size.png" \
+    install -Dvm644 "chrome/app/theme/chromium/linux/product_logo_$size.png" \
       "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/helcanium.png"
   done
 
   for size in 16 32; do
-    install -Dvm644 "chrome/app/theme/default_100_percent/chromium/product_logo_$size.png" \
+    install -Dvm644 "chrome/app/theme/default_100_percent/chromium/linux/product_logo_$size.png" \
       "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/helcanium.png"
   done
 
-  # chromium uses the icon name "chromium-browser" internally
-  # https://github.com/chromium/chromium/blob/160.0.8155.1/chrome/browser/shell_integration_linux.cc#L604
-  # (skipped in helcanium to avoid file conflict with extra/chromium)
-
-  install -Dvm644 LICENSE "$pkgdir/usr/share/licenses/chromium/LICENSE"
+  install -Dvm644 LICENSE "$pkgdir/usr/share/licenses/helcanium/LICENSE"
 }
 
 # vim:set ts=2 sw=2 et:
