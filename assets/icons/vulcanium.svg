@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <clipPath id="outer-clip">
+      <circle cx="128" cy="128" r="116"/>
+    </clipPath>
+    <linearGradient id="blade-top" x1="20%" y1="0%" x2="80%" y2="70%">
+      <stop offset="0%" stop-color="#FF5722"/>
+      <stop offset="100%" stop-color="#C62800"/>
+    </linearGradient>
+    <linearGradient id="blade-right" x1="85%" y1="20%" x2="25%" y2="90%">
+      <stop offset="0%" stop-color="#FFB300"/>
+      <stop offset="100%" stop-color="#F57C00"/>
+    </linearGradient>
+    <linearGradient id="blade-left" x1="15%" y1="20%" x2="80%" y2="85%">
+      <stop offset="0%" stop-color="#FF7A1A"/>
+      <stop offset="100%" stop-color="#E64A00"/>
+    </linearGradient>
+    <radialGradient id="core-grad" cx="40%" cy="35%" r="65%">
+      <stop offset="0%" stop-color="#FFE082"/>
+      <stop offset="45%" stop-color="#FF6D00"/>
+      <stop offset="100%" stop-color="#BF2600"/>
+    </radialGradient>
+    <linearGradient id="seam-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#000000" stop-opacity="0.14"/>
+      <stop offset="45%" stop-color="#000000" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <g clip-path="url(#outer-clip)">
+    <path d="M 128.00 72.00 L 288.00 72.00 L 288.00 -32.00 L -32.00 -32.00 L -0.50 17.44 L 79.50 156.00 A 56.00 56.00 0 0 1 128.00 72.00 Z" fill="url(#blade-top)"/>
+    <path d="M 128.00 72.00 L 288.00 72.00 L 288.00 -32.00 L -32.00 -32.00 L -0.50 17.44 L 79.50 156.00 A 56.00 56.00 0 0 1 128.00 72.00 Z" fill="url(#blade-right)" transform="rotate(120 128 128)"/>
+    <path d="M 128.00 72.00 L 288.00 72.00 L 288.00 -32.00 L -32.00 -32.00 L -0.50 17.44 L 79.50 156.00 A 56.00 56.00 0 0 1 128.00 72.00 Z" fill="url(#blade-left)" transform="rotate(240 128 128)"/>
+    <!-- Subtle seam shadows along each blade edge -->
+    <path d="M 128.00 72.00 L 288.00 72.00 L 288.00 -32.00 L -32.00 -32.00 L -0.50 17.44 L 79.50 156.00 A 56.00 56.00 0 0 1 128.00 72.00 Z" fill="url(#seam-grad)"/>
+    <path d="M 128.00 72.00 L 288.00 72.00 L 288.00 -32.00 L -32.00 -32.00 L -0.50 17.44 L 79.50 156.00 A 56.00 56.00 0 0 1 128.00 72.00 Z" fill="url(#seam-grad)" transform="rotate(120 128 128)"/>
+    <path d="M 128.00 72.00 L 288.00 72.00 L 288.00 -32.00 L -32.00 -32.00 L -0.50 17.44 L 79.50 156.00 A 56.00 56.00 0 0 1 128.00 72.00 Z" fill="url(#seam-grad)" transform="rotate(240 128 128)"/>
+  </g>
+
+  <!-- Crisp separator ring & molten core -->
+  <circle cx="128" cy="128" r="56" fill="#FFF8F0"/>
+  <circle cx="128" cy="128" r="45" fill="url(#core-grad)"/>
+</svg>

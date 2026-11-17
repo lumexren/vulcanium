@@ -569,15 +569,12 @@ EOF
   cp "${toplevel_files[@]/#/out/Release/}" "$pkgdir/usr/lib/helcanium/"
   install -Dvm644 -t "$pkgdir/usr/lib/helcanium/locales" out/Release/locales/*.pak
 
-  for size in 24 48 64 128 256; do
-    install -Dvm644 "chrome/app/theme/chromium/linux/product_logo_$size.png" \
+  for size in 16 24 32 48 64 128 256; do
+    install -Dvm644 "$srcdir/vulcanium/assets/icons/helcanium/${size}.png" \
       "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/helcanium.png"
   done
-
-  for size in 16 32; do
-    install -Dvm644 "chrome/app/theme/default_100_percent/chromium/linux/product_logo_$size.png" \
-      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/helcanium.png"
-  done
+  install -Dvm644 "$srcdir/vulcanium/assets/icons/helcanium.svg" \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/helcanium.svg"
 
   install -Dvm644 LICENSE "$pkgdir/usr/share/licenses/helcanium/LICENSE"
 }
