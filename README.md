@@ -1,6 +1,12 @@
+<div align="center">
+
+<img src="assets/icons/vulcanium.svg" alt="Vulcanium" width="96" />
+
 # Vulcanium
 
-Chromium `157.0.8103.78` patch set and Arch Linux packaging focused on native **Linux Wayland + Vulkan** rendering and **Vulkan Video** hardware decoding/encoding.
+Chromium with Vulkan rendering and Vulkan Video Decoding / Encoding
+
+</div>
 
 ## Features
 
