@@ -8,6 +8,7 @@ branding/0002-hide-unsafe-webgpu-bad-flag-banner.patch
 # Vulkan & ANGLE
 vulkan/0001-angle-dmabuf-graceful-fallback.patch
 vulkan/0002-skia-vk-ozone-general-layout-for-dmabuf.patch
+vulkan/0003-vulkan-image-no-export-on-dmabuf-import.patch
 
 # Wayland / Ozone
 wayland/0001-ozone-wayland-vulkan-enable.patch

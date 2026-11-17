@@ -236,10 +236,18 @@
        wl_format = DRM_FORMAT_XBGR8888;
 --- a/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc	2026-11-16 09:17:41.395766654 +0300
 +++ b/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc	2026-11-16 09:16:34.460864189 +0300
-@@ -261,6 +261,18 @@
-     return nullptr;
-   }
- #if defined(WAYLAND_GBM)
+@@ -267,11 +267,22 @@
+         base::MakeRefCounted<GbmPixmapWayland>(buffer_manager_);
+ 
+     auto native_usage = BufferUsageToNativePixmapUsage(usage);
+-    if (!pixmap->InitializeBuffer(widget, size, format, native_usage,
+-                                  framebuffer_size)) {
+-      return nullptr;
++    if (pixmap->InitializeBuffer(widget, size, format, native_usage,
++                                 framebuffer_size)) {
++      return pixmap;
++    }
++  }
 +  if (device_queue &&
 +      (format == viz::SinglePlaneFormat::kRGBA_8888 ||
 +       format == viz::SinglePlaneFormat::kBGRA_8888 ||
@@ -250,8 +258,8 @@
 +    if (vk_pixmap->InitializeVulkanLinearBuffer(widget, device_queue, size,
 +                                                format, framebuffer_size)) {
 +      return vk_pixmap;
-+    }
-+  }
-   auto* gbm_device = buffer_manager_->GetGbmDevice();
-   if (gbm_device && gbm_device->CanCreateBufferForFormat(
-                         GetFourCCFormatFromSharedImageFormat(format))) {
+     }
+-    return pixmap;
+   }
+ #endif
+   return nullptr;

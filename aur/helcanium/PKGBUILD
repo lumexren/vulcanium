@@ -447,7 +447,7 @@ build() {
 package() {
   cd chromium-$pkgver
 
-  install -Dv out/Release/chrome "$pkgdir/usr/lib/helcanium/helcanium"
+  install -Dv out/Release/helium "$pkgdir/usr/lib/helcanium/helcanium"
   install -Dv out/Release/chromedriver "$pkgdir/usr/bin/helcanium-chromedriver"
   install -Dvm4755 out/Release/chrome_sandbox "$pkgdir/usr/lib/helcanium/chrome-sandbox"
   install -Dvm644 "$srcdir/vulcanium/config/vulcanium-flags.conf" \
@@ -547,7 +547,7 @@ EOF
   local toplevel_files=(
     chrome_100_percent.pak
     chrome_200_percent.pak
-    chrome_crashpad_handler
+    helium_crashpad_handler
     libqt6_shim.so
     resources.pak
     v8_context_snapshot.bin
