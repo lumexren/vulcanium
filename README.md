@@ -42,6 +42,9 @@ makepkg -si
 ### Video Acceleration Information (`H.264`, `HEVC`, `VP9`, `AV1`)
 ![Video Acceleration Information](docs/screenshots/video-acceleration.png)
 
+### Video Encode Acceleration (`H.264`, `HEVC`)
+![Video Encode Acceleration](docs/screenshots/video-encode.png)
+
 ## Notes & Limitations
 
 - Targets Chromium `157.0.8103.78`.
