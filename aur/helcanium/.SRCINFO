@@ -1,5 +1,5 @@
-pkgbase = helium-vulcanium
-	pkgdesc = Helium Browser with native Wayland Vulkan rendering and Vulkan Video decoding
+pkgbase = helcanium
+	pkgdesc = Helium Browser with native Wayland Vulkan rendering and Vulkan Video decoding/encoding
 	pkgver = 157.0.8103.78
 	pkgrel = 1
 	url = https://github.com/lumexren/vulcanium
@@ -87,19 +87,21 @@ pkgbase = helium-vulcanium
 	optdepends = org.freedesktop.secrets: password storage backend on GNOME, KDE and Xfce
 	optdepends = upower: Battery Status API support
 	provides = helium-browser
-	conflicts = helium-vulcanium-bin
+	conflicts = helcanium-bin
 	options = !lto
-	source = https://commondatastorage.googleapis.com/chromium-browser-official/chromium-157.0.8103.78-lite.tar.xz
+	source = https://tarballs.imput.net/chromium-157.0.8103.78/chromium-157.0.8103.78-base.tar.zst
+	source = https://tarballs.imput.net/chromium-157.0.8103.78/chromium-157.0.8103.78-linux-x64.tar.zst
 	source = git+https://chromium.googlesource.com/external/github.com/google/crubit.git#commit=25d2c01bde904c3333bb2d48201e5cbb186a1c7f
-	source = git+https://github.com/imputnet/helium-linux.git
-	source = git+https://github.com/imputnet/helium.git
+	source = git+https://github.com/imputnet/helium-linux.git#tag=0.21.3.1
+	source = git+https://github.com/imputnet/helium.git#commit=a2d96a753a3e9f10e10170615f8eaed6b159e85b
 	source = https://github.com/foutrelis/chromium-launcher/archive/v8/chromium-launcher-8.tar.gz
 	source = git+https://github.com/lumexren/vulcanium.git
-	sha256sums = 9fdce9d3c866f97f14f7a4250915e8e5b729dc952fcfb3a35507b126233f0660
+	sha256sums = 660fa7236e06f325da2c23df5f7fd1a4f613e3a5519771815ef103e27921b2e9
+	sha256sums = a21823bd958611f2368065d4dc831def595ed9f629d3c5b932fad5dbfe677c3e
 	sha256sums = a9c0f429c7a45d31cecd8bd36fc636fbedaf49ff57264a22e3f1eabd4cab523a
 	sha256sums = SKIP
 	sha256sums = SKIP
 	sha256sums = 213e50f48b67feb4441078d50b0fd431df34323be15be97c55302d3fdac4483a
 	sha256sums = SKIP
 
-pkgname = helium-vulcanium
+pkgname = helcanium
