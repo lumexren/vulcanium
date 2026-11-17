@@ -21,7 +21,7 @@
    created_wl_buffer_ = true;
  
 +  uint32_t wl_format = gbm_bo_->GetFormat();
-+  if (!overlay_plane_data.enable_blend || overlay_plane_data.z_order == 0) {
++  if (!overlay_plane_data.enable_blend) {
 +    if (wl_format == DRM_FORMAT_ABGR8888) {
 +      wl_format = DRM_FORMAT_XBGR8888;
 +    } else if (wl_format == DRM_FORMAT_ARGB8888) {

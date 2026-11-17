@@ -231,7 +231,7 @@
 +  uint32_t wl_format = vulkan_handle_
 +                           ? GetFourCCFormatFromSharedImageFormat(vulkan_format_)
 +                           : gbm_bo_->GetFormat();
-   if (!overlay_plane_data.enable_blend || overlay_plane_data.z_order == 0) {
+   if (!overlay_plane_data.enable_blend) {
      if (wl_format == DRM_FORMAT_ABGR8888) {
        wl_format = DRM_FORMAT_XBGR8888;
 --- a/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc	2026-11-16 09:17:41.395766654 +0300
