@@ -85,13 +85,13 @@ optdepends=('pipewire: WebRTC desktop sharing under Wayland'
 provides=('helium-browser')
 conflicts=('helcanium-bin')
 options=('!lto') # Chromium adds its own flags for ThinLTO
-source=(https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$pkgver-lite.tar.xz
+source=("https://tarballs.imput.net/chromium-$pkgver/chromium-$pkgver-linux-x64.tar.zst"
         "git+https://chromium.googlesource.com/external/github.com/google/crubit.git#commit=$_crubit_rev"
         "git+https://github.com/imputnet/helium-linux.git"
         "git+https://github.com/imputnet/helium.git"
         https://github.com/foutrelis/chromium-launcher/archive/v$_launcher_ver/chromium-launcher-$_launcher_ver.tar.gz
         "git+https://github.com/lumexren/vulcanium.git")
-sha256sums=('9fdce9d3c866f97f14f7a4250915e8e5b729dc952fcfb3a35507b126233f0660'
+sha256sums=('a21823bd958611f2368065d4dc831def595ed9f629d3c5b932fad5dbfe677c3e'
             'a9c0f429c7a45d31cecd8bd36fc636fbedaf49ff57264a22e3f1eabd4cab523a'
             'SKIP'
             'SKIP'
@@ -241,6 +241,10 @@ prepare() {
   _helium_linux="$srcdir/helium-linux"
   _helium_core="$srcdir/helium"
   _utils="${_helium_core}/utils"
+  msg2 'Downloading Helium extra dependencies (deps.ini)'
+  mkdir -p "$srcdir/helium-dl-cache"
+  python "$_utils/downloads.py" retrieve -i "$_helium_core/deps.ini" -c "$srcdir/helium-dl-cache"
+  python "$_utils/downloads.py" unpack -i "$_helium_core/deps.ini" -c "$srcdir/helium-dl-cache" ./
   msg2 'Pruning binaries (Helium)'
   python "$_utils/prune_binaries.py" --keep-build-dependencies ./ "$_helium_core/pruning.list" || echo "some errors"
   msg2 'Applying Helium patches'
