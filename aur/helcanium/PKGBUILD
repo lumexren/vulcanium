@@ -202,10 +202,6 @@ prepare() {
 
   patch -Np1 -i "$srcdir/vulcanium/arch/chromium-152-unbundle-opus-devtools.patch"
 
-  # Use system python3 instead of the hermetic cpython3 interpreter
-  # https://github.com/ungoogled-software/ungoogled-chromium/pull/3946
-  patch -Np1 -i "$srcdir/vulcanium/arch/chromium-153-hermetic-python.patch"
-
   # third_party/iamf_tools includes vendored Opus via relative "include/opus.h"
   # paths that only resolve against a real bundled Opus checkout; fix them up
   # for the unbundled system Opus build
