@@ -272,12 +272,12 @@ prepare() {
            third_party/dawn/tools/golang/linux-amd64/bin \
            third_party/rust-toolchain/crubit/lib/third_party/ \
 
-  ln -s /usr/bin/node third_party/node/linux/node-linux-x64/bin/
-  ln -s /usr/bin/java third_party/jdk/current/bin/
-  ln -s /usr/bin/rustc third_party/rust-toolchain/bin/
-  ln -s /usr/bin/gperf third_party/gperf/cipd/bin/
-  ln -s /usr/bin/go third_party/dawn/tools/golang/linux-amd64/bin/
-  ln -s "$srcdir/crubit" third_party/rust-toolchain/crubit/lib/third_party/crubit
+  ln -sf /usr/bin/node third_party/node/linux/node-linux-x64/bin/
+  ln -sf /usr/bin/java third_party/jdk/current/bin/
+  ln -sf /usr/bin/rustc third_party/rust-toolchain/bin/
+  ln -sf /usr/bin/gperf third_party/gperf/cipd/bin/
+  ln -sf /usr/bin/go third_party/dawn/tools/golang/linux-amd64/bin/
+  ln -sfn "$srcdir/crubit" third_party/rust-toolchain/crubit/lib/third_party/crubit
 
   # Remove bundled libraries for which we will use the system copies; this
   # *should* do what the remove_bundled_libraries.py script does, with the
