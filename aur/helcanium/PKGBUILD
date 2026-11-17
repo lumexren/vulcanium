@@ -162,11 +162,6 @@ prepare() {
     third_party/blink/renderer/core/xml/parser/xml_document_parser.cc \
     third_party/libxml/chromium/*.cc
 
-  # Use the --oauth2-client-id= and --oauth2-client-secret= switches for
-  # setting GOOGLE_DEFAULT_CLIENT_ID and GOOGLE_DEFAULT_CLIENT_SECRET at
-  # runtime -- this allows signing into Chromium without baked-in values
-  patch -Np1 -i "$srcdir/vulcanium/arch/use-oauth2-client-switches-as-default.patch"
-
   # Upstream fixes
 
   # Fixes from Gentoo
