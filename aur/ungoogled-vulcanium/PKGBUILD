@@ -13,7 +13,7 @@ _crubit_rev=25d2c01bde904c3333bb2d48201e5cbb186a1c7f
 # ungoogled chromium variables
 _uc_usr=ungoogled-software
 _uc_ver=157.0.8103.78-1
-pkgdesc="ungoogled-chromium with native Wayland Vulkan rendering and Vulkan Video decoding"
+pkgdesc="ungoogled-chromium with native Wayland Vulkan rendering and Vulkan Video decoding/encoding"
 arch=('x86_64')
 url="https://github.com/lumexren/vulcanium"
 license=('BSD-3-Clause')

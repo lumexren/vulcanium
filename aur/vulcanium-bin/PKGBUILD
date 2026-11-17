@@ -3,7 +3,7 @@
 pkgname=vulcanium-bin
 pkgver=157.0.8103.78
 pkgrel=1
-pkgdesc="Chromium with native Wayland Vulkan rendering and Vulkan Video decoding (prebuilt)"
+pkgdesc="Chromium with native Wayland Vulkan rendering and Vulkan Video decoding/encoding (prebuilt)"
 arch=('x86_64')
 url="https://github.com/lumexren/vulcanium"
 license=('BSD-3-Clause')
