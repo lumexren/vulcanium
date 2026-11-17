@@ -39,11 +39,8 @@ makepkg -si
 ### Driver Information (`GaneshVulkan` + `ANGLE_VULKAN`)
 ![Driver Information](docs/screenshots/driver-info.png)
 
-### Video Acceleration Information (`H.264`, `HEVC`, `VP9`, `AV1`)
+### Video Acceleration Information (Decode & Encode)
 ![Video Acceleration Information](docs/screenshots/video-acceleration.png)
-
-### Video Encode Acceleration (`H.264`, `HEVC`)
-![Video Encode Acceleration](docs/screenshots/video-encode.png)
 
 ## Notes & Limitations
 
