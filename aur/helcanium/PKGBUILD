@@ -88,8 +88,8 @@ options=('!lto') # Chromium adds its own flags for ThinLTO
 source=("https://tarballs.imput.net/chromium-$pkgver/chromium-$pkgver-base.tar.zst"
         "https://tarballs.imput.net/chromium-$pkgver/chromium-$pkgver-linux-x64.tar.zst"
         "git+https://chromium.googlesource.com/external/github.com/google/crubit.git#commit=$_crubit_rev"
-        "git+https://github.com/imputnet/helium-linux.git"
-        "git+https://github.com/imputnet/helium.git"
+        "git+https://github.com/imputnet/helium-linux.git#tag=0.21.3.1"
+        "git+https://github.com/imputnet/helium.git#commit=a2d96a753a3e9f10e10170615f8eaed6b159e85b"
         https://github.com/foutrelis/chromium-launcher/archive/v$_launcher_ver/chromium-launcher-$_launcher_ver.tar.gz
         "git+https://github.com/lumexren/vulcanium.git")
 sha256sums=('660fa7236e06f325da2c23df5f7fd1a4f613e3a5519771815ef103e27921b2e9'
