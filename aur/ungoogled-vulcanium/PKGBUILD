@@ -462,7 +462,16 @@ _push_flag() {
   local tok="$1"
   case "$tok" in
     --enable-features=*)
-      _enable_features+=("${tok#--enable-features=}")
+      local IFS=, feat
+      for feat in ${tok#--enable-features=}; do
+        case "$feat" in
+          VaapiOnNvidiaGPUs|VaapiVideoDecoder|VaapiVideoEncoder|VaapiVideoDecodeLinuxGL|AcceleratedVideoDecodeLinuxGL|"")
+            ;;
+          *)
+            _enable_features+=("$feat")
+            ;;
+        esac
+      done
       ;;
     --disable-features=*)
       _disable_features+=("${tok#--disable-features=}")
@@ -490,6 +499,8 @@ _read_flags "${XDG_CONFIG_HOME:-$HOME/.config}/chromium-flags.conf"
 for arg in "$@"; do
   _push_flag "$arg"
 done
+
+_disable_features+=("VaapiVideoDecoder,VaapiVideoEncoder,VaapiVideoDecodeLinuxGL,VaapiOnNvidiaGPUs,AcceleratedVideoDecodeLinuxGL")
 
 if (( ${#_enable_features[@]} > 0 )); then
   _flags+=("--enable-features=$(IFS=,; echo "${_enable_features[*]}")")
