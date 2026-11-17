@@ -1,6 +1,6 @@
 --- a/gpu/vulkan/vulkan_image_linux.cc
 +++ b/gpu/vulkan/vulkan_image_linux.cc
-@@ -94,20 +94,6 @@
+@@ -94,21 +94,6 @@
        .fd = memory_fd,
    };
  
