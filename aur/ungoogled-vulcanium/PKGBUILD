@@ -509,6 +509,7 @@ if (( ${#_disable_features[@]} > 0 )); then
   _flags+=("--disable-features=$(IFS=,; echo "${_disable_features[*]}")")
 fi
 
+export CHROME_VERSION_EXTRA="vulcanium"
 export CHROME_WRAPPER="$(readlink -f "$0")"
 exec /usr/lib/chromium/chromium "${_flags[@]}"
 EOF
