@@ -1,5 +1,5 @@
 pkgbase = ungoogled-vulcanium
-	pkgdesc = ungoogled-chromium with native Wayland Vulkan rendering and Vulkan Video decoding
+	pkgdesc = ungoogled-chromium with native Wayland Vulkan rendering and Vulkan Video decoding/encoding
 	pkgver = 157.0.8103.78
 	pkgrel = 1
 	url = https://github.com/lumexren/vulcanium
@@ -86,7 +86,10 @@ pkgbase = ungoogled-vulcanium
 	optdepends = qt6-base: Qt support
 	optdepends = org.freedesktop.secrets: password storage backend on GNOME, KDE and Xfce
 	optdepends = upower: Battery Status API support
+	provides = chromium
 	provides = ungoogled-chromium
+	conflicts = chromium
+	conflicts = ungoogled-chromium
 	conflicts = ungoogled-vulcanium-bin
 	options = !lto
 	source = https://commondatastorage.googleapis.com/chromium-browser-official/chromium-157.0.8103.78-lite.tar.xz
