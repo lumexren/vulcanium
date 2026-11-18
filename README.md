@@ -11,10 +11,9 @@ Chromium with Vulkan rendering and Vulkan Video Decoding / Encoding
 ## Features
 
 - **Native Wayland + Vulkan (`patches/wayland/`, `patches/vulkan/`):**
-  - `GaneshVulkan` + `ANGLE_VULKAN` via `VK_KHR_wayland_surface` swapchain, premultiplied alpha, and Wayland windowing state synchronization.
-  - DMA-BUF linear modifier fallback and `VK_IMAGE_LAYOUT_GENERAL` transitions.
+  - Out-of-process GPU rendering (`GaneshVulkan` + `ANGLE_VULKAN`) via DMA-BUF (`gbm_device` / Vulkan linear modifier fallback), `VK_IMAGE_LAYOUT_GENERAL` transitions, and preserved CSD window alpha.
 - **Vulkan Video Decoding & Encoding (`patches/video-decode/`, `patches/video-encode/`):**
-  - `VulkanVideoDecoder` (H.264, HEVC/H.265, VP9, AV1) backed by FFmpeg Vulkan hwaccel with zero-copy DMA-BUF frame wrapping.
+  - `VulkanVideoDecoder` (H.264, HEVC/H.265, VP9, AV1) backed by FFmpeg Vulkan hwaccel with zero-copy GPU `vkCmdCopyImage` → 2-plane DMA-BUF → `MailboxVideoFrameConverter` (`SharedImage`) output.
   - `VulkanVideoEncodeAccelerator` (H.264, HEVC/H.265) backed by FFmpeg `h264_vulkan` and `hevc_vulkan` (`VK_KHR_video_encode_queue`).
 - **Isolated Branding & Safe Defaults (`patches/branding/`, `config/`):**
   - Separate profile directory, default Wayland/Vulkan runtime flags, and automatic launcher neutralization of conflicting VA-API flags.
@@ -56,5 +55,5 @@ makepkg -si
 
 ## Notes & Limitations
 
-- Uses `--in-process-gpu` so `VK_KHR_wayland_surface` shares Wayland surface handles directly.
+- Runs with the standard out-of-process GPU process (`--in-process-gpu` is not used).
 - Tested on Arch Linux, KDE Plasma Wayland, and NVIDIA RTX 3060 (AMD and Intel GPUs are currently untested).
