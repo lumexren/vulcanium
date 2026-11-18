@@ -72,7 +72,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,707 @@
+@@ -0,0 +1,709 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -86,6 +86,7 @@
 +#include <cstring>
 +#include <vector>
 +
++#include "base/compiler_specific.h"
 +#include "base/files/scoped_file.h"
 +#include "base/functional/bind.h"
 +#include "base/logging.h"
@@ -315,6 +316,7 @@
 +  std::move(bound_cb).Run(DecoderStatus::Codes::kOk);
 +}
 +
++NO_SANITIZE("cfi-icall")
 +scoped_refptr<VideoFrame> TryGpuCopyVkFrameToDmabuf(AVFrame* hw_frame,
 +                                                    base::TimeDelta pts) {
 +  if (!hw_frame || !hw_frame->hw_frames_ctx) {
