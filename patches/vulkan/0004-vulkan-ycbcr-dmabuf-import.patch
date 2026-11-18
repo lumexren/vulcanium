@@ -1,0 +1,35 @@
+--- a/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc
++++ b/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc
+@@ -190,9 +190,14 @@
+     VkFormat vk_format,
+     const gfx::ColorSpace& color_space) {
+-  constexpr auto kUsage =
+-      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+-      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++  VkImageUsageFlags usage =
++      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++      VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++  if (vk_format != VK_FORMAT_G8_B8R8_2PLANE_420_UNORM &&
++      vk_format != VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM &&
++      vk_format != VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16) {
++    usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++  }
+   auto tiling = gmb_handle.native_pixmap_handle().modifier ==
+                         gfx::NativePixmapHandle::kNoModifier
+                     ? VK_IMAGE_TILING_OPTIMAL
+                     : VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+   return gpu::VulkanImage::CreateFromGpuMemoryBufferHandle(
+-      device_queue, std::move(gmb_handle), size, vk_format, kUsage, /*flags=*/0,
++      device_queue, std::move(gmb_handle), size, vk_format, usage, /*flags=*/0,
+       tiling, VK_QUEUE_FAMILY_FOREIGN_EXT);
+ }
+--- a/gpu/vulkan/vulkan_image_linux.cc
++++ b/gpu/vulkan/vulkan_image_linux.cc
+@@ -105,5 +105,5 @@
+   if (result == kFailedBeforeAllocateMemory) {
+     scoped_fd.reset(memory_fd);
+   }
+ 
+-  return result;
++  return result == kSuccess;
+ }

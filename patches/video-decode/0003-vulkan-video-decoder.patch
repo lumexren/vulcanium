@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.h
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,78 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -12,11 +12,13 @@
 +
 +#include "base/functional/callback.h"
 +#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
 +#include "base/sequence_checker.h"
 +#include "media/base/supported_video_decoder_config.h"
 +#include "media/base/video_decoder.h"
 +#include "media/base/video_decoder_config.h"
 +#include "media/ffmpeg/ffmpeg_deleters.h"
++#include "media/gpu/chromeos/frame_resource_converter.h"
 +#include "media/gpu/media_gpu_export.h"
 +
 +struct AVBufferRef;
@@ -34,13 +36,16 @@
 +  static bool IsSupported(const VideoDecoderConfig& config);
 +  static SupportedVideoDecoderConfigs GetSupportedConfigs();
 +
-+  explicit VulkanVideoDecoder(std::unique_ptr<MediaLog> media_log);
++  explicit VulkanVideoDecoder(
++      std::unique_ptr<MediaLog> media_log,
++      std::unique_ptr<FrameResourceConverter> frame_converter = nullptr);
 +  VulkanVideoDecoder(const VulkanVideoDecoder&) = delete;
 +  VulkanVideoDecoder& operator=(const VulkanVideoDecoder&) = delete;
 +  ~VulkanVideoDecoder() override;
 +
 +  // VideoDecoder implementation:
 +  VideoDecoderType GetDecoderType() const override;
++  bool FramesHoldExternalResources() const override;
 +  void Initialize(const VideoDecoderConfig& config,
 +                  bool low_delay,
 +                  CdmContext* cdm_context,
@@ -54,10 +59,13 @@
 +  bool ConfigureVulkanDecoder(const VideoDecoderConfig& config);
 +  void ReleaseResources();
 +  bool EmitFrame(AVFrame* hw_frame);
++  void OnFrameConverted(scoped_refptr<VideoFrame> frame);
 +
 +  SEQUENCE_CHECKER(sequence_checker_);
 +
 +  std::unique_ptr<MediaLog> media_log_;
++  std::unique_ptr<FrameResourceConverter> frame_converter_;
++  bool converter_initialized_ = false;
 +  VideoDecoderConfig config_;
 +  OutputCB output_cb_;
 +
@@ -65,6 +73,7 @@
 +  std::unique_ptr<AVCodecContext, ScopedPtrAVFreeContext> codec_context_;
 +  bool initialized_ = false;
 +  bool eos_reached_ = false;
++  base::WeakPtrFactory<VulkanVideoDecoder> weak_factory_{this};
 +};
 +
 +}  // namespace media
@@ -72,7 +81,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,709 @@
+@@ -0,0 +1,748 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -100,6 +109,7 @@
 +#include "media/base/video_frame.h"
 +#include "media/base/video_frame_layout.h"
 +#include "media/ffmpeg/ffmpeg_common.h"
++#include "media/gpu/chromeos/video_frame_resource.h"
 +
 +extern "C" {
 +#include <libavcodec/avcodec.h>
@@ -159,8 +169,11 @@
 +  }
 +}
 +
-+VulkanVideoDecoder::VulkanVideoDecoder(std::unique_ptr<MediaLog> media_log)
-+    : media_log_(std::move(media_log)) {}
++VulkanVideoDecoder::VulkanVideoDecoder(
++    std::unique_ptr<MediaLog> media_log,
++    std::unique_ptr<FrameResourceConverter> frame_converter)
++    : media_log_(std::move(media_log)),
++      frame_converter_(std::move(frame_converter)) {}
 +
 +VulkanVideoDecoder::~VulkanVideoDecoder() {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
@@ -169,6 +182,10 @@
 +
 +VideoDecoderType VulkanVideoDecoder::GetDecoderType() const {
 +  return VideoDecoderType::kFFmpeg;
++}
++
++bool VulkanVideoDecoder::FramesHoldExternalResources() const {
++  return true;
 +}
 +
 +void VulkanVideoDecoder::Initialize(const VideoDecoderConfig& config,
@@ -187,6 +204,13 @@
 +
 +  config_ = config;
 +  output_cb_ = output_cb;
++  if (frame_converter_ && !converter_initialized_) {
++    frame_converter_->Initialize(
++        base::SequencedTaskRunner::GetCurrentDefault(),
++        base::BindRepeating(&VulkanVideoDecoder::OnFrameConverted,
++                            weak_factory_.GetWeakPtr()));
++    converter_initialized_ = true;
++  }
 +  initialized_ = true;
 +  eos_reached_ = false;
 +  std::move(bound_init_cb).Run(DecoderStatus::Codes::kOk);
@@ -316,7 +340,7 @@
 +  std::move(bound_cb).Run(DecoderStatus::Codes::kOk);
 +}
 +
-+NO_SANITIZE("cfi-icall")
++NO_SANITIZE("cfi") __attribute__((noinline))
 +scoped_refptr<VideoFrame> TryGpuCopyVkFrameToDmabuf(AVFrame* hw_frame,
 +                                                    base::TimeDelta pts) {
 +  if (!hw_frame || !hw_frame->hw_frames_ctx) {
@@ -340,10 +364,8 @@
 +  if (!vk_get_dev_proc) {
 +    return nullptr;
 +  }
-+  auto fn = [&](const char* name) {
-+    return vk_get_dev_proc(vk_dev->act_dev, name);
-+  };
-+#define VK_FN(name) auto pfn_##name = reinterpret_cast<PFN_##name>(fn(#name))
++#define VK_FN(name) \
++  auto pfn_##name = reinterpret_cast<PFN_##name>(vk_get_dev_proc(vk_dev->act_dev, #name))
 +  VK_FN(vkCreateImage);
 +  VK_FN(vkDestroyImage);
 +  VK_FN(vkGetImageMemoryRequirements);
@@ -383,120 +405,130 @@
 +  const gfx::Size coded_size(w, h);
 +  const gfx::Rect visible_rect(coded_size);
 +
-+  struct PlaneTarget {
-+    VkImage img = VK_NULL_HANDLE;
-+    VkDeviceMemory mem = VK_NULL_HANDLE;
-+    base::ScopedFD fd;
-+    uint32_t stride = 0;
-+    uint64_t offset = 0;
-+    uint64_t size = 0;
-+  } targets[2];
++  VkImage dst_img = VK_NULL_HANDLE;
++  VkDeviceMemory dst_mem = VK_NULL_HANDLE;
++  base::ScopedFD dst_fd;
++  base::ScopedFD dst_fd_dup;
++#define cleanup()                                                         \
++  do {                                                                    \
++    if (dst_img != VK_NULL_HANDLE)                                        \
++      pfn_vkDestroyImage(vk_dev->act_dev, dst_img, nullptr);              \
++    if (dst_mem != VK_NULL_HANDLE)                                        \
++      pfn_vkFreeMemory(vk_dev->act_dev, dst_mem, nullptr);                \
++  } while (0)
 +
-+  auto cleanup = [&]() {
-+    for (auto& t : targets) {
-+      if (t.img != VK_NULL_HANDLE) pfn_vkDestroyImage(vk_dev->act_dev, t.img, nullptr);
-+      if (t.mem != VK_NULL_HANDLE) pfn_vkFreeMemory(vk_dev->act_dev, t.mem, nullptr);
-+    }
-+  };
-+
-+  const VkFormat formats[2] = {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM};
-+  const uint32_t widths[2] = {static_cast<uint32_t>(w),
-+                              static_cast<uint32_t>((w + 1) / 2)};
-+  const uint32_t heights[2] = {static_cast<uint32_t>(h),
-+                               static_cast<uint32_t>((h + 1) / 2)};
 +  uint64_t linear_mod = DRM_FORMAT_MOD_LINEAR;
++  VkImageDrmFormatModifierListCreateInfoEXT mod_list{
++      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
++      .drmFormatModifierCount = 1,
++      .pDrmFormatModifiers = &linear_mod,
++  };
++  VkExternalMemoryImageCreateInfo ext_info{
++      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
++      .pNext = &mod_list,
++      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++  };
++  VkImageCreateInfo img_ci{
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .pNext = &ext_info,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
++      .extent = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++      .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++  };
++  VkResult ci_res =
++      pfn_vkCreateImage(vk_dev->act_dev, &img_ci, nullptr, &dst_img);
++  if (ci_res != VK_SUCCESS) {
++    LOG(WARNING) << "VulkanVideoDecoder: vkCreateImage 2PLANE failed: "
++                 << ci_res;
++    cleanup();
++    return nullptr;
++  }
++  VkMemoryRequirements req{};
++  pfn_vkGetImageMemoryRequirements(vk_dev->act_dev, dst_img, &req);
++  uint32_t mem_idx = UINT32_MAX;
++  for (uint32_t m = 0; m < mem_props.memoryTypeCount; ++m) {
++    if ((req.memoryTypeBits & (1u << m)) &&
++        (mem_props.memoryTypes[m].propertyFlags &
++         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
++      mem_idx = m;
++      break;
++    }
++  }
++  if (mem_idx == UINT32_MAX) {
++    cleanup();
++    return nullptr;
++  }
++  VkExportMemoryAllocateInfo exp_ai{
++      .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
++      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++  };
++  VkMemoryDedicatedAllocateInfo ded_ai{
++      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
++      .pNext = &exp_ai,
++      .image = dst_img,
++  };
++  VkMemoryAllocateInfo mai{
++      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++      .pNext = &ded_ai,
++      .allocationSize = req.size,
++      .memoryTypeIndex = mem_idx,
++  };
++  if (pfn_vkAllocateMemory(vk_dev->act_dev, &mai, nullptr, &dst_mem) !=
++          VK_SUCCESS ||
++      pfn_vkBindImageMemory(vk_dev->act_dev, dst_img, dst_mem, 0) !=
++          VK_SUCCESS) {
++    cleanup();
++    return nullptr;
++  }
 +
++  VkImageAspectFlags aspects[2] = {VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
++                                   VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT};
++  uint32_t strides[2]{};
++  uint64_t offsets[2]{};
++  uint64_t sizes[2]{};
 +  for (int i = 0; i < 2; ++i) {
-+    VkImageDrmFormatModifierListCreateInfoEXT mod_list{
-+        .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
-+        .drmFormatModifierCount = 1,
-+        .pDrmFormatModifiers = &linear_mod,
-+    };
-+    VkExternalMemoryImageCreateInfo ext_info{
-+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-+        .pNext = &mod_list,
-+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-+    };
-+    VkImageCreateInfo img_ci{
-+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-+        .pNext = &ext_info,
-+        .imageType = VK_IMAGE_TYPE_2D,
-+        .format = formats[i],
-+        .extent = {widths[i], heights[i], 1},
-+        .mipLevels = 1,
-+        .arrayLayers = 1,
-+        .samples = VK_SAMPLE_COUNT_1_BIT,
-+        .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-+    };
-+    if (pfn_vkCreateImage(vk_dev->act_dev, &img_ci, nullptr, &targets[i].img) !=
-+        VK_SUCCESS) {
-+      cleanup();
-+      return nullptr;
-+    }
-+    VkMemoryRequirements req{};
-+    pfn_vkGetImageMemoryRequirements(vk_dev->act_dev, targets[i].img, &req);
-+    uint32_t mem_idx = UINT32_MAX;
-+    for (uint32_t m = 0; m < mem_props.memoryTypeCount; ++m) {
-+      if ((req.memoryTypeBits & (1u << m)) &&
-+          (mem_props.memoryTypes[m].propertyFlags &
-+           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-+        mem_idx = m;
-+        break;
-+      }
-+    }
-+    if (mem_idx == UINT32_MAX) {
-+      cleanup();
-+      return nullptr;
-+    }
-+    VkExportMemoryAllocateInfo exp_ai{
-+        .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
-+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-+    };
-+    VkMemoryDedicatedAllocateInfo ded_ai{
-+        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-+        .pNext = &exp_ai,
-+        .image = targets[i].img,
-+    };
-+    VkMemoryAllocateInfo mai{
-+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-+        .pNext = &ded_ai,
-+        .allocationSize = req.size,
-+        .memoryTypeIndex = mem_idx,
-+    };
-+    if (pfn_vkAllocateMemory(vk_dev->act_dev, &mai, nullptr, &targets[i].mem) !=
-+            VK_SUCCESS ||
-+        pfn_vkBindImageMemory(vk_dev->act_dev, targets[i].img, targets[i].mem,
-+                              0) != VK_SUCCESS) {
-+      cleanup();
-+      return nullptr;
-+    }
-+    VkImageSubresource sub{.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT};
++    VkImageSubresource sub{.aspectMask = aspects[i]};
 +    VkSubresourceLayout lay{};
-+    pfn_vkGetImageSubresourceLayout(vk_dev->act_dev, targets[i].img, &sub,
-+                                    &lay);
-+    targets[i].stride = lay.rowPitch > 0 ? static_cast<uint32_t>(lay.rowPitch)
-+                                         : widths[i] * (i == 0 ? 1u : 2u);
-+    targets[i].offset = lay.offset;
-+    targets[i].size = lay.size > 0 ? lay.size : req.size;
-+    VkMemoryGetFdInfoKHR fd_info{
-+        .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
-+        .memory = targets[i].mem,
-+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-+    };
-+    int raw_fd = -1;
-+    if (pfn_vkGetMemoryFdKHR(vk_dev->act_dev, &fd_info, &raw_fd) !=
-+            VK_SUCCESS ||
-+        raw_fd < 0) {
-+      cleanup();
-+      return nullptr;
-+    }
-+    targets[i].fd.reset(raw_fd);
++    pfn_vkGetImageSubresourceLayout(vk_dev->act_dev, dst_img, &sub, &lay);
++    strides[i] = lay.rowPitch > 0 ? static_cast<uint32_t>(lay.rowPitch)
++                                  : static_cast<uint32_t>(w);
++    offsets[i] = lay.offset;
++    sizes[i] = lay.size > 0 ? lay.size : req.size;
++  }
++
++  VkMemoryGetFdInfoKHR fd_info{
++      .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
++      .memory = dst_mem,
++      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++  };
++  int raw_fd = -1;
++  if (pfn_vkGetMemoryFdKHR(vk_dev->act_dev, &fd_info, &raw_fd) != VK_SUCCESS ||
++      raw_fd < 0) {
++    cleanup();
++    return nullptr;
++  }
++  dst_fd.reset(raw_fd);
++  dst_fd_dup.reset(HANDLE_EINTR(dup(dst_fd.get())));
++  if (!dst_fd_dup.is_valid()) {
++    cleanup();
++    return nullptr;
 +  }
 +
 +  uint32_t qf = vk_dev->nb_qf > 0 ? static_cast<uint32_t>(vk_dev->qf[0].idx) : 0u;
++  for (int qi = 0; qi < vk_dev->nb_qf; ++qi) {
++    if (vk_dev->qf[qi].flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT)) {
++      qf = static_cast<uint32_t>(vk_dev->qf[qi].idx);
++      if (vk_dev->qf[qi].flags & VK_QUEUE_GRAPHICS_BIT)
++        break;
++    }
++  }
 +  VkCommandPoolCreateInfo cpci{
 +      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 +      .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
@@ -530,7 +562,7 @@
 +  VkImageAspectFlags src_aspect =
 +      two_imgs ? VK_IMAGE_ASPECT_COLOR_BIT
 +               : (VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT);
-+  VkImageMemoryBarrier pre[3]{
++  VkImageMemoryBarrier pre[2]{
 +      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 +       .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
 +       .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
@@ -547,39 +579,38 @@
 +       .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 +       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 +       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+       .image = targets[0].img,
-+       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
-+      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-+       .srcAccessMask = 0,
-+       .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-+       .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-+       .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-+       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+       .image = targets[1].img,
-+       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
++       .image = dst_img,
++       .subresourceRange = {VK_IMAGE_ASPECT_PLANE_0_BIT |
++                                VK_IMAGE_ASPECT_PLANE_1_BIT,
++                            0, 1, 0, 1}},
 +  };
 +  pfn_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
 +                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-+                           nullptr, 3, pre);
++                           nullptr, 2, pre);
 +
++  const uint32_t widths[2] = {static_cast<uint32_t>(w),
++                              static_cast<uint32_t>((w + 1) / 2)};
++  const uint32_t heights[2] = {static_cast<uint32_t>(h),
++                               static_cast<uint32_t>((h + 1) / 2)};
 +  for (int i = 0; i < 2; ++i) {
 +    VkImage src_img = two_imgs ? src_vk->img[i] : src_vk->img[0];
-+    VkImageAspectFlags plane_aspect =
++    VkImageAspectFlags src_plane_aspect =
 +        two_imgs ? VK_IMAGE_ASPECT_COLOR_BIT
 +                 : (i == 0 ? VK_IMAGE_ASPECT_PLANE_0_BIT
 +                           : VK_IMAGE_ASPECT_PLANE_1_BIT);
++    VkImageAspectFlags dst_plane_aspect =
++        (i == 0) ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_PLANE_1_BIT;
 +    VkImageCopy region{
-+        .srcSubresource = {plane_aspect, 0, 0, 1},
-+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++        .srcSubresource = {src_plane_aspect, 0, 0, 1},
++        .dstSubresource = {dst_plane_aspect, 0, 0, 1},
 +        .extent = {widths[i], heights[i], 1},
 +    };
 +    pfn_vkCmdCopyImage(cb, src_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-+                       targets[i].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-+                       1, &region);
++                       dst_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
++                       &region);
 +  }
 +
-+  VkImageMemoryBarrier post[3]{
++  VkImageMemoryBarrier post[2]{
 +      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 +       .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 +       .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
@@ -596,21 +627,14 @@
 +       .newLayout = VK_IMAGE_LAYOUT_GENERAL,
 +       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 +       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+       .image = targets[0].img,
-+       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
-+      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-+       .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-+       .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
-+       .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-+       .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-+       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+       .image = targets[1].img,
-+       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
++       .image = dst_img,
++       .subresourceRange = {VK_IMAGE_ASPECT_PLANE_0_BIT |
++                                VK_IMAGE_ASPECT_PLANE_1_BIT,
++                            0, 1, 0, 1}},
 +  };
 +  pfn_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
 +                           VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr,
-+                           0, nullptr, 3, post);
++                           0, nullptr, 2, post);
 +  pfn_vkEndCommandBuffer(cb);
 +
 +  VkQueue queue = VK_NULL_HANDLE;
@@ -636,22 +660,27 @@
 +  if (vk_dev->lock_queue) vk_dev->lock_queue(frames_ctx->device_ctx, qf, 0);
 +  VkResult sr = pfn_vkQueueSubmit(queue, 1, &si, fence);
 +  if (vk_dev->unlock_queue) vk_dev->unlock_queue(frames_ctx->device_ctx, qf, 0);
++  VkResult wr = VK_ERROR_UNKNOWN;
 +  if (sr == VK_SUCCESS) {
-+    pfn_vkWaitForFences(vk_dev->act_dev, 1, &fence, VK_TRUE, UINT64_MAX);
++    wr = pfn_vkWaitForFences(vk_dev->act_dev, 1, &fence, VK_TRUE, 1000000000ULL);
 +  }
 +  pfn_vkDestroyFence(vk_dev->act_dev, fence, nullptr);
 +  pfn_vkDestroyCommandPool(vk_dev->act_dev, pool, nullptr);
 +  cleanup();
-+  if (sr != VK_SUCCESS) {
++  if (sr != VK_SUCCESS || wr != VK_SUCCESS) {
++    LOG(WARNING) << "VulkanVideoDecoder: TryGpuCopyVkFrameToDmabuf failed sr="
++                 << sr << " wr=" << wr << " qf=" << qf;
 +    return nullptr;
 +  }
 +
 +  std::vector<ColorPlaneLayout> planes;
-+  std::vector<base::ScopedFD> fds;
 +  for (int i = 0; i < 2; ++i) {
-+    planes.emplace_back(targets[i].stride, targets[i].offset, targets[i].size);
-+    fds.push_back(std::move(targets[i].fd));
++    planes.emplace_back(strides[i], offsets[i], sizes[i]);
 +  }
++  std::vector<base::ScopedFD> fds;
++  fds.push_back(std::move(dst_fd));
++  fds.push_back(std::move(dst_fd_dup));
++#undef cleanup
 +  auto layout = VideoFrameLayout::CreateWithPlanes(
 +      PIXEL_FORMAT_NV12, coded_size, std::move(planes),
 +      VideoFrameLayout::kBufferAddressAlignment, linear_mod);
@@ -712,11 +741,12 @@
 +              auto video_frame = VideoFrame::WrapExternalDmabufs(
 +                  *layout, visible_rect, coded_size, std::move(dmabuf_fds),
 +                  pts);
-+              if (video_frame) {
++              if (video_frame && frame_converter_) {
 +                video_frame->metadata().power_efficient = true;
 +                video_frame->AddDestructionObserver(base::BindOnce(
 +                    [](AVFrame* frame) { av_frame_free(&frame); }, drm_frame));
-+                output_cb_.Run(std::move(video_frame));
++                frame_converter_->ConvertFrame(
++                    VideoFrameResource::Create(std::move(video_frame)));
 +                return true;
 +              }
 +            }
@@ -725,9 +755,17 @@
 +      }
 +      av_frame_free(&drm_frame);
 +    }
-+    if (auto gpu_vf = TryGpuCopyVkFrameToDmabuf(hw_frame, pts)) {
-+      output_cb_.Run(std::move(gpu_vf));
-+      return true;
++    if (frame_converter_) {
++      if (auto gpu_vf = TryGpuCopyVkFrameToDmabuf(hw_frame, pts)) {
++        frame_converter_->ConvertFrame(
++            VideoFrameResource::Create(std::move(gpu_vf)));
++        return true;
++      }
++    }
++    static bool logged_fb = false;
++    if (!logged_fb) {
++      logged_fb = true;
++      LOG(WARNING) << "VulkanVideoDecoder: falling back to av_hwframe_transfer_data";
 +    }
 +  }
 +
@@ -771,8 +809,18 @@
 +  return true;
 +}
 +
++void VulkanVideoDecoder::OnFrameConverted(scoped_refptr<VideoFrame> frame) {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (frame && output_cb_) {
++    output_cb_.Run(std::move(frame));
++  }
++}
++
 +void VulkanVideoDecoder::Reset(base::OnceClosure closure) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (frame_converter_) {
++    frame_converter_->AbortPendingFrames();
++  }
 +  if (codec_context_) {
 +    avcodec_flush_buffers(codec_context_.get());
 +  }
@@ -817,7 +865,10 @@
        VideoDecoderTraits& traits) final {
 +#if BUILDFLAG(ENABLE_VULKAN)
 +    if (base::FeatureList::IsEnabled(kVulkanVideoDecode)) {
-+      return std::make_unique<VulkanVideoDecoder>(traits.media_log->Clone());
++      return std::make_unique<VulkanVideoDecoder>(
++          traits.media_log->Clone(),
++          MailboxVideoFrameConverter::Create(
++              gpu_task_runner_, traits.get_command_buffer_stub_cb));
 +    }
 +#endif
 +
