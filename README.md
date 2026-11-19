@@ -8,6 +8,9 @@ Chromium with Vulkan rendering and Vulkan Video Decoding / Encoding
 
 </div>
 
+> [!IMPORTANT]
+> I maintain this project solo and build all three browsers locally on my own machine. Because of that, Chromium version updates are planned for the end of each month. Bug fixes are exempt from this schedule and will be built and released on top of the current version as soon as they are resolved.
+
 ## Features
 
 - **Native Wayland + Vulkan:** Out-of-process GPU rendering (`GaneshVulkan` + `ANGLE_VULKAN`) with DMA-BUF support and preserved window alpha.
