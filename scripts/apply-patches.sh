@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${CHROMIUM_VERSION:-157.0.8103.78}"
+VERSION="${CHROMIUM_VERSION:-158.0.8127.36}"
 TARGET_DIR="${1:-${ROOT_DIR}/src/chromium-${VERSION}}"
 SERIES_FILE="${ROOT_DIR}/patches/series"
 

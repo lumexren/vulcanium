@@ -1,6 +1,7 @@
 --- a/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc
 +++ b/ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc
-@@ -190,9 +190,14 @@
+@@ -120,15 +120,20 @@
+     gfx::Size size,
      VkFormat vk_format,
      const gfx::ColorSpace& color_space) {
 -  constexpr auto kUsage =
@@ -23,13 +24,15 @@
 +      device_queue, std::move(gmb_handle), size, vk_format, usage, /*flags=*/0,
        tiling, VK_QUEUE_FAMILY_FOREIGN_EXT);
  }
+ 
 --- a/gpu/vulkan/vulkan_image_linux.cc
 +++ b/gpu/vulkan/vulkan_image_linux.cc
-@@ -105,5 +105,5 @@
-   if (result == kFailedBeforeAllocateMemory) {
+@@ -105,7 +105,7 @@
      scoped_fd.reset(memory_fd);
    }
  
 -  return result;
 +  return result == kSuccess;
  }
+ 
+ bool VulkanImage::InitializeWithExternalMemoryAndModifiers(

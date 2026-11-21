@@ -1,0 +1,65 @@
+--- a/chrome/browser/web_applications/os_integration/web_app_shortcut_linux.cc
++++ b/chrome/browser/web_applications/os_integration/web_app_shortcut_linux.cc
+@@ -44,6 +44,7 @@
+ #include "chrome/browser/web_applications/web_app_constants.h"
+ #include "chrome/common/auto_start_linux.h"
+ #include "chrome/common/buildflags.h"
++#include "chrome/common/channel_info.h"
+ #include "chrome/common/chrome_constants.h"
+ #include "components/webapps/common/web_app_id.h"
+ 
+@@ -390,7 +391,17 @@
+ std::string GetShortcutFileName(const base::FilePath& profile_path,
+                                 const std::string& app_id) {
+   // Use a prefix, because xdg-desktop-menu requires it.
+-  std::string filename(chrome::kBrowserProcessExecutableName);
++  std::unique_ptr<base::Environment> env(base::Environment::Create());
++  std::string prefix = chrome::GetDesktopName(env.get());
++  if (auto base = base::RemoveSuffix(prefix, ".desktop")) {
++    prefix = std::string(*base);
++  }
++  if (prefix.empty() || prefix == "chromium-browser") {
++    prefix = chrome::kBrowserProcessExecutableName;
++  } else {
++    base::ReplaceChars(prefix, " ", "-", &prefix);
++  }
++  std::string filename(prefix);
+   filename.append("-").append(app_id).append("-").append(
+       profile_path.BaseName().value());
+   base::i18n::ReplaceIllegalCharactersInPath(&filename, '_');
+--- a/chrome/browser/shell_integration_linux.cc
++++ b/chrome/browser/shell_integration_linux.cc
+@@ -644,7 +644,13 @@
+                                                 base::BlockingType::MAY_BLOCK);
+ 
+   // Use a prefix, because xdg-desktop-menu requires it.
+-  std::string prefix(chrome::kBrowserProcessExecutableName);
++  std::unique_ptr<base::Environment> env(base::Environment::Create());
++  std::string prefix = GetDesktopBaseName(chrome::GetDesktopName(env.get()));
++  if (prefix.empty() || prefix == "chromium-browser") {
++    prefix = chrome::kBrowserProcessExecutableName;
++  } else {
++    base::ReplaceChars(prefix, " ", "-", &prefix);
++  }
+   prefix.append("-");
+   std::string suffix("-");
+   suffix.append(profile_path.BaseName().value());
+@@ -681,7 +687,17 @@
+   base::CommandLine cmd_line = shell_integration::CommandLineArgsForLauncher(
+       url, extension_id, profile_path, run_on_os_login_mode);
+   cmd_line.SetProgram(chrome_exe_path);
+-  return GetDesktopFileContentsForCommand(
++  std::string contents = GetDesktopFileContentsForCommand(
+       cmd_line, app_name, url, title, icon_name, categories, mime_type,
+       no_display, GetDirectLaunchMimeTypeHandler(), std::move(action_info));
++  if (!profile_path.empty()) {
++    std::unique_ptr<base::Environment> env(base::Environment::Create());
++    if (env->HasVar("WAYLAND_DISPLAY")) {
++      std::string old_wm = "StartupWMClass=" + GetWMClassFromAppName(app_name);
++      std::string new_wm =
++          "StartupWMClass=" + GetXdgAppIdForWebApp(app_name, profile_path);
++      base::ReplaceFirstSubstringAfterOffset(&contents, 0, old_wm, new_wm);
++    }
++  }
++  return contents;
+ }

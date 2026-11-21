@@ -26,3 +26,56 @@
            </message>
          </else>
        </if>
+--- a/chrome/app/theme/chromium/BRANDING
++++ b/chrome/app/theme/chromium/BRANDING
+@@ -1,9 +1,9 @@
+-COMPANY_FULLNAME=The Chromium Authors
+-COMPANY_SHORTNAME=The Chromium Authors
+-PRODUCT_FULLNAME=Chromium
+-PRODUCT_SHORTNAME=Chromium
+-PRODUCT_INSTALLER_FULLNAME=Chromium Installer
+-PRODUCT_INSTALLER_SHORTNAME=Chromium Installer
++COMPANY_FULLNAME=The Vulcanium Authors
++COMPANY_SHORTNAME=The Vulcanium Authors
++PRODUCT_FULLNAME=Vulcanium
++PRODUCT_SHORTNAME=Vulcanium
++PRODUCT_INSTALLER_FULLNAME=Vulcanium Installer
++PRODUCT_INSTALLER_SHORTNAME=Vulcanium Installer
+ COPYRIGHT=Copyright @LASTCHANGE_YEAR@ The Chromium Authors. All rights reserved.
+ MAC_BUNDLE_ID=org.chromium.Chromium
+ MAC_CREATOR_CODE=Cr24
+--- a/chrome/common/channel_info_posix.cc
++++ b/chrome/common/channel_info_posix.cc
+@@ -148,7 +148,7 @@
+   std::optional<std::string> name = env->GetVar("CHROME_DESKTOP");
+   if (name.has_value() && !name.value().empty()) {
+     return name.value();
+   }
+-  return "chromium-browser.desktop";
++  return "vulcanium.desktop";
+ #endif
+ }
+--- a/chrome/browser/shell_integration_linux.cc
++++ b/chrome/browser/shell_integration_linux.cc
+@@ -471,7 +471,7 @@
+ std::string GetIconName() {
+ #if BUILDFLAG(GOOGLE_CHROME_BRANDING)
+   return "google-chrome";
+ #else  // BUILDFLAG(CHROMIUM_BRANDING)
+-  return "chromium-browser";
++  return "vulcanium";
+ #endif
+ }
+--- a/media/audio/pulse/pulse_util.cc
++++ b/media/audio/pulse/pulse_util.cc
+@@ -40,8 +40,8 @@
+ constexpr char kBrowserDisplayName[] = "google-chrome";
+ #define PRODUCT_STRING "Google Chrome"
+ #else
+-constexpr char kBrowserDisplayName[] = "chromium-browser";
+-#define PRODUCT_STRING "Chromium"
++constexpr char kBrowserDisplayName[] = "vulcanium";
++#define PRODUCT_STRING "Vulcanium"
+ #endif
+ 
+ #if defined(DLOPEN_PULSEAUDIO)

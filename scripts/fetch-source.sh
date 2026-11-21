@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${CHROMIUM_VERSION:-157.0.8103.78}"
+VERSION="${CHROMIUM_VERSION:-158.0.8127.36}"
 TARBALL="chromium-${VERSION}-lite.tar.xz"
 URL="https://commondatastorage.googleapis.com/chromium-browser-official/${TARBALL}"
 SRC_DIR="${ROOT_DIR}/src"

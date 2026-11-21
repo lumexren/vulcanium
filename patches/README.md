@@ -1,6 +1,6 @@
 # Vulcanium Patch Architecture
 
-All `.patch` files are applied in the order listed in `patches/series` against Chromium `157.0.8103.78`.
+All `.patch` files are applied in the order listed in `patches/series` against Chromium `158.0.8127.36`.
 
 ## Patch Categories
 

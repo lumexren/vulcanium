@@ -270,7 +270,7 @@
    if (gpu_feature_info->status_values[GPU_FEATURE_TYPE_VULKAN] ==
            kGpuFeatureStatusEnabled ||
        gpu_preferences->gr_context_type == GrContextType::kVulkan) {
-@@ -1287,6 +1289,11 @@
+@@ -1287,5 +1289,10 @@
  #endif  // BUILDFLAG(IS_OZONE)
  
 +  // Initialize Vulkan in-process for native VK_KHR_wayland_surface WSI.

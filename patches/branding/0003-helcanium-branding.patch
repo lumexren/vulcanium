@@ -1,0 +1,81 @@
+--- a/chrome/app/theme/chromium/BRANDING
++++ b/chrome/app/theme/chromium/BRANDING
+@@ -1,9 +1,9 @@
+ COMPANY_FULLNAME=The Helium Authors
+ COMPANY_SHORTNAME=The Helium Authors
+-PRODUCT_FULLNAME=Helium
+-PRODUCT_SHORTNAME=Helium
+-PRODUCT_INSTALLER_FULLNAME=Helium Installer
+-PRODUCT_INSTALLER_SHORTNAME=Helium Installer
++PRODUCT_FULLNAME=Helcanium
++PRODUCT_SHORTNAME=Helcanium
++PRODUCT_INSTALLER_FULLNAME=Helcanium Installer
++PRODUCT_INSTALLER_SHORTNAME=Helcanium Installer
+ COPYRIGHT=Copyright @LASTCHANGE_YEAR@ The Helium Authors. All rights reserved.
+ MAC_BUNDLE_ID=net.imput.helium
+ MAC_CREATOR_CODE=Cr24
+--- a/chrome/common/channel_info_posix.cc
++++ b/chrome/common/channel_info_posix.cc
+@@ -139,10 +139,13 @@
+   // Allow $CHROME_DESKTOP to override the built-in value, so that development
+   // versions can set themselves as the default without interfering with
+   // non-official, packaged versions using the built-in value.
+-  std::optional<std::string> name = env->GetVar("HELIUM_DESKTOP");
+-  if (name.has_value() && !name.value().empty()) {
+-    return name.value();
++  for (const char* var :
++       {"HELCANIUM_DESKTOP", "HELIUM_DESKTOP", "CHROME_DESKTOP"}) {
++    std::optional<std::string> name = env->GetVar(var);
++    if (name.has_value() && !name.value().empty()) {
++      return name.value();
++    }
+   }
+-  return "helium.desktop";
++  return "helcanium.desktop";
+ #endif
+ }
+--- a/chrome/browser/shell_integration_linux.cc
++++ b/chrome/browser/shell_integration_linux.cc
+@@ -578,3 +578,3 @@
+ std::string GetIconName() {
+-  return "helium";
++  return "helcanium";
+ }
+--- a/media/audio/pulse/pulse_util.cc
++++ b/media/audio/pulse/pulse_util.cc
+@@ -37,8 +37,8 @@
+ constexpr char kBrowserDisplayName[] = "google-chrome";
+ #define PRODUCT_STRING "Google Chrome"
+ #else
+-constexpr char kBrowserDisplayName[] = "helium";
+-#define PRODUCT_STRING "Helium"
++constexpr char kBrowserDisplayName[] = "helcanium";
++#define PRODUCT_STRING "Helcanium"
+ #endif
+ 
+ #if defined(DLOPEN_PULSEAUDIO)
+--- a/chrome/installer/linux/common/chromium-browser.info
++++ b/chrome/installer/linux/common/chromium-browser.info
+@@ -6,7 +6,7 @@
+ # chromium-browser packages for various platforms.
+ 
+ # Base name of the package.
+-PACKAGE="helium"
++PACKAGE="helcanium"
+ 
+ # Filename of the main executable (for generating launcher scripts, etc.)
+ PROGNAME=chrome
+@@ -18,7 +18,7 @@
+ ENROLLMENTDIR=/etc/chromium/policies/enrollment
+ 
+ # Display string for desktop menu/icon.
+-MENUNAME="Helium"
++MENUNAME="Helcanium"
+ 
+ # Brief package description.
+ SHORTDESC="The web browser from the Chromium projects"
+@@ -39,3 +39,3 @@
+ HELPURL="https://helium.computer/"
+ 
+-RDN="net.imput.helium"
++RDN="helcanium"

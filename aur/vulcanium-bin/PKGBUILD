@@ -1,7 +1,7 @@
 # Maintainer: lumexren <lumexren@gmail.com>
 
 pkgname=vulcanium-bin
-pkgver=157.0.8103.78
+pkgver=158.0.8127.36
 pkgrel=1
 pkgdesc="Chromium with native Wayland Vulkan rendering and Vulkan Video decoding/encoding (prebuilt)"
 arch=('x86_64')
