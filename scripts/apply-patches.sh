@@ -33,4 +33,7 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
   patch -d "${TARGET_DIR}" -Np1 --forward < "${patch_file}"
 done < "${SERIES_FILE}"
 
+echo "==> Applying Vulcanium internal logo assets..."
+"${ROOT_DIR}/scripts/apply-branding-icons.sh" vulcanium "${TARGET_DIR}" "${ROOT_DIR}"
+
 echo "==> All Vulcanium patches applied."

@@ -273,6 +273,9 @@ prepare() {
     done < "$_vpatch_dir/series"
   fi
 
+  msg2 "Applying Vulcanium internal logo assets"
+  "$startdir/../scripts/apply-branding-icons.sh" vulcanium ./ "$startdir/.."
+
   # The unbundled brotli doesn't provide brotli:headers
   sed -i '/brotli:headers/ d' third_party/pdfium/core/fxcodec/BUILD.gn
 
@@ -418,6 +421,7 @@ build() {
       "rust_sysroot_absolute=\"$_rust_sysroot\""
       'rust_bindgen_root="/usr"'
       "rustc_version=\"$(rustc --version | awk '{ print $2 ;}')\""
+      'added_rust_stdlib_libs=["addr2line","adler2","gimli","miniz_oxide"]'
     )
   fi
 

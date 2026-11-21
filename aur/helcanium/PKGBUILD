@@ -263,6 +263,9 @@ prepare() {
   msg2 "Applying Helcanium branding patch"
   patch -Np1 -i "$_vpatch_dir/branding/0003-helcanium-branding.patch"
 
+  msg2 "Applying Helcanium internal logo assets"
+  "$srcdir/vulcanium/scripts/apply-branding-icons.sh" helcanium ./ "$srcdir/vulcanium"
+
   # Link to system tools required by the build
   mkdir -p third_party/node/linux/node-linux-x64/bin \
            third_party/rust-toolchain/bin \
@@ -390,6 +393,7 @@ build() {
       "rust_sysroot_absolute=\"$_rust_sysroot\""
       'rust_bindgen_root="/usr"'
       "rustc_version=\"$(rustc --version | awk '{ print $2 ;}')\""
+      'added_rust_stdlib_libs=["addr2line","adler2","gimli","miniz_oxide"]'
     )
   fi
 
