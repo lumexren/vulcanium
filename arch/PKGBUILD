@@ -22,6 +22,7 @@ arch=('x86_64')
 url="https://www.chromium.org/Home"
 license=('BSD-3-Clause')
 provides=('chromium')
+conflicts=('chromium' 'ungoogled-chromium' 'vulcanium-bin' 'ungoogled-vulcanium' 'ungoogled-vulcanium-bin')
 depends=(
   'alsa-lib'
   'at-spi2-core'
@@ -567,7 +568,7 @@ EOF
     -e 's/@@PACKAGE/vulcanium/g' \
     -e 's/@@desktop_exec/vulcanium/g' \
     -e 's/@@desktop_icon/vulcanium/g' \
-    -e 's/@@startup_wm_class/vulcanium/g' \
+    -e '/^StartupWMClass=/d' \
     -e 's|@@uri_scheme|x-scheme-handler/vulcanium;|g' \
     -e 's/@@extra_desktop_entries//g' \
     "$pkgdir/usr/share/applications/vulcanium.desktop" \

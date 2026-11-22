@@ -84,8 +84,8 @@ optdepends=('pipewire: WebRTC desktop sharing under Wayland'
             'qt6-base: Qt support'
             'org.freedesktop.secrets: password storage backend on GNOME, KDE and Xfce'
             'upower: Battery Status API support')
-provides=('chromium' 'ungoogled-chromium')
-conflicts=('chromium' 'ungoogled-chromium' 'ungoogled-vulcanium-bin')
+provides=('vulcanium' 'chromium' 'ungoogled-chromium')
+conflicts=('chromium' 'ungoogled-chromium' 'vulcanium' 'vulcanium-bin' 'ungoogled-vulcanium-bin')
 options=('!lto') # Chromium adds its own flags for ThinLTO
 source=(https://commondatastorage.googleapis.com/chromium-browser-official/chromium-$pkgver-lite.tar.xz
         "git+https://chromium.googlesource.com/external/github.com/google/crubit.git#commit=$_crubit_rev"
@@ -251,10 +251,12 @@ prepare() {
     _line="${_line%%#*}"
     _line="${_line//[[:space:]]/}"
     [[ -z "$_line" ]] && continue
-    [[ "$_line" == "branding/0001-vulcanium-branding.patch" ]] && continue
     msg2 "Applying Vulcanium patch: $_line"
     patch -Np1 -i "$_vpatch_dir/$_line"
   done < "$_vpatch_dir/series"
+
+  msg2 "Applying Vulcanium internal logo assets"
+  "$srcdir/vulcanium/scripts/apply-branding-icons.sh" vulcanium ./ "$srcdir/vulcanium"
 
   # Link to system tools required by the build
   mkdir -p third_party/node/linux/node-linux-x64/bin \
@@ -440,14 +442,14 @@ build() {
 package() {
   cd chromium-$pkgver
 
-  install -Dv out/Release/chrome "$pkgdir/usr/lib/chromium/chromium"
-  install -Dv out/Release/chromedriver "$pkgdir/usr/bin/chromedriver"
-  install -Dvm4755 out/Release/chrome_sandbox "$pkgdir/usr/lib/chromium/chrome-sandbox"
+  install -Dv out/Release/chrome "$pkgdir/usr/lib/vulcanium/vulcanium"
+  install -Dv out/Release/chromedriver "$pkgdir/usr/bin/vulcanium-chromedriver"
+  install -Dvm4755 out/Release/chrome_sandbox "$pkgdir/usr/lib/vulcanium/chrome-sandbox"
   install -Dvm644 "$srcdir/vulcanium/config/vulcanium-flags.conf" \
-    "$pkgdir/etc/chromium/default-flags.conf"
+    "$pkgdir/etc/vulcanium/default-flags.conf"
 
   install -dm755 "$pkgdir/usr/bin"
-  cat > "$pkgdir/usr/bin/chromium" << 'EOF'
+  cat > "$pkgdir/usr/bin/vulcanium" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -491,8 +493,8 @@ _read_flags() {
   done < "$f"
 }
 
-_read_flags "/etc/chromium/default-flags.conf"
-_read_flags "${XDG_CONFIG_HOME:-$HOME/.config}/chromium-flags.conf"
+_read_flags "/etc/vulcanium/default-flags.conf"
+_read_flags "${XDG_CONFIG_HOME:-$HOME/.config}/vulcanium-flags.conf"
 for arg in "$@"; do
   _push_flag "$arg"
 done
@@ -506,37 +508,37 @@ if (( ${#_disable_features[@]} > 0 )); then
   _flags+=("--disable-features=$(IFS=,; echo "${_disable_features[*]}")")
 fi
 
-export CHROME_DESKTOP="chromium.desktop"
+export CHROME_DESKTOP="vulcanium.desktop"
 export CHROME_VERSION_EXTRA="vulcanium"
 export CHROME_WRAPPER="$(readlink -f "$0")"
-exec /usr/lib/chromium/chromium "${_flags[@]}"
+exec /usr/lib/vulcanium/vulcanium "${_flags[@]}"
 EOF
-  chmod 755 "$pkgdir/usr/bin/chromium"
+  chmod 755 "$pkgdir/usr/bin/vulcanium"
 
   install -Dvm644 chrome/installer/linux/common/desktop.template \
-    "$pkgdir/usr/share/applications/chromium.desktop"
+    "$pkgdir/usr/share/applications/vulcanium.desktop"
   install -Dvm644 chrome/app/resources/manpage.1.in \
-    "$pkgdir/usr/share/man/man1/chromium.1"
+    "$pkgdir/usr/share/man/man1/vulcanium.1"
   sed -i \
-    -e 's/@@MENUNAME/Chromium/g' \
-    -e 's/@@PACKAGE/chromium/g' \
-    -e 's/@@desktop_exec/chromium/g' \
-    -e 's/@@desktop_icon/chromium/g' \
-    -e 's/@@startup_wm_class/chromium/g' \
-    -e 's|@@uri_scheme|x-scheme-handler/chromium;|g' \
+    -e 's/@@MENUNAME/Vulcanium/g' \
+    -e 's/@@PACKAGE/vulcanium/g' \
+    -e 's/@@desktop_exec/vulcanium/g' \
+    -e 's/@@desktop_icon/vulcanium/g' \
+    -e '/^StartupWMClass=/d' \
+    -e 's|@@uri_scheme|x-scheme-handler/vulcanium;|g' \
     -e 's/@@extra_desktop_entries//g' \
-    "$pkgdir/usr/share/applications/chromium.desktop" \
-    "$pkgdir/usr/share/man/man1/chromium.1"
+    "$pkgdir/usr/share/applications/vulcanium.desktop" \
+    "$pkgdir/usr/share/man/man1/vulcanium.1"
 
-  # Fill in common Chrome/Chromium AppData template with Chromium info
+  # Fill in common Chrome/Chromium AppData template with Vulcanium info
   (
     tmpl_file=chrome/installer/linux/common/appdata.xml.template
     info_file=chrome/installer/linux/common/chromium-browser.info
-    . $info_file; PACKAGE=chromium
+    . $info_file; PACKAGE=vulcanium
     export $(grep -o '^[A-Z_]*' $info_file)
     sed -E -e 's/@@([A-Z_]*)/\${\1}/g' -e '/<update_contact>/d' $tmpl_file | envsubst
   ) \
-  | install -Dvm644 /dev/stdin "$pkgdir/usr/share/metainfo/chromium.appdata.xml"
+  | install -Dvm644 /dev/stdin "$pkgdir/usr/share/metainfo/vulcanium.appdata.xml"
 
   local toplevel_files=(
     chrome_100_percent.pak
@@ -560,21 +562,17 @@ EOF
     toplevel_files+=(icudtl.dat)
   fi
 
-  cp "${toplevel_files[@]/#/out/Release/}" "$pkgdir/usr/lib/chromium/"
-  install -Dvm644 -t "$pkgdir/usr/lib/chromium/locales" out/Release/locales/*.pak
+  cp "${toplevel_files[@]/#/out/Release/}" "$pkgdir/usr/lib/vulcanium/"
+  install -Dvm644 -t "$pkgdir/usr/lib/vulcanium/locales" out/Release/locales/*.pak
 
   for size in 16 24 32 48 64 128 256; do
     install -Dvm644 "$srcdir/vulcanium/assets/icons/vulcanium/${size}.png" \
-      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/chromium.png"
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/vulcanium.png"
   done
   install -Dvm644 "$srcdir/vulcanium/assets/icons/vulcanium.svg" \
-    "$pkgdir/usr/share/icons/hicolor/scalable/apps/chromium.svg"
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/vulcanium.svg"
 
-  # chromium uses the icon name "chromium-browser" internally
-  # https://github.com/chromium/chromium/blob/160.0.8155.1/chrome/browser/shell_integration_linux.cc#L604
-  ln -s chromium.png "$pkgdir/usr/share/icons/hicolor/48x48/apps/chromium-browser.png"
-
-  install -Dvm644 LICENSE "$pkgdir/usr/share/licenses/chromium/LICENSE"
+  install -Dvm644 LICENSE "$pkgdir/usr/share/licenses/vulcanium/LICENSE"
 }
 
 # vim:set ts=2 sw=2 et:

@@ -16,15 +16,16 @@
  MAC_CREATOR_CODE=Cr24
 --- a/chrome/common/channel_info_posix.cc
 +++ b/chrome/common/channel_info_posix.cc
-@@ -139,10 +139,13 @@
+@@ -139,10 +139,14 @@
    // Allow $CHROME_DESKTOP to override the built-in value, so that development
    // versions can set themselves as the default without interfering with
    // non-official, packaged versions using the built-in value.
 -  std::optional<std::string> name = env->GetVar("HELIUM_DESKTOP");
 -  if (name.has_value() && !name.value().empty()) {
 -    return name.value();
-+  for (const char* var :
-+       {"HELCANIUM_DESKTOP", "HELIUM_DESKTOP", "CHROME_DESKTOP"}) {
++  static constexpr base::cstring_view kDesktopEnvVars[] = {
++      "HELCANIUM_DESKTOP", "HELIUM_DESKTOP", "CHROME_DESKTOP"};
++  for (base::cstring_view var : kDesktopEnvVars) {
 +    std::optional<std::string> name = env->GetVar(var);
 +    if (name.has_value() && !name.value().empty()) {
 +      return name.value();

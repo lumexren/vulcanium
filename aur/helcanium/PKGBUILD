@@ -534,7 +534,7 @@ EOF
     -e 's/@@PACKAGE/helcanium/g' \
     -e 's/@@desktop_exec/helcanium/g' \
     -e 's/@@desktop_icon/helcanium/g' \
-    -e 's/@@startup_wm_class/helcanium/g' \
+    -e '/^StartupWMClass=/d' \
     -e 's|@@uri_scheme|x-scheme-handler/helcanium;|g' \
     -e 's/@@extra_desktop_entries//g' \
     "$pkgdir/usr/share/applications/helcanium.desktop" \
