@@ -23,10 +23,12 @@ All `.patch` files are applied in the order listed in `patches/series` against C
   - `VK_IMAGE_LAYOUT_GENERAL` transitions for Ozone Vulkan SharedImages (`0002`).
   - Drops `VkExportMemoryAllocateInfo` when importing DMA-BUFs into `VulkanImage` so NVIDIA out-of-process GPU mode doesn't create shadow allocations / black screens (`0003`).
   - Uses YCbCr-compatible Vulkan image usage flags (`SAMPLED | TRANSFER_SRC | TRANSFER_DST`) when importing multi-planar NV12/P010 DMA-BUFs (`0004`).
+  - Matches `disable_rgb_to_yuv_conversion` (`gpu_driver_bug_list.json` #474) by NVIDIA PCI vendor ID (`0x10de`) instead of OpenGL vendor string so Skia+ANGLE+Vulkan also avoids broken hardware RGB->YUV conversion into 2-plane NV12 pixmaps (`0005`).
 - Target files:
   - `third_party/angle/src/libANGLE/renderer/vulkan/linux/DmaBufImageSiblingVkLinux.cpp`
   - `gpu/command_buffer/service/shared_image/skia_vk_ozone_image_representation.cc`
   - `gpu/vulkan/vulkan_image_linux.cc`, `ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc`
+  - `gpu/config/gpu_driver_bug_list.json`
 
 ### 3. `wayland/`
 - **Ozone/Wayland, `VK_KHR_wayland_surface` Swapchain & PWA Grouping**:
@@ -39,18 +41,20 @@ All `.patch` files are applied in the order listed in `patches/series` against C
 
 ### 4. `video-decode/`
 - **Vulkan Video Decoding (`VkVideo`)**:
-  - `VulkanVideoDecoder` backed by FFmpeg `AV_HWDEVICE_TYPE_VULKAN` (`H.264`, `HEVC/H.265`, `VP9`, `AV1`) with zero-copy NVIDIA output (`vkCmdCopyImage` -> 2-plane DMA-BUF -> `MailboxVideoFrameConverter` `SharedImage`).
-  - Process-wide `SharedVulkanDevice` singleton, concurrent decoder cap (`kMaxConcurrentDecoders = 8`) with software fallback, reusable `VkCommandPool`/`VkCommandBuffer`/`VkFence`, same-config flush fast-path, and bounded DMA-BUF `OutputSlot` pool (`kMaxOutputPoolSize = 12`) with frame-lifetime tracking.
+  - Shared GPU-process `VulkanVideoDevice` singleton (`vulkan_video_device.{h,cc}`) with `vkGetPhysicalDeviceVideoCapabilitiesKHR` probing across `H.264`, `HEVC`, `VP9`, and `AV1` decode/encode queues and extent limits.
+  - `VulkanVideoDecoder` backed by FFmpeg `AV_HWDEVICE_TYPE_VULKAN` (`H.264`, `HEVC/H.265`, `VP9`, `AV1`) gated by probed GPU capabilities, with zero-copy NVIDIA output (`vkCmdCopyImage` -> 2-plane DMA-BUF -> `MailboxVideoFrameConverter` `SharedImage`).
+  - Concurrent decoder cap (`kMaxConcurrentDecoders = 8`) with software fallback, reusable `VkCommandPool`/`VkCommandBuffer`/`VkFence`, same-config flush fast-path, and bounded DMA-BUF `OutputSlot` pool (`kMaxOutputPoolSize = 12`) with frame-lifetime tracking.
 - Target files:
   - `media/base/media_switches.{h,cc}` (`VulkanVideoDecode`)
   - `third_party/ffmpeg/` (Vulkan hwaccel & VP9/AV1/HEVC decoder enablement)
-  - `media/gpu/vulkan/vulkan_video_decoder.{h,cc}`, `media/gpu/BUILD.gn`, `media/mojo/services/gpu_mojo_media_client_linux.cc`
+  - `media/gpu/vulkan/vulkan_video_device.{h,cc}`, `media/gpu/vulkan/vulkan_video_decoder.{h,cc}`, `media/gpu/BUILD.gn`, `media/mojo/services/gpu_mojo_media_client_linux.cc`
 
 ### 5. `video-encode/`
 - **Vulkan Video Encoding (`VkVideo`)**:
-  - `VulkanVideoEncodeAccelerator` backed by FFmpeg `h264_vulkan` and `hevc_vulkan` (`VK_KHR_video_encode_queue`) for `H.264` and `HEVC/H.265` hardware encoding.
+  - `VulkanVideoEncodeAccelerator` backed by FFmpeg `h264_vulkan`, `hevc_vulkan`, and `av1_vulkan` (`VK_KHR_video_encode_queue`, dynamically gated by GPU capability probing via `VulkanVideoDevice`).
+  - Zero-copy GPU-to-GPU DMA-BUF input path (`CopyDmabufToVkFrame`: imports `MappableSharedImage`/`STORAGE_DMABUFS` native pixmap handles with explicit modifier/size validation into `AVVkFrame` via `vkCmdCopyImage`), with `ConvertToMemoryMappedFrame` CPU upload fallback.
 - Target files:
-  - `third_party/ffmpeg/` (`CONFIG_VULKAN_ENCODE`, `h264_vulkan`, `hevc_vulkan`)
+  - `third_party/ffmpeg/` (`CONFIG_VULKAN_ENCODE`, `h264_vulkan`, `hevc_vulkan`, `av1_vulkan`)
   - `media/base/media_switches.{h,cc}` (`VulkanVideoEncode`)
   - `media/gpu/vulkan/vulkan_video_encode_accelerator.{h,cc}`, `media/gpu/BUILD.gn`, `media/gpu/gpu_video_encode_accelerator_factory.cc`
-  - `media/video/video_encode_accelerator_adapter.cc`, `content/renderer/render_thread_impl.cc`, `content/browser/gpu/compositor_util.cc`
+  - `content/renderer/render_thread_impl.cc`, `content/browser/gpu/compositor_util.cc`

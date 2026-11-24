@@ -1,6 +1,6 @@
 --- a/media/base/media_switches.h
 +++ b/media/base/media_switches.h
-@@ -471,6 +471,7 @@
+@@ -478,6 +478,7 @@
  MEDIA_EXPORT BASE_DECLARE_FEATURE(kPulseaudioLoopbackForScreenShare);
  MEDIA_EXPORT BASE_DECLARE_FEATURE(kVaapiIgnoreDriverChecks);
  MEDIA_EXPORT BASE_DECLARE_FEATURE(kVulkanVideoDecode);
@@ -10,7 +10,7 @@
  #if BUILDFLAG(IS_MAC)
 --- a/media/base/media_switches.cc
 +++ b/media/base/media_switches.cc
-@@ -1514,6 +1514,10 @@
+@@ -1542,6 +1542,10 @@
  // AV_HWDEVICE_TYPE_VULKAN) on Linux when Vulkan is active.
  BASE_FEATURE(kVulkanVideoDecode, base::FEATURE_ENABLED_BY_DEFAULT);
  
@@ -23,21 +23,15 @@
  #if BUILDFLAG(IS_MAC)
 --- a/media/gpu/BUILD.gn
 +++ b/media/gpu/BUILD.gn
-@@ -186,8 +186,13 @@
-     sources += [
-       "vulkan/vulkan_video_decoder.cc",
+@@ -185,6 +185,8 @@
        "vulkan/vulkan_video_decoder.h",
+       "vulkan/vulkan_video_device.cc",
+       "vulkan/vulkan_video_device.h",
 +      "vulkan/vulkan_video_encode_accelerator.cc",
 +      "vulkan/vulkan_video_encode_accelerator.h",
-+    ]
-+    deps += [
-+      "//third_party/ffmpeg",
-+      "//third_party/libyuv",
      ]
--    deps += [ "//third_party/ffmpeg" ]
-   }
- 
-   if (use_v4l2_codec) {
+     deps += [
+       "//third_party/ffmpeg",
 --- a/media/gpu/gpu_video_encode_accelerator_factory.cc
 +++ b/media/gpu/gpu_video_encode_accelerator_factory.cc
 @@ -22,6 +22,7 @@
@@ -87,30 +81,9 @@
  #if BUILDFLAG(USE_VAAPI) || BUILDFLAG(USE_V4L2_CODEC)
    // Mirror the decoder's runtime selection so encode and decode share a
    // consistent hardware backend.
---- a/media/video/video_encode_accelerator_adapter.cc
-+++ b/media/video/video_encode_accelerator_adapter.cc
-@@ -612,10 +612,15 @@
-   // We need to keep sending frames with the same storage type.
-   // Other platforms will happily mix GpuMemoryBuffer storage with shared-mem
-   // storage, so we don't care about mismatches on other platforms.
--  if (input_buffer_preference_ == InputBufferKind::Any) {
--    input_buffer_preference_ = InputBufferKind::GpuMemBuf;
-+  if (base::FeatureList::IsEnabled(kVulkanVideoEncode)) {
-+    input_buffer_preference_ = InputBufferKind::CpuMemBuf;
-+    storage_type = VideoEncodeAccelerator::Config::StorageType::kShmem;
-+  } else {
-+    if (input_buffer_preference_ == InputBufferKind::Any) {
-+      input_buffer_preference_ = InputBufferKind::GpuMemBuf;
-+    }
-+    storage_type = VideoEncodeAccelerator::Config::StorageType::kGpuMemoryBuffer;
-   }
--  storage_type = VideoEncodeAccelerator::Config::StorageType::kGpuMemoryBuffer;
- #endif
- 
-   auto vea_config =
 --- a/content/renderer/render_thread_impl.cc
 +++ b/content/renderer/render_thread_impl.cc
-@@ -1004,7 +1004,8 @@
+@@ -1005,7 +1005,8 @@
  
    const bool enable_video_encode_accelerator =
  #if BUILDFLAG(IS_LINUX)
@@ -132,9 +105,9 @@
  #else
            command_line.HasSwitch(switches::kDisableAcceleratedVideoEncode)),
  #endif  // BUILDFLAG(IS_LINUX)
---- a/dev/null
+--- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_encode_accelerator.h
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,115 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -161,11 +134,13 @@
 +
 +struct AVBufferRef;
 +struct AVCodecContext;
++struct AVFrame;
 +
 +namespace media {
 +
 +class MediaLog;
 +class VideoFrame;
++struct VulkanEncodeCopyState;
 +
 +class MEDIA_GPU_EXPORT VulkanVideoEncodeAccelerator
 +    : public VideoEncodeAccelerator {
@@ -219,6 +194,7 @@
 +  };
 +
 +  bool ConfigureEncoder(const Config& config);
++  bool TryEncodeZeroCopyDmabuf(const VideoFrame& frame, AVFrame* hw_frame);
 +  void DrainPackets();
 +  void DrainOutputs();
 +  void ReleaseResources();
@@ -229,11 +205,13 @@
 +  raw_ptr<AVBufferRef> hw_device_ctx_ = nullptr;
 +  raw_ptr<AVBufferRef> hw_frames_ctx_ = nullptr;
 +  std::unique_ptr<AVCodecContext, ScopedPtrAVFreeContext> codec_context_;
++  std::unique_ptr<VulkanEncodeCopyState> copy_state_;
 +
 +  gfx::Size input_visible_size_;
 +  size_t output_buffer_size_ = 0;
 +  bool initialized_ = false;
 +  bool has_error_ = false;
++  bool logged_zero_copy_ = false;
 +
 +  base::circular_deque<OutputBuffer> available_bitstream_buffers_;
 +  base::circular_deque<PendingOutput> pending_outputs_;
@@ -245,31 +223,43 @@
 +}  // namespace media
 +
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_ENCODE_ACCELERATOR_H_
---- a/dev/null
+--- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_encode_accelerator.cc
-@@ -0,0 +1,522 @@
+@@ -0,0 +1,1271 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "media/gpu/vulkan/vulkan_video_encode_accelerator.h"
 +
++#include <sys/stat.h>
++#include <unistd.h>
++
 +#include <algorithm>
 +#include <cstring>
 +#include <utility>
++#include <vector>
 +
++#include "base/compiler_specific.h"
++#include "base/files/scoped_file.h"
 +#include "base/logging.h"
 +#include "base/numerics/safe_conversions.h"
++#include "base/posix/eintr_wrapper.h"
 +#include "media/base/media_log.h"
 +#include "media/base/video_frame.h"
++#include "media/base/video_util.h"
 +#include "media/ffmpeg/ffmpeg_common.h"
++#include "media/gpu/vulkan/vulkan_video_device.h"
 +#include "media/video/video_encoder_info.h"
 +#include "third_party/libyuv/include/libyuv/convert.h"
 +#include "third_party/libyuv/include/libyuv/planar_functions.h"
++#include "ui/gfx/gpu_memory_buffer_handle.h"
++#include "ui/gfx/native_pixmap_handle.h"
 +
 +extern "C" {
 +#include <libavcodec/avcodec.h>
 +#include <libavutil/hwcontext.h>
++#include <libavutil/hwcontext_vulkan.h>
 +#include <libavutil/opt.h>
 +#include <libavutil/pixfmt.h>
 +}
@@ -278,7 +268,6 @@
 +
 +namespace {
 +
-+constexpr uint32_t kDefaultFramerate = 30;
 +constexpr uint32_t kDefaultGopLength = 60;
 +constexpr size_t kMinOutputBufferSize = 1024 * 1024;
 +
@@ -288,6 +277,9 @@
 +  }
 +  if (profile >= HEVCPROFILE_MIN && profile <= HEVCPROFILE_MAX) {
 +    return "hevc_vulkan";
++  }
++  if (profile >= AV1PROFILE_MIN && profile <= AV1PROFILE_MAX) {
++    return "av1_vulkan";
 +  }
 +  return nullptr;
 +}
@@ -302,30 +294,638 @@
 +      return AV_PROFILE_H264_HIGH;
 +    case HEVCPROFILE_MAIN:
 +      return AV_PROFILE_HEVC_MAIN;
++    case AV1PROFILE_PROFILE_MAIN:
++      return AV_PROFILE_AV1_MAIN;
 +    default:
 +      return AV_PROFILE_UNKNOWN;
 +  }
 +}
 +
-+bool CanCreateVulkanEncoderDevice() {
-+  static const bool supported = []() {
-+    if (!avcodec_find_encoder_by_name("h264_vulkan") &&
-+        !avcodec_find_encoder_by_name("hevc_vulkan")) {
-+      return false;
-+    }
-+    AVBufferRef* dev = nullptr;
-+    int err = av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_VULKAN, nullptr,
-+                                     nullptr, 0);
-+    if (err < 0 || !dev) {
-+      return false;
-+    }
-+    av_buffer_unref(&dev);
++bool SameInodeFd(int fd0, int fd1) {
++  if (fd0 < 0 || fd1 < 0) {
 +    return true;
-+  }();
-+  return supported;
++  }
++  if (fd0 == fd1) {
++    return true;
++  }
++  struct stat st0 {};
++  struct stat st1 {};
++  if (fstat(fd0, &st0) != 0 || fstat(fd1, &st1) != 0) {
++    return false;
++  }
++  return st0.st_dev == st1.st_dev && st0.st_ino == st1.st_ino;
++}
++
++uint32_t FindMemoryType(const VkPhysicalDeviceMemoryProperties& mem_props,
++                        uint32_t type_bits) {
++  for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
++    if ((type_bits & (1u << i)) &&
++        (mem_props.memoryTypes[i].propertyFlags &
++         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
++      return i;
++    }
++  }
++  for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
++    if (type_bits & (1u << i)) {
++      return i;
++    }
++  }
++  return UINT32_MAX;
++}
++
++int64_t GetDmabufSize(int fd) {
++  if (fd < 0) {
++    return -1;
++  }
++  struct stat st {};
++  if (fstat(fd, &st) == 0 && st.st_size > 0) {
++    return static_cast<int64_t>(st.st_size);
++  }
++  const off_t cur = lseek(fd, 0, SEEK_CUR);
++  const off_t end = lseek(fd, 0, SEEK_END);
++  if (cur >= 0) {
++    lseek(fd, cur, SEEK_SET);
++  }
++  return end > 0 ? static_cast<int64_t>(end) : -1;
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++void CleanupDmabufImport(VkDevice dev,
++                         const VkCopyProcs& p,
++                         VkImage* src_img,
++                         VkDeviceMemory src_mem[2]) {
++  if (*src_img != VK_NULL_HANDLE) {
++    p.vkDestroyImage(dev, *src_img, nullptr);
++    *src_img = VK_NULL_HANDLE;
++  }
++  for (int i = 0; i < 2; ++i) {
++    if (src_mem[i] != VK_NULL_HANDLE) {
++      p.vkFreeMemory(dev, src_mem[i], nullptr);
++      src_mem[i] = VK_NULL_HANDLE;
++    }
++  }
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++bool CopyDmabufToVkFrame(AVVulkanDeviceContext* vk_dev,
++                         const VkCopyInfo& info,
++                         VkCommandPool cmd_pool,
++                         VkCommandBuffer cb,
++                         VkFence fence,
++                         const gfx::NativePixmapHandle& handle,
++                         const gfx::Size& coded_size,
++                         const gfx::Rect& visible_rect,
++                         int enc_w,
++                         int enc_h,
++                         AVFrame* dst_hw_frame) {
++  if (!vk_dev || !vk_dev->act_dev || !info.procs_ready ||
++      !info.procs.vkGetMemoryFdPropertiesKHR || cmd_pool == VK_NULL_HANDLE ||
++      cb == VK_NULL_HANDLE || fence == VK_NULL_HANDLE ||
++      handle.planes.size() != 2 || !handle.planes[0].fd.is_valid() ||
++      coded_size.IsEmpty() || enc_w <= 0 || enc_h <= 0 || !dst_hw_frame ||
++      !dst_hw_frame->hw_frames_ctx) {
++    return false;
++  }
++
++  auto* frames_ctx =
++      reinterpret_cast<AVHWFramesContext*>(dst_hw_frame->hw_frames_ctx->data);
++  if (!frames_ctx || !frames_ctx->device_ctx) {
++    return false;
++  }
++  auto* dst_vk = reinterpret_cast<AVVkFrame*>(dst_hw_frame->data[0]);
++  if (!dst_vk || dst_vk->img[0] == VK_NULL_HANDLE) {
++    return false;
++  }
++
++  if (handle.modifier == gfx::NativePixmapHandle::kNoModifier) {
++    static bool logged_no_mod = false;
++    if (!logged_no_mod) {
++      logged_no_mod = true;
++      VLOG(1) << "CopyDmabufToVkFrame: rejecting kNoModifier";
++    }
++    return false;
++  }
++
++  const auto& p = info.procs;
++  const bool has_plane1_fd = handle.planes[1].fd.is_valid();
++  const bool same_dmabuf =
++      !has_plane1_fd ||
++      SameInodeFd(handle.planes[0].fd.get(), handle.planes[1].fd.get());
++  const bool disjoint = !same_dmabuf;
++  if (disjoint &&
++      (!p.vkGetImageMemoryRequirements2 || !p.vkBindImageMemory2)) {
++    return false;
++  }
++
++  const VkImageCreateFlags img_flags =
++      disjoint ? VK_IMAGE_CREATE_DISJOINT_BIT : 0u;
++  if (p.vkGetPhysicalDeviceImageFormatProperties2 && vk_dev->phys_dev) {
++    VkPhysicalDeviceImageDrmFormatModifierInfoEXT mod_info{
++        .sType =
++            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
++        .drmFormatModifier = handle.modifier,
++        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++    };
++    VkPhysicalDeviceExternalImageFormatInfo ext_fmt_info{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
++        .pNext = &mod_info,
++        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++    };
++    VkPhysicalDeviceImageFormatInfo2 fmt_info{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
++        .pNext = &ext_fmt_info,
++        .format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
++        .type = VK_IMAGE_TYPE_2D,
++        .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++        .flags = img_flags,
++    };
++    VkExternalImageFormatProperties ext_props{
++        .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
++    };
++    VkImageFormatProperties2 fmt_props{
++        .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
++        .pNext = &ext_props,
++    };
++    VkResult fmt_res = p.vkGetPhysicalDeviceImageFormatProperties2(
++        vk_dev->phys_dev, &fmt_info, &fmt_props);
++    if (fmt_res != VK_SUCCESS ||
++        (ext_props.externalMemoryProperties.externalMemoryFeatures &
++         VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) == 0) {
++      static bool logged_fmt_reject = false;
++      if (!logged_fmt_reject) {
++        logged_fmt_reject = true;
++        VLOG(1) << "CopyDmabufToVkFrame: format/modifier rejected mod=0x"
++                << std::hex << handle.modifier << std::dec
++                << " res=" << fmt_res << " features=0x" << std::hex
++                << ext_props.externalMemoryProperties.externalMemoryFeatures
++                << std::dec << " disjoint=" << disjoint;
++      }
++      return false;
++    }
++  }
++
++  VkSubresourceLayout plane_layouts[2] = {
++      {.offset = handle.planes[0].offset,
++       .size = 0,
++       .rowPitch = handle.planes[0].stride,
++       .arrayPitch = 0,
++       .depthPitch = 0},
++      {.offset = handle.planes[1].offset,
++       .size = 0,
++       .rowPitch = handle.planes[1].stride,
++       .arrayPitch = 0,
++       .depthPitch = 0},
++  };
++  VkImageDrmFormatModifierExplicitCreateInfoEXT mod_ci{
++      .sType =
++          VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++      .drmFormatModifier = handle.modifier,
++      .drmFormatModifierPlaneCount = 2,
++      .pPlaneLayouts = plane_layouts,
++  };
++  VkExternalMemoryImageCreateInfo ext_ci{
++      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
++      .pNext = &mod_ci,
++      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++  };
++  VkImageCreateInfo ici{
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .pNext = &ext_ci,
++      .flags = img_flags,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
++      .extent = {static_cast<uint32_t>(coded_size.width()),
++                 static_cast<uint32_t>(coded_size.height()), 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++      .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++  };
++
++  VkImage src_img = VK_NULL_HANDLE;
++  VkDeviceMemory src_mem[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++
++  if (p.vkCreateImage(vk_dev->act_dev, &ici, nullptr, &src_img) != VK_SUCCESS) {
++    CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++    return false;
++  }
++
++  int64_t logged_dmabuf_size = -1;
++  uint64_t logged_req_size = 0;
++
++  if (same_dmabuf) {
++    VkMemoryRequirements req{};
++    bool use_dedicated = true;
++    if (p.vkGetImageMemoryRequirements2) {
++      VkImageMemoryRequirementsInfo2 req_info{
++          .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
++          .image = src_img,
++      };
++      VkMemoryDedicatedRequirements ded_req{
++          .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
++      };
++      VkMemoryRequirements2 req2{
++          .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
++          .pNext = &ded_req,
++      };
++      p.vkGetImageMemoryRequirements2(vk_dev->act_dev, &req_info, &req2);
++      req = req2.memoryRequirements;
++      use_dedicated =
++          (ded_req.prefersDedicatedAllocation ||
++           ded_req.requiresDedicatedAllocation);
++    } else {
++      p.vkGetImageMemoryRequirements(vk_dev->act_dev, src_img, &req);
++    }
++
++    const int64_t dmabuf_size = GetDmabufSize(handle.planes[0].fd.get());
++    logged_dmabuf_size = dmabuf_size;
++    logged_req_size = req.size;
++    if (dmabuf_size <= 0 || static_cast<uint64_t>(dmabuf_size) < req.size ||
++        plane_layouts[1].offset >= static_cast<uint64_t>(dmabuf_size)) {
++      static bool logged_size_reject = false;
++      if (!logged_size_reject) {
++        logged_size_reject = true;
++        VLOG(1) << "CopyDmabufToVkFrame: dmabuf size mismatch dmabuf_size="
++                << dmabuf_size << " req.size=" << req.size
++                << " p0_off=" << plane_layouts[0].offset
++                << " p1_off=" << plane_layouts[1].offset
++                << " mod=0x" << std::hex << handle.modifier << std::dec;
++      }
++      CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++      return false;
++    }
++
++    VkMemoryFdPropertiesKHR fd_props{
++        .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
++    };
++    if (p.vkGetMemoryFdPropertiesKHR(
++            vk_dev->act_dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++            handle.planes[0].fd.get(), &fd_props) != VK_SUCCESS) {
++      CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++      return false;
++    }
++
++    uint32_t mem_idx =
++        FindMemoryType(info.mem_props, req.memoryTypeBits & fd_props.memoryTypeBits);
++    if (mem_idx == UINT32_MAX) {
++      CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++      return false;
++    }
++
++    int import_fd = HANDLE_EINTR(dup(handle.planes[0].fd.get()));
++    if (import_fd < 0) {
++      CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++      return false;
++    }
++
++    VkImportMemoryFdInfoKHR imp{
++        .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
++        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++        .fd = import_fd,
++    };
++    VkMemoryDedicatedAllocateInfo ded{
++        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
++        .pNext = &imp,
++        .image = src_img,
++    };
++    VkMemoryAllocateInfo mai{
++        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++        .pNext = use_dedicated ? static_cast<const void*>(&ded)
++                               : static_cast<const void*>(&imp),
++        .allocationSize = req.size,
++        .memoryTypeIndex = mem_idx,
++    };
++    if (p.vkAllocateMemory(vk_dev->act_dev, &mai, nullptr, &src_mem[0]) !=
++        VK_SUCCESS) {
++      IGNORE_EINTR(close(import_fd));
++      CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++      return false;
++    }
++
++    if (p.vkBindImageMemory(vk_dev->act_dev, src_img, src_mem[0], 0) !=
++        VK_SUCCESS) {
++      CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++      return false;
++    }
++  } else {
++    static constexpr VkImageAspectFlagBits plane_aspects[2] = {
++        VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
++        VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT,
++    };
++    for (int i = 0; i < 2; ++i) {
++      VkImagePlaneMemoryRequirementsInfo plane_req{
++          .sType = VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO,
++          .planeAspect = plane_aspects[i],
++      };
++      VkImageMemoryRequirementsInfo2 req_info{
++          .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
++          .pNext = &plane_req,
++          .image = src_img,
++      };
++      VkMemoryRequirements2 req2{
++          .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
++      };
++      p.vkGetImageMemoryRequirements2(vk_dev->act_dev, &req_info, &req2);
++
++      const int64_t dmabuf_size = GetDmabufSize(handle.planes[i].fd.get());
++      if (i == 0) {
++        logged_dmabuf_size = dmabuf_size;
++        logged_req_size = req2.memoryRequirements.size;
++      }
++      if (dmabuf_size <= 0 ||
++          static_cast<uint64_t>(dmabuf_size) < req2.memoryRequirements.size) {
++        static bool logged_disjoint_size = false;
++        if (!logged_disjoint_size) {
++          logged_disjoint_size = true;
++          VLOG(1) << "CopyDmabufToVkFrame: disjoint dmabuf size mismatch plane="
++                  << i << " dmabuf_size=" << dmabuf_size
++                  << " req.size=" << req2.memoryRequirements.size
++                  << " mod=0x" << std::hex << handle.modifier << std::dec;
++        }
++        CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++        return false;
++      }
++
++      VkMemoryFdPropertiesKHR fd_props{
++          .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
++      };
++      if (p.vkGetMemoryFdPropertiesKHR(
++              vk_dev->act_dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++              handle.planes[i].fd.get(), &fd_props) != VK_SUCCESS) {
++        CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++        return false;
++      }
++
++      uint32_t mem_idx = FindMemoryType(
++          info.mem_props,
++          req2.memoryRequirements.memoryTypeBits & fd_props.memoryTypeBits);
++      if (mem_idx == UINT32_MAX) {
++        CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++        return false;
++      }
++
++      int import_fd = HANDLE_EINTR(dup(handle.planes[i].fd.get()));
++      if (import_fd < 0) {
++        CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++        return false;
++      }
++
++      VkImportMemoryFdInfoKHR imp{
++          .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
++          .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++          .fd = import_fd,
++      };
++      VkMemoryAllocateInfo mai{
++          .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++          .pNext = &imp,
++          .allocationSize = req2.memoryRequirements.size,
++          .memoryTypeIndex = mem_idx,
++      };
++      if (p.vkAllocateMemory(vk_dev->act_dev, &mai, nullptr, &src_mem[i]) !=
++          VK_SUCCESS) {
++        IGNORE_EINTR(close(import_fd));
++        CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++        return false;
++      }
++    }
++
++    VkBindImagePlaneMemoryInfo bind_planes[2] = {
++        {.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO,
++         .planeAspect = plane_aspects[0]},
++        {.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO,
++         .planeAspect = plane_aspects[1]},
++    };
++    VkBindImageMemoryInfo bind_infos[2] = {
++        {.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
++         .pNext = &bind_planes[0],
++         .image = src_img,
++         .memory = src_mem[0],
++         .memoryOffset = 0},
++        {.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
++         .pNext = &bind_planes[1],
++         .image = src_img,
++         .memory = src_mem[1],
++         .memoryOffset = 0},
++    };
++    if (p.vkBindImageMemory2(vk_dev->act_dev, 2, bind_infos) != VK_SUCCESS) {
++      CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++      return false;
++    }
++  }
++
++  if (p.vkResetCommandPool(vk_dev->act_dev, cmd_pool, 0) != VK_SUCCESS ||
++      p.vkResetFences(vk_dev->act_dev, 1, &fence) != VK_SUCCESS) {
++    CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++    return false;
++  }
++
++  VkCommandBufferBeginInfo cbbi{
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++  };
++  if (p.vkBeginCommandBuffer(cb, &cbbi) != VK_SUCCESS) {
++    CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++    return false;
++  }
++
++  const bool two_dst_imgs = (dst_vk->img[1] != VK_NULL_HANDLE);
++  const VkImageAspectFlags src_aspect_barrier =
++      disjoint ? (VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT)
++               : VK_IMAGE_ASPECT_COLOR_BIT;
++  const VkImageAspectFlags dst_aspect0 = VK_IMAGE_ASPECT_COLOR_BIT;
++  VkImageMemoryBarrier pre[3]{
++      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++       .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++       .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++       .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
++       .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++       .image = src_img,
++       .subresourceRange = {src_aspect_barrier, 0, 1, 0, 1}},
++      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++       .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT,
++       .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++       .oldLayout = dst_vk->layout[0],
++       .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++       .image = dst_vk->img[0],
++       .subresourceRange = {dst_aspect0, 0, 1, 0, 1}},
++      {},
++  };
++  uint32_t pre_count = 2;
++  if (two_dst_imgs) {
++    pre[2] = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++              .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT,
++              .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++              .oldLayout = dst_vk->layout[1],
++              .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++              .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++              .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++              .image = dst_vk->img[1],
++              .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
++    pre_count = 3;
++  }
++  p.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
++                         nullptr, pre_count, pre);
++
++  const int vis_x = std::max(0, visible_rect.x()) & ~1;
++  const int vis_y = std::max(0, visible_rect.y()) & ~1;
++  const int vis_w =
++      visible_rect.IsEmpty() ? coded_size.width() : visible_rect.width();
++  const int vis_h =
++      visible_rect.IsEmpty() ? coded_size.height() : visible_rect.height();
++  const uint32_t copy_w = static_cast<uint32_t>(
++      std::min({vis_w, enc_w, std::max(0, coded_size.width() - vis_x)}));
++  const uint32_t copy_h = static_cast<uint32_t>(
++      std::min({vis_h, enc_h, std::max(0, coded_size.height() - vis_y)}));
++  if (copy_w == 0 || copy_h == 0) {
++    CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++    return false;
++  }
++
++  const uint32_t plane_widths[2] = {copy_w, (copy_w + 1) / 2};
++  const uint32_t plane_heights[2] = {copy_h, (copy_h + 1) / 2};
++  const int32_t src_off_x[2] = {vis_x, vis_x / 2};
++  const int32_t src_off_y[2] = {vis_y, vis_y / 2};
++
++  for (int i = 0; i < 2; ++i) {
++    VkImage dst_img = two_dst_imgs ? dst_vk->img[i] : dst_vk->img[0];
++    VkImageAspectFlags src_plane_aspect =
++        (i == 0) ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_PLANE_1_BIT;
++    VkImageAspectFlags dst_plane_aspect =
++        two_dst_imgs
++            ? VK_IMAGE_ASPECT_COLOR_BIT
++            : (i == 0 ? VK_IMAGE_ASPECT_PLANE_0_BIT
++                      : VK_IMAGE_ASPECT_PLANE_1_BIT);
++    VkImageCopy region{
++        .srcSubresource = {src_plane_aspect, 0, 0, 1},
++        .srcOffset = {src_off_x[i], src_off_y[i], 0},
++        .dstSubresource = {dst_plane_aspect, 0, 0, 1},
++        .dstOffset = {0, 0, 0},
++        .extent = {plane_widths[i], plane_heights[i], 1},
++    };
++    p.vkCmdCopyImage(cb, src_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                     dst_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++  }
++
++  if (p.vkEndCommandBuffer(cb) != VK_SUCCESS) {
++    CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++    return false;
++  }
++
++  const uint32_t qf = info.copy_queue_family;
++  VkQueue queue = VK_NULL_HANDLE;
++  p.vkGetDeviceQueue(vk_dev->act_dev, qf, 0, &queue);
++  VkSemaphore sems[2] = {};
++  uint64_t wait_vals[2] = {};
++  uint64_t sig_vals[2] = {};
++  VkPipelineStageFlags wait_stages[2] = {
++      VK_PIPELINE_STAGE_TRANSFER_BIT,
++      VK_PIPELINE_STAGE_TRANSFER_BIT,
++  };
++  uint32_t sem_count = 0;
++  if (dst_vk->sem[0] != VK_NULL_HANDLE) {
++    sems[sem_count] = dst_vk->sem[0];
++    wait_vals[sem_count] = dst_vk->sem_value[0];
++    sig_vals[sem_count] = dst_vk->sem_value[0] + 1;
++    ++sem_count;
++  }
++  if (two_dst_imgs && dst_vk->sem[1] != VK_NULL_HANDLE &&
++      dst_vk->sem[1] != dst_vk->sem[0]) {
++    sems[sem_count] = dst_vk->sem[1];
++    wait_vals[sem_count] = dst_vk->sem_value[1];
++    sig_vals[sem_count] = dst_vk->sem_value[1] + 1;
++    ++sem_count;
++  }
++  VkTimelineSemaphoreSubmitInfo tl_info{
++      .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
++      .waitSemaphoreValueCount = sem_count,
++      .pWaitSemaphoreValues = wait_vals,
++      .signalSemaphoreValueCount = sem_count,
++      .pSignalSemaphoreValues = sig_vals,
++  };
++  VkSubmitInfo si{
++      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++      .pNext = sem_count > 0 ? &tl_info : nullptr,
++      .waitSemaphoreCount = sem_count,
++      .pWaitSemaphores = sem_count > 0 ? sems : nullptr,
++      .pWaitDstStageMask = sem_count > 0 ? wait_stages : nullptr,
++      .commandBufferCount = 1,
++      .pCommandBuffers = &cb,
++      .signalSemaphoreCount = sem_count,
++      .pSignalSemaphores = sem_count > 0 ? sems : nullptr,
++  };
++  if (vk_dev->lock_queue) {
++    vk_dev->lock_queue(frames_ctx->device_ctx, qf, 0);
++  }
++  VkResult sr = p.vkQueueSubmit(queue, 1, &si, fence);
++  if (vk_dev->unlock_queue) {
++    vk_dev->unlock_queue(frames_ctx->device_ctx, qf, 0);
++  }
++
++  const VkImageLayout orig_dst_layout = dst_vk->layout[0];
++  const uint32_t orig_dst_qf = dst_vk->queue_family[0];
++  VkResult wr = VK_ERROR_UNKNOWN;
++  if (sr == VK_SUCCESS) {
++    dst_vk->layout[0] = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++    dst_vk->access[0] = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++    if (dst_vk->queue_family[0] != VK_QUEUE_FAMILY_IGNORED) {
++      dst_vk->queue_family[0] = qf;
++    }
++    if (two_dst_imgs) {
++      dst_vk->layout[1] = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++      dst_vk->access[1] = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++      if (dst_vk->queue_family[1] != VK_QUEUE_FAMILY_IGNORED) {
++        dst_vk->queue_family[1] = qf;
++      }
++    }
++    if (dst_vk->sem[0] != VK_NULL_HANDLE) {
++      dst_vk->sem_value[0] += 1;
++    }
++    if (two_dst_imgs && dst_vk->sem[1] != VK_NULL_HANDLE &&
++        dst_vk->sem[1] != dst_vk->sem[0]) {
++      dst_vk->sem_value[1] += 1;
++    }
++    wr = p.vkWaitForFences(vk_dev->act_dev, 1, &fence, VK_TRUE, 1000000000ULL);
++  }
++
++  static bool logged_diag = false;
++  if (!logged_diag) {
++    logged_diag = true;
++    VLOG(1) << "CopyDmabufToVkFrame diag: coded=" << coded_size.ToString()
++            << " vis=" << visible_rect.ToString() << " enc=" << enc_w << "x"
++            << enc_h << " mod=0x" << std::hex << handle.modifier << std::dec
++            << " same_dmabuf=" << same_dmabuf
++            << " p0=(" << handle.planes[0].stride << ","
++            << handle.planes[0].offset << "," << handle.planes[0].size << ")"
++            << " p1=(" << handle.planes[1].stride << ","
++            << handle.planes[1].offset << "," << handle.planes[1].size << ")"
++            << " dmabuf_size=" << logged_dmabuf_size
++            << " req_size=" << logged_req_size
++            << " two_dst=" << two_dst_imgs
++            << " orig_dst_layout=" << orig_dst_layout
++            << " orig_dst_qf=" << orig_dst_qf
++            << " sr=" << sr << " wr=" << wr;
++  }
++
++  CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++  return sr == VK_SUCCESS && wr == VK_SUCCESS;
 +}
 +
 +}  // namespace
++
++struct VulkanEncodeCopyState {
++  VkCommandPool cmd_pool = VK_NULL_HANDLE;
++  VkCommandBuffer cmd_buf = VK_NULL_HANDLE;
++  VkFence fence = VK_NULL_HANDLE;
++};
 +
 +VulkanVideoEncodeAccelerator::OutputBuffer::OutputBuffer(
 +    int32_t id,
@@ -360,16 +960,17 @@
 +VulkanVideoEncodeAccelerator::GetSupportedProfiles() {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +  SupportedProfiles profiles;
-+  if (!CanCreateVulkanEncoderDevice()) {
++  const auto& caps = VulkanVideoDevice::GetInstance()->GetCapabilities();
++  if (!caps.has_encode_queue) {
 +    return profiles;
 +  }
 +
 +  const auto add_profile = [&](VideoCodecProfile codec_profile,
-+                               const gfx::Size& max_res) {
++                               const CodecCapability& cap) {
 +    SupportedProfile p;
 +    p.profile = codec_profile;
-+    p.min_resolution = gfx::Size(64, 64);
-+    p.max_resolution = max_res;
++    p.min_resolution = cap.min_size;
++    p.max_resolution = cap.max_size;
 +    p.max_framerate_numerator = 60;
 +    p.max_framerate_denominator = 1;
 +    p.rate_control_modes =
@@ -379,13 +980,16 @@
 +    profiles.push_back(p);
 +  };
 +
-+  if (avcodec_find_encoder_by_name("h264_vulkan")) {
-+    add_profile(H264PROFILE_BASELINE, gfx::Size(4096, 4096));
-+    add_profile(H264PROFILE_MAIN, gfx::Size(4096, 4096));
-+    add_profile(H264PROFILE_HIGH, gfx::Size(4096, 4096));
++  if (caps.encode_h264.supported && avcodec_find_encoder_by_name("h264_vulkan")) {
++    add_profile(H264PROFILE_BASELINE, caps.encode_h264);
++    add_profile(H264PROFILE_MAIN, caps.encode_h264);
++    add_profile(H264PROFILE_HIGH, caps.encode_h264);
 +  }
-+  if (avcodec_find_encoder_by_name("hevc_vulkan")) {
-+    add_profile(HEVCPROFILE_MAIN, gfx::Size(8192, 8192));
++  if (caps.encode_hevc.supported && avcodec_find_encoder_by_name("hevc_vulkan")) {
++    add_profile(HEVCPROFILE_MAIN, caps.encode_hevc);
++  }
++  if (caps.encode_av1.supported && avcodec_find_encoder_by_name("av1_vulkan")) {
++    add_profile(AV1PROFILE_PROFILE_MAIN, caps.encode_av1);
 +  }
 +
 +  return profiles;
@@ -424,11 +1028,12 @@
 +      std::max<size_t>(kMinOutputBufferSize, input_visible_size_.GetArea() * 2);
 +  initialized_ = true;
 +  has_error_ = false;
++  logged_zero_copy_ = false;
 +
 +  VideoEncoderInfo info;
 +  info.implementation_name = "VulkanVideoEncodeAccelerator";
 +  info.is_hardware_accelerated = true;
-+  info.supports_native_handle = false;
++  info.supports_native_handle = true;
 +  info.supports_frame_size_change = false;
 +  client_->NotifyEncoderInfoChange(info);
 +
@@ -448,15 +1053,11 @@
 +    return false;
 +  }
 +
-+  AVBufferRef* dev = nullptr;
-+  int err = av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_VULKAN, nullptr,
-+                                   nullptr, 0);
-+  if (err < 0 || !dev) {
-+    LOG(ERROR) << "VulkanVideoEncodeAccelerator: av_hwdevice_ctx_create failed: "
-+               << AVErrorToString(err);
++  hw_device_ctx_ = VulkanVideoDevice::GetInstance()->AcquireDevice();
++  if (!hw_device_ctx_) {
++    LOG(ERROR) << "VulkanVideoEncodeAccelerator: failed to acquire Vulkan device";
 +    return false;
 +  }
-+  hw_device_ctx_ = dev;
 +
 +  AVBufferRef* frames_ref = av_hwframe_ctx_alloc(hw_device_ctx_);
 +  if (!frames_ref) {
@@ -469,7 +1070,7 @@
 +  frames_ctx->height = std::max(64, config.input_visible_size.height());
 +  frames_ctx->initial_pool_size = 4;
 +
-+  err = av_hwframe_ctx_init(frames_ref);
++  int err = av_hwframe_ctx_init(frames_ref);
 +  if (err < 0) {
 +    LOG(ERROR) << "VulkanVideoEncodeAccelerator: av_hwframe_ctx_init failed: "
 +               << AVErrorToString(err);
@@ -483,7 +1084,7 @@
 +    return false;
 +  }
 +
-+  uint32_t fps = config.framerate > 0 ? config.framerate : kDefaultFramerate;
++  uint32_t fps = config.framerate > 0 ? config.framerate : 30u;
 +  codec_context_->width = config.input_visible_size.width();
 +  codec_context_->height = config.input_visible_size.height();
 +  codec_context_->time_base = AVRational{1, 1000000};
@@ -525,6 +1126,75 @@
 +  return true;
 +}
 +
++bool VulkanVideoEncodeAccelerator::TryEncodeZeroCopyDmabuf(
++    const VideoFrame& frame,
++    AVFrame* hw_frame) {
++  if (frame.format() != PIXEL_FORMAT_NV12 || !hw_device_ctx_ || !hw_frame) {
++    return false;
++  }
++
++  const auto* copy_info = VulkanVideoDevice::GetInstance()->GetCopyInfo();
++  if (!copy_info || !copy_info->procs_ready ||
++      !copy_info->procs.vkGetMemoryFdPropertiesKHR) {
++    return false;
++  }
++
++  auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ctx_->data);
++  auto* vk_dev =
++      dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx) : nullptr;
++  if (!vk_dev || !vk_dev->act_dev) {
++    return false;
++  }
++
++  gfx::NativePixmapHandle pixmap_handle;
++  bool have_handle = false;
++
++  if (frame.HasMappableSharedImage()) {
++    gfx::GpuMemoryBufferHandle gmb_handle = frame.GetGpuMemoryBufferHandle();
++    if (gmb_handle.type == gfx::GpuMemoryBufferType::NATIVE_PIXMAP) {
++      pixmap_handle = std::move(gmb_handle).native_pixmap_handle();
++      have_handle = pixmap_handle.planes.size() >= 2;
++    }
++  } else if (frame.storage_type() == VideoFrame::STORAGE_DMABUFS &&
++             frame.layout().num_planes() >= 2 && frame.NumDmabufFds() >= 1) {
++    const size_t num_fds = frame.NumDmabufFds();
++    const auto& layout_planes = frame.layout().planes();
++    for (size_t i = 0; i < 2; ++i) {
++      const size_t fd_idx = (i < num_fds) ? i : 0;
++      base::ScopedFD dup_fd(HANDLE_EINTR(dup(frame.GetDmabufFd(fd_idx))));
++      if (!dup_fd.is_valid()) {
++        return false;
++      }
++      pixmap_handle.planes.emplace_back(layout_planes[i].stride,
++                                        layout_planes[i].offset,
++                                        layout_planes[i].size,
++                                        std::move(dup_fd));
++    }
++    pixmap_handle.modifier = frame.layout().modifier();
++    have_handle = true;
++  }
++
++  if (!have_handle) {
++    return false;
++  }
++
++  if (!copy_state_) {
++    copy_state_ = std::make_unique<VulkanEncodeCopyState>();
++  }
++  if (copy_state_->cmd_pool == VK_NULL_HANDLE) {
++    if (!CreateCopyCmdResources(vk_dev, *copy_info, &copy_state_->cmd_pool,
++                                &copy_state_->cmd_buf, &copy_state_->fence)) {
++      return false;
++    }
++  }
++
++  return CopyDmabufToVkFrame(
++      vk_dev, *copy_info, copy_state_->cmd_pool, copy_state_->cmd_buf,
++      copy_state_->fence, pixmap_handle, frame.coded_size(),
++      frame.visible_rect(), codec_context_->width, codec_context_->height,
++      hw_frame);
++}
++
 +void VulkanVideoEncodeAccelerator::Encode(scoped_refptr<VideoFrame> frame,
 +                                          bool force_keyframe) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
@@ -532,77 +1202,116 @@
 +    return;
 +  }
 +
-+  if (!frame || !frame->visible_data(VideoFrame::Plane::kY)) {
++  if (!frame) {
 +    has_error_ = true;
 +    client_->NotifyErrorStatus(
 +        {EncoderStatus::Codes::kUnsupportedFrameFormat,
-+         "VulkanVideoEncodeAccelerator requires mappable VideoFrame"});
++         "VulkanVideoEncodeAccelerator received null frame"});
 +    return;
 +  }
 +
-+  AVFrame* sw_frame = av_frame_alloc();
 +  AVFrame* hw_frame = av_frame_alloc();
-+  if (!sw_frame || !hw_frame) {
-+    av_frame_free(&sw_frame);
-+    av_frame_free(&hw_frame);
++  if (!hw_frame) {
 +    has_error_ = true;
 +    client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
 +    return;
 +  }
 +
-+  sw_frame->format = AV_PIX_FMT_NV12;
-+  sw_frame->width = codec_context_->width;
-+  sw_frame->height = codec_context_->height;
-+  int err = av_frame_get_buffer(sw_frame, 32);
-+  if (err < 0) {
-+    av_frame_free(&sw_frame);
-+    av_frame_free(&hw_frame);
-+    has_error_ = true;
-+    client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
-+    return;
-+  }
-+
-+  if (frame->format() == PIXEL_FORMAT_NV12) {
-+    libyuv::NV12Copy(
-+        frame->visible_data(VideoFrame::Plane::kY),
-+        frame->stride(VideoFrame::Plane::kY),
-+        frame->visible_data(VideoFrame::Plane::kUV),
-+        frame->stride(VideoFrame::Plane::kUV),
-+        sw_frame->data[0], sw_frame->linesize[0],
-+        sw_frame->data[1], sw_frame->linesize[1],
-+        codec_context_->width, codec_context_->height);
-+  } else if (frame->format() == PIXEL_FORMAT_I420) {
-+    libyuv::I420ToNV12(
-+        frame->visible_data(VideoFrame::Plane::kY),
-+        frame->stride(VideoFrame::Plane::kY),
-+        frame->visible_data(VideoFrame::Plane::kU),
-+        frame->stride(VideoFrame::Plane::kU),
-+        frame->visible_data(VideoFrame::Plane::kV),
-+        frame->stride(VideoFrame::Plane::kV),
-+        sw_frame->data[0], sw_frame->linesize[0],
-+        sw_frame->data[1], sw_frame->linesize[1],
-+        codec_context_->width, codec_context_->height);
-+  } else {
-+    av_frame_free(&sw_frame);
-+    av_frame_free(&hw_frame);
-+    has_error_ = true;
-+    client_->NotifyErrorStatus(EncoderStatus::Codes::kUnsupportedFrameFormat);
-+    return;
-+  }
-+
-+  err = av_hwframe_get_buffer(hw_frames_ctx_, hw_frame, 0);
-+  if (err >= 0) {
-+    err = av_hwframe_transfer_data(hw_frame, sw_frame, 0);
-+  }
-+  av_frame_free(&sw_frame);
-+
++  int err = av_hwframe_get_buffer(hw_frames_ctx_, hw_frame, 0);
 +  if (err < 0) {
 +    av_frame_free(&hw_frame);
-+    LOG(ERROR) << "VulkanVideoEncodeAccelerator: hwframe upload failed: "
++    LOG(ERROR) << "VulkanVideoEncodeAccelerator: av_hwframe_get_buffer failed: "
 +               << AVErrorToString(err);
 +    has_error_ = true;
 +    client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
 +    return;
++  }
++
++  bool uploaded = TryEncodeZeroCopyDmabuf(*frame, hw_frame);
++  if (uploaded) {
++    if (!logged_zero_copy_) {
++      logged_zero_copy_ = true;
++      VLOG(1) << "VulkanVideoEncodeAccelerator: zero-copy DMA-BUF GPU copy active";
++    }
++  } else {
++    scoped_refptr<VideoFrame> cpu_frame = frame;
++    if (!cpu_frame->HasDirectCpuAccess() && cpu_frame->HasMappableSharedImage()) {
++      cpu_frame = ConvertToMemoryMappedFrame(std::move(cpu_frame));
++    }
++    if (!cpu_frame || !cpu_frame->HasDirectCpuAccess() ||
++        !cpu_frame->visible_data(VideoFrame::Plane::kY)) {
++      av_frame_free(&hw_frame);
++      has_error_ = true;
++      client_->NotifyErrorStatus(
++          {EncoderStatus::Codes::kUnsupportedFrameFormat,
++           "VulkanVideoEncodeAccelerator requires mappable or CPU VideoFrame"});
++      return;
++    }
++
++    AVFrame* sw_frame = av_frame_alloc();
++    if (!sw_frame) {
++      av_frame_free(&hw_frame);
++      has_error_ = true;
++      client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
++      return;
++    }
++
++    sw_frame->format = AV_PIX_FMT_NV12;
++    sw_frame->width = codec_context_->width;
++    sw_frame->height = codec_context_->height;
++    err = av_frame_get_buffer(sw_frame, 32);
++    if (err < 0) {
++      av_frame_free(&sw_frame);
++      av_frame_free(&hw_frame);
++      has_error_ = true;
++      client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
++      return;
++    }
++
++    const int copy_w =
++        std::min(codec_context_->width, cpu_frame->visible_rect().width());
++    const int copy_h =
++        std::min(codec_context_->height, cpu_frame->visible_rect().height());
++
++    if (cpu_frame->format() == PIXEL_FORMAT_NV12) {
++      libyuv::NV12Copy(
++          cpu_frame->visible_data(VideoFrame::Plane::kY),
++          cpu_frame->stride(VideoFrame::Plane::kY),
++          cpu_frame->visible_data(VideoFrame::Plane::kUV),
++          cpu_frame->stride(VideoFrame::Plane::kUV),
++          sw_frame->data[0], sw_frame->linesize[0],
++          sw_frame->data[1], sw_frame->linesize[1],
++          copy_w, copy_h);
++    } else if (cpu_frame->format() == PIXEL_FORMAT_I420) {
++      libyuv::I420ToNV12(
++          cpu_frame->visible_data(VideoFrame::Plane::kY),
++          cpu_frame->stride(VideoFrame::Plane::kY),
++          cpu_frame->visible_data(VideoFrame::Plane::kU),
++          cpu_frame->stride(VideoFrame::Plane::kU),
++          cpu_frame->visible_data(VideoFrame::Plane::kV),
++          cpu_frame->stride(VideoFrame::Plane::kV),
++          sw_frame->data[0], sw_frame->linesize[0],
++          sw_frame->data[1], sw_frame->linesize[1],
++          copy_w, copy_h);
++    } else {
++      av_frame_free(&sw_frame);
++      av_frame_free(&hw_frame);
++      has_error_ = true;
++      client_->NotifyErrorStatus(EncoderStatus::Codes::kUnsupportedFrameFormat);
++      return;
++    }
++
++    err = av_hwframe_transfer_data(hw_frame, sw_frame, 0);
++    av_frame_free(&sw_frame);
++
++    if (err < 0) {
++      av_frame_free(&hw_frame);
++      LOG(ERROR) << "VulkanVideoEncodeAccelerator: hwframe upload failed: "
++                 << AVErrorToString(err);
++      has_error_ = true;
++      client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
++      return;
++    }
 +  }
 +
 +  hw_frame->pts = frame->timestamp().InMicroseconds();
@@ -753,6 +1462,23 @@
 +
 +void VulkanVideoEncodeAccelerator::ReleaseResources() {
 +  codec_context_.reset();
++  if (copy_state_) {
++    if (hw_device_ctx_) {
++      auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ctx_->data);
++      auto* vk_dev =
++          dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx)
++                  : nullptr;
++      const auto* copy_info = VulkanVideoDevice::GetInstance()->GetCopyInfo();
++      if (vk_dev && copy_info && copy_info->procs_ready) {
++        DestroyCopyCmdResources(vk_dev, copy_info->procs,
++                                copy_state_->cmd_pool, copy_state_->fence);
++      }
++    }
++    copy_state_->cmd_pool = VK_NULL_HANDLE;
++    copy_state_->cmd_buf = VK_NULL_HANDLE;
++    copy_state_->fence = VK_NULL_HANDLE;
++    copy_state_.reset();
++  }
 +  if (hw_frames_ctx_) {
 +    AVBufferRef* ref = hw_frames_ctx_.get();
 +    hw_frames_ctx_ = nullptr;
@@ -767,6 +1493,7 @@
 +  pending_outputs_.clear();
 +  pending_timestamps_.clear();
 +  initialized_ = false;
++  logged_zero_copy_ = false;
 +}
 +
 +}  // namespace media

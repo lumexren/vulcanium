@@ -1,4 +1,607 @@
 --- /dev/null
++++ b/media/gpu/vulkan/vulkan_video_device.h
+@@ -0,0 +1,127 @@
++// Copyright 2026 The Vulcanium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef MEDIA_GPU_VULKAN_VULKAN_VIDEO_DEVICE_H_
++#define MEDIA_GPU_VULKAN_VULKAN_VIDEO_DEVICE_H_
++
++#include <vulkan/vulkan.h>
++
++#include "base/no_destructor.h"
++#include "base/synchronization/lock.h"
++#include "media/gpu/media_gpu_export.h"
++#include "ui/gfx/geometry/size.h"
++
++struct AVBufferRef;
++struct AVVulkanDeviceContext;
++
++namespace media {
++
++struct VkCopyProcs {
++  PFN_vkCreateImage vkCreateImage = nullptr;
++  PFN_vkDestroyImage vkDestroyImage = nullptr;
++  PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements = nullptr;
++  PFN_vkGetImageMemoryRequirements2 vkGetImageMemoryRequirements2 = nullptr;
++  PFN_vkAllocateMemory vkAllocateMemory = nullptr;
++  PFN_vkFreeMemory vkFreeMemory = nullptr;
++  PFN_vkBindImageMemory vkBindImageMemory = nullptr;
++  PFN_vkBindImageMemory2 vkBindImageMemory2 = nullptr;
++  PFN_vkGetImageSubresourceLayout vkGetImageSubresourceLayout = nullptr;
++  PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR = nullptr;
++  PFN_vkGetMemoryFdPropertiesKHR vkGetMemoryFdPropertiesKHR = nullptr;
++  PFN_vkCreateCommandPool vkCreateCommandPool = nullptr;
++  PFN_vkDestroyCommandPool vkDestroyCommandPool = nullptr;
++  PFN_vkResetCommandPool vkResetCommandPool = nullptr;
++  PFN_vkAllocateCommandBuffers vkAllocateCommandBuffers = nullptr;
++  PFN_vkBeginCommandBuffer vkBeginCommandBuffer = nullptr;
++  PFN_vkEndCommandBuffer vkEndCommandBuffer = nullptr;
++  PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier = nullptr;
++  PFN_vkCmdCopyImage vkCmdCopyImage = nullptr;
++  PFN_vkCreateFence vkCreateFence = nullptr;
++  PFN_vkDestroyFence vkDestroyFence = nullptr;
++  PFN_vkResetFences vkResetFences = nullptr;
++  PFN_vkWaitForFences vkWaitForFences = nullptr;
++  PFN_vkQueueSubmit vkQueueSubmit = nullptr;
++  PFN_vkGetDeviceQueue vkGetDeviceQueue = nullptr;
++  PFN_vkGetPhysicalDeviceMemoryProperties
++      vkGetPhysicalDeviceMemoryProperties = nullptr;
++  PFN_vkEnumerateDeviceExtensionProperties
++      vkEnumerateDeviceExtensionProperties = nullptr;
++  PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR
++      vkGetPhysicalDeviceVideoCapabilitiesKHR = nullptr;
++  PFN_vkGetPhysicalDeviceFormatProperties2
++      vkGetPhysicalDeviceFormatProperties2 = nullptr;
++  PFN_vkGetPhysicalDeviceImageFormatProperties2
++      vkGetPhysicalDeviceImageFormatProperties2 = nullptr;
++};
++
++struct VkCopyInfo {
++  VkCopyProcs procs;
++  VkPhysicalDeviceMemoryProperties mem_props{};
++  uint32_t copy_queue_family = 0;
++  bool procs_ready = false;
++};
++
++struct CodecCapability {
++  bool supported = false;
++  gfx::Size min_size{64, 64};
++  gfx::Size max_size{4096, 4096};
++};
++
++struct VulkanVideoCapabilities {
++  bool probed = false;
++  bool has_decode_queue = false;
++  bool has_encode_queue = false;
++  CodecCapability decode_h264;
++  CodecCapability decode_hevc;
++  CodecCapability decode_vp9;
++  CodecCapability decode_av1;
++  CodecCapability encode_h264;
++  CodecCapability encode_hevc;
++  CodecCapability encode_av1;
++};
++
++// Holds a single GPU-process-wide FFmpeg AV_HWDEVICE_TYPE_VULKAN context,
++// resolved Vulkan function pointers, and cached hardware video capabilities so
++// decoders and encoders share one VkDevice and avoid repeated device creation.
++class MEDIA_GPU_EXPORT VulkanVideoDevice {
++ public:
++  static VulkanVideoDevice* GetInstance();
++
++  AVBufferRef* AcquireDevice();
++  const VkCopyInfo* GetCopyInfo() const { return &copy_info_; }
++  const VulkanVideoCapabilities& GetCapabilities();
++
++ private:
++  friend class base::NoDestructor<VulkanVideoDevice>;
++  VulkanVideoDevice() = default;
++  ~VulkanVideoDevice() = delete;
++
++  bool EnsureInitializedLocked();
++
++  base::Lock lock_;
++  AVBufferRef* device_ctx_ = nullptr;
++  VkCopyInfo copy_info_;
++  bool copy_info_attempted_ = false;
++  VulkanVideoCapabilities caps_;
++};
++
++MEDIA_GPU_EXPORT bool CreateCopyCmdResources(AVVulkanDeviceContext* vk_dev,
++                                             const VkCopyInfo& info,
++                                             VkCommandPool* pool_out,
++                                             VkCommandBuffer* buf_out,
++                                             VkFence* fence_out);
++
++MEDIA_GPU_EXPORT void DestroyCopyCmdResources(AVVulkanDeviceContext* vk_dev,
++                                              const VkCopyProcs& procs,
++                                              VkCommandPool pool,
++                                              VkFence fence);
++
++MEDIA_GPU_EXPORT void CleanupVkImageMemory(AVVulkanDeviceContext* vk_dev,
++                                           const VkCopyProcs& procs,
++                                           VkImage img,
++                                           VkDeviceMemory mem);
++
++}  // namespace media
++
++#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DEVICE_H_
+--- /dev/null
++++ b/media/gpu/vulkan/vulkan_video_device.cc
+@@ -0,0 +1,470 @@
++// Copyright 2026 The Vulcanium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "media/gpu/vulkan/vulkan_video_device.h"
++
++#include <algorithm>
++#include <string_view>
++#include <vector>
++
++#include "base/compiler_specific.h"
++#include "base/logging.h"
++#include "media/ffmpeg/ffmpeg_common.h"
++
++extern "C" {
++#include <libavutil/buffer.h>
++#include <libavutil/hwcontext.h>
++#include <libavutil/hwcontext_vulkan.h>
++}
++
++namespace media {
++
++namespace {
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++void InitCopyInfo(AVVulkanDeviceContext* vk_dev, VkCopyInfo* info) {
++  if (!vk_dev || !vk_dev->act_dev || !vk_dev->phys_dev || !vk_dev->inst ||
++      !vk_dev->get_proc_addr) {
++    return;
++  }
++
++  auto vk_get_dev_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
++      vk_dev->get_proc_addr(vk_dev->inst, "vkGetDeviceProcAddr"));
++  if (!vk_get_dev_proc) {
++    return;
++  }
++
++#define LOAD_DEV_PROC(name)                               \
++  info->procs.name = reinterpret_cast<PFN_##name>(        \
++      vk_get_dev_proc(vk_dev->act_dev, #name))
++  LOAD_DEV_PROC(vkCreateImage);
++  LOAD_DEV_PROC(vkDestroyImage);
++  LOAD_DEV_PROC(vkGetImageMemoryRequirements);
++  LOAD_DEV_PROC(vkGetImageMemoryRequirements2);
++  LOAD_DEV_PROC(vkAllocateMemory);
++  LOAD_DEV_PROC(vkFreeMemory);
++  LOAD_DEV_PROC(vkBindImageMemory);
++  LOAD_DEV_PROC(vkBindImageMemory2);
++  LOAD_DEV_PROC(vkGetImageSubresourceLayout);
++  LOAD_DEV_PROC(vkGetMemoryFdKHR);
++  LOAD_DEV_PROC(vkGetMemoryFdPropertiesKHR);
++  LOAD_DEV_PROC(vkCreateCommandPool);
++  LOAD_DEV_PROC(vkDestroyCommandPool);
++  LOAD_DEV_PROC(vkResetCommandPool);
++  LOAD_DEV_PROC(vkAllocateCommandBuffers);
++  LOAD_DEV_PROC(vkBeginCommandBuffer);
++  LOAD_DEV_PROC(vkEndCommandBuffer);
++  LOAD_DEV_PROC(vkCmdPipelineBarrier);
++  LOAD_DEV_PROC(vkCmdCopyImage);
++  LOAD_DEV_PROC(vkCreateFence);
++  LOAD_DEV_PROC(vkDestroyFence);
++  LOAD_DEV_PROC(vkResetFences);
++  LOAD_DEV_PROC(vkWaitForFences);
++  LOAD_DEV_PROC(vkQueueSubmit);
++  LOAD_DEV_PROC(vkGetDeviceQueue);
++#undef LOAD_DEV_PROC
++
++  if (!info->procs.vkGetImageMemoryRequirements2) {
++    info->procs.vkGetImageMemoryRequirements2 =
++        reinterpret_cast<PFN_vkGetImageMemoryRequirements2>(
++            vk_get_dev_proc(vk_dev->act_dev, "vkGetImageMemoryRequirements2KHR"));
++  }
++  if (!info->procs.vkBindImageMemory2) {
++    info->procs.vkBindImageMemory2 =
++        reinterpret_cast<PFN_vkBindImageMemory2>(
++            vk_get_dev_proc(vk_dev->act_dev, "vkBindImageMemory2KHR"));
++  }
++
++#define LOAD_INST_PROC(name)                              \
++  info->procs.name = reinterpret_cast<PFN_##name>(        \
++      vk_dev->get_proc_addr(vk_dev->inst, #name))
++  LOAD_INST_PROC(vkGetPhysicalDeviceMemoryProperties);
++  LOAD_INST_PROC(vkEnumerateDeviceExtensionProperties);
++  LOAD_INST_PROC(vkGetPhysicalDeviceVideoCapabilitiesKHR);
++  LOAD_INST_PROC(vkGetPhysicalDeviceFormatProperties2);
++  LOAD_INST_PROC(vkGetPhysicalDeviceImageFormatProperties2);
++#undef LOAD_INST_PROC
++
++  if (!info->procs.vkGetPhysicalDeviceFormatProperties2) {
++    info->procs.vkGetPhysicalDeviceFormatProperties2 =
++        reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(
++            vk_dev->get_proc_addr(vk_dev->inst,
++                                  "vkGetPhysicalDeviceFormatProperties2KHR"));
++  }
++  if (!info->procs.vkGetPhysicalDeviceImageFormatProperties2) {
++    info->procs.vkGetPhysicalDeviceImageFormatProperties2 =
++        reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(
++            vk_dev->get_proc_addr(
++                vk_dev->inst, "vkGetPhysicalDeviceImageFormatProperties2KHR"));
++  }
++
++  const auto& p = info->procs;
++  if (!p.vkCreateImage || !p.vkDestroyImage ||
++      !p.vkGetImageMemoryRequirements || !p.vkAllocateMemory ||
++      !p.vkFreeMemory || !p.vkBindImageMemory ||
++      !p.vkGetImageSubresourceLayout || !p.vkGetMemoryFdKHR ||
++      !p.vkCreateCommandPool || !p.vkDestroyCommandPool ||
++      !p.vkResetCommandPool || !p.vkAllocateCommandBuffers ||
++      !p.vkBeginCommandBuffer || !p.vkEndCommandBuffer ||
++      !p.vkCmdPipelineBarrier || !p.vkCmdCopyImage || !p.vkCreateFence ||
++      !p.vkDestroyFence || !p.vkResetFences || !p.vkWaitForFences ||
++      !p.vkQueueSubmit || !p.vkGetDeviceQueue ||
++      !p.vkGetPhysicalDeviceMemoryProperties) {
++    return;
++  }
++
++  p.vkGetPhysicalDeviceMemoryProperties(vk_dev->phys_dev, &info->mem_props);
++
++  uint32_t qf =
++      vk_dev->nb_qf > 0 ? static_cast<uint32_t>(vk_dev->qf[0].idx) : 0u;
++  for (int qi = 0; qi < vk_dev->nb_qf; ++qi) {
++    if (vk_dev->qf[qi].flags &
++        (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT)) {
++      qf = static_cast<uint32_t>(vk_dev->qf[qi].idx);
++      if (vk_dev->qf[qi].flags & VK_QUEUE_GRAPHICS_BIT) {
++        break;
++      }
++    }
++  }
++  info->copy_queue_family = qf;
++  info->procs_ready = true;
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++CodecCapability QueryProfileCap(AVVulkanDeviceContext* vk_dev,
++                                const VkCopyProcs& procs,
++                                VkVideoCodecOperationFlagBitsKHR op,
++                                const void* profile_pnext,
++                                void* caps_pnext) {
++  CodecCapability out;
++  if (!vk_dev || !vk_dev->phys_dev ||
++      !procs.vkGetPhysicalDeviceVideoCapabilitiesKHR) {
++    return out;
++  }
++
++  VkVideoProfileInfoKHR profile{
++      .sType = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR,
++      .pNext = profile_pnext,
++      .videoCodecOperation = op,
++      .chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR,
++      .lumaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR,
++      .chromaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR,
++  };
++  VkVideoCapabilitiesKHR vk_caps{
++      .sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR,
++      .pNext = caps_pnext,
++  };
++  VkResult res = procs.vkGetPhysicalDeviceVideoCapabilitiesKHR(
++      vk_dev->phys_dev, &profile, &vk_caps);
++  if (res != VK_SUCCESS || vk_caps.maxCodedExtent.width == 0 ||
++      vk_caps.maxCodedExtent.height == 0) {
++    return out;
++  }
++
++  out.supported = true;
++  out.min_size = gfx::Size(
++      static_cast<int>(std::max(16u, vk_caps.minCodedExtent.width)),
++      static_cast<int>(std::max(16u, vk_caps.minCodedExtent.height)));
++  out.max_size = gfx::Size(static_cast<int>(vk_caps.maxCodedExtent.width),
++                           static_cast<int>(vk_caps.maxCodedExtent.height));
++  return out;
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++void ProbeVideoCapabilities(AVVulkanDeviceContext* vk_dev,
++                            const VkCopyProcs& procs,
++                            VulkanVideoCapabilities* caps) {
++  caps->probed = true;
++  if (!vk_dev || !vk_dev->phys_dev ||
++      !procs.vkEnumerateDeviceExtensionProperties ||
++      !procs.vkGetPhysicalDeviceVideoCapabilitiesKHR) {
++    return;
++  }
++
++  uint32_t ext_count = 0;
++  if (procs.vkEnumerateDeviceExtensionProperties(
++          vk_dev->phys_dev, nullptr, &ext_count, nullptr) != VK_SUCCESS ||
++      ext_count == 0) {
++    return;
++  }
++  std::vector<VkExtensionProperties> exts(ext_count);
++  if (procs.vkEnumerateDeviceExtensionProperties(
++          vk_dev->phys_dev, nullptr, &ext_count, exts.data()) != VK_SUCCESS) {
++    return;
++  }
++
++  const auto has_ext = [&](const char* name) {
++    const std::string_view target(name);
++    for (uint32_t i = 0; i < ext_count; ++i) {
++      if (std::string_view(exts[i].extensionName) == target) {
++        return true;
++      }
++    }
++    return false;
++  };
++
++  caps->has_decode_queue = has_ext(VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME);
++  caps->has_encode_queue = has_ext(VK_KHR_VIDEO_ENCODE_QUEUE_EXTENSION_NAME);
++
++  if (caps->has_decode_queue) {
++    if (has_ext(VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME)) {
++      VkVideoDecodeH264ProfileInfoKHR p{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_PROFILE_INFO_KHR,
++          .stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_HIGH,
++          .pictureLayout = VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_PROGRESSIVE_KHR,
++      };
++      VkVideoDecodeH264CapabilitiesKHR h264_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_CAPABILITIES_KHR,
++      };
++      VkVideoDecodeCapabilitiesKHR dec_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR,
++          .pNext = &h264_caps,
++      };
++      caps->decode_h264 = QueryProfileCap(
++          vk_dev, procs, VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR, &p,
++          &dec_caps);
++    }
++    if (has_ext(VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME)) {
++      VkVideoDecodeH265ProfileInfoKHR p{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_PROFILE_INFO_KHR,
++          .stdProfileIdc = STD_VIDEO_H265_PROFILE_IDC_MAIN,
++      };
++      VkVideoDecodeH265CapabilitiesKHR h265_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_CAPABILITIES_KHR,
++      };
++      VkVideoDecodeCapabilitiesKHR dec_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR,
++          .pNext = &h265_caps,
++      };
++      caps->decode_hevc = QueryProfileCap(
++          vk_dev, procs, VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR, &p,
++          &dec_caps);
++    }
++    if (has_ext(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)) {
++      VkVideoDecodeVP9ProfileInfoKHR p{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_VP9_PROFILE_INFO_KHR,
++          .stdProfile = STD_VIDEO_VP9_PROFILE_0,
++      };
++      VkVideoDecodeVP9CapabilitiesKHR vp9_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_VP9_CAPABILITIES_KHR,
++      };
++      VkVideoDecodeCapabilitiesKHR dec_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR,
++          .pNext = &vp9_caps,
++      };
++      caps->decode_vp9 = QueryProfileCap(
++          vk_dev, procs, VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR, &p,
++          &dec_caps);
++    }
++    if (has_ext(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME)) {
++      VkVideoDecodeAV1ProfileInfoKHR p{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_PROFILE_INFO_KHR,
++          .stdProfile = STD_VIDEO_AV1_PROFILE_MAIN,
++          .filmGrainSupport = VK_FALSE,
++      };
++      VkVideoDecodeAV1CapabilitiesKHR av1_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_CAPABILITIES_KHR,
++      };
++      VkVideoDecodeCapabilitiesKHR dec_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR,
++          .pNext = &av1_caps,
++      };
++      caps->decode_av1 = QueryProfileCap(
++          vk_dev, procs, VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR, &p,
++          &dec_caps);
++    }
++  }
++
++  if (caps->has_encode_queue) {
++    if (has_ext(VK_KHR_VIDEO_ENCODE_H264_EXTENSION_NAME)) {
++      VkVideoEncodeH264ProfileInfoKHR p{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR,
++          .stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_HIGH,
++      };
++      VkVideoEncodeH264CapabilitiesKHR h264_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_CAPABILITIES_KHR,
++      };
++      VkVideoEncodeCapabilitiesKHR enc_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR,
++          .pNext = &h264_caps,
++      };
++      caps->encode_h264 = QueryProfileCap(
++          vk_dev, procs, VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR, &p,
++          &enc_caps);
++    }
++    if (has_ext(VK_KHR_VIDEO_ENCODE_H265_EXTENSION_NAME)) {
++      VkVideoEncodeH265ProfileInfoKHR p{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_PROFILE_INFO_KHR,
++          .stdProfileIdc = STD_VIDEO_H265_PROFILE_IDC_MAIN,
++      };
++      VkVideoEncodeH265CapabilitiesKHR h265_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_CAPABILITIES_KHR,
++      };
++      VkVideoEncodeCapabilitiesKHR enc_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR,
++          .pNext = &h265_caps,
++      };
++      caps->encode_hevc = QueryProfileCap(
++          vk_dev, procs, VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR, &p,
++          &enc_caps);
++    }
++    if (has_ext(VK_KHR_VIDEO_ENCODE_AV1_EXTENSION_NAME)) {
++      VkVideoEncodeAV1ProfileInfoKHR p{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR,
++          .stdProfile = STD_VIDEO_AV1_PROFILE_MAIN,
++      };
++      VkVideoEncodeAV1CapabilitiesKHR av1_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR,
++      };
++      VkVideoEncodeCapabilitiesKHR enc_caps{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR,
++          .pNext = &av1_caps,
++      };
++      caps->encode_av1 = QueryProfileCap(
++          vk_dev, procs, VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR, &p,
++          &enc_caps);
++    }
++  }
++
++  VLOG(1) << "VulkanVideoDevice probed capabilities: decode(h264="
++          << caps->decode_h264.supported << " "
++          << caps->decode_h264.max_size.ToString()
++          << ", hevc=" << caps->decode_hevc.supported << " "
++          << caps->decode_hevc.max_size.ToString()
++          << ", vp9=" << caps->decode_vp9.supported << " "
++          << caps->decode_vp9.max_size.ToString()
++          << ", av1=" << caps->decode_av1.supported << " "
++          << caps->decode_av1.max_size.ToString()
++          << ") encode(h264=" << caps->encode_h264.supported << " "
++          << caps->encode_h264.max_size.ToString()
++          << ", hevc=" << caps->encode_hevc.supported << " "
++          << caps->encode_hevc.max_size.ToString()
++          << ", av1=" << caps->encode_av1.supported << " "
++          << caps->encode_av1.max_size.ToString() << ")";
++}
++
++}  // namespace
++
++// static
++VulkanVideoDevice* VulkanVideoDevice::GetInstance() {
++  static base::NoDestructor<VulkanVideoDevice> instance;
++  return instance.get();
++}
++
++bool VulkanVideoDevice::EnsureInitializedLocked() {
++  if (!device_ctx_) {
++    int err = av_hwdevice_ctx_create(&device_ctx_, AV_HWDEVICE_TYPE_VULKAN,
++                                     nullptr, nullptr, 0);
++    if (err < 0 || !device_ctx_) {
++      LOG(ERROR) << "VulkanVideoDevice: av_hwdevice_ctx_create failed: "
++                 << AVErrorToString(err);
++      caps_.probed = true;
++      return false;
++    }
++  }
++  if (!copy_info_attempted_) {
++    copy_info_attempted_ = true;
++    auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(device_ctx_->data);
++    auto* vk_dev =
++        dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx) : nullptr;
++    InitCopyInfo(vk_dev, &copy_info_);
++    ProbeVideoCapabilities(vk_dev, copy_info_.procs, &caps_);
++  }
++  return true;
++}
++
++AVBufferRef* VulkanVideoDevice::AcquireDevice() {
++  base::AutoLock lock(lock_);
++  if (!EnsureInitializedLocked()) {
++    return nullptr;
++  }
++  return av_buffer_ref(device_ctx_);
++}
++
++const VulkanVideoCapabilities& VulkanVideoDevice::GetCapabilities() {
++  base::AutoLock lock(lock_);
++  EnsureInitializedLocked();
++  return caps_;
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++bool CreateCopyCmdResources(AVVulkanDeviceContext* vk_dev,
++                            const VkCopyInfo& info,
++                            VkCommandPool* pool_out,
++                            VkCommandBuffer* buf_out,
++                            VkFence* fence_out) {
++  if (!vk_dev || !vk_dev->act_dev || !info.procs_ready) {
++    return false;
++  }
++  const auto& p = info.procs;
++  VkCommandPoolCreateInfo cpci{
++      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++      .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
++               VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
++      .queueFamilyIndex = info.copy_queue_family,
++  };
++  VkCommandPool pool = VK_NULL_HANDLE;
++  if (p.vkCreateCommandPool(vk_dev->act_dev, &cpci, nullptr, &pool) !=
++      VK_SUCCESS) {
++    return false;
++  }
++
++  VkCommandBufferAllocateInfo cbai{
++      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool,
++      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++      .commandBufferCount = 1,
++  };
++  VkCommandBuffer cb = VK_NULL_HANDLE;
++  if (p.vkAllocateCommandBuffers(vk_dev->act_dev, &cbai, &cb) != VK_SUCCESS) {
++    p.vkDestroyCommandPool(vk_dev->act_dev, pool, nullptr);
++    return false;
++  }
++
++  VkFenceCreateInfo fci{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++  VkFence fence = VK_NULL_HANDLE;
++  if (p.vkCreateFence(vk_dev->act_dev, &fci, nullptr, &fence) != VK_SUCCESS) {
++    p.vkDestroyCommandPool(vk_dev->act_dev, pool, nullptr);
++    return false;
++  }
++
++  *pool_out = pool;
++  *buf_out = cb;
++  *fence_out = fence;
++  return true;
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++void DestroyCopyCmdResources(AVVulkanDeviceContext* vk_dev,
++                             const VkCopyProcs& procs,
++                             VkCommandPool pool,
++                             VkFence fence) {
++  if (!vk_dev || !vk_dev->act_dev) {
++    return;
++  }
++  if (fence != VK_NULL_HANDLE && procs.vkDestroyFence) {
++    procs.vkDestroyFence(vk_dev->act_dev, fence, nullptr);
++  }
++  if (pool != VK_NULL_HANDLE && procs.vkDestroyCommandPool) {
++    procs.vkDestroyCommandPool(vk_dev->act_dev, pool, nullptr);
++  }
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++void CleanupVkImageMemory(AVVulkanDeviceContext* vk_dev,
++                          const VkCopyProcs& procs,
++                          VkImage img,
++                          VkDeviceMemory mem) {
++  if (!vk_dev || !vk_dev->act_dev) {
++    return;
++  }
++  if (img != VK_NULL_HANDLE && procs.vkDestroyImage) {
++    procs.vkDestroyImage(vk_dev->act_dev, img, nullptr);
++  }
++  if (mem != VK_NULL_HANDLE && procs.vkFreeMemory) {
++    procs.vkFreeMemory(vk_dev->act_dev, mem, nullptr);
++  }
++}
++
++}  // namespace media
+--- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.h
 @@ -0,0 +1,90 @@
 +// Copyright 2026 The Vulcanium Authors
@@ -93,7 +696,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,1257 @@
+@@ -0,0 +1,1058 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -115,10 +718,8 @@
 +#include "base/functional/bind.h"
 +#include "base/functional/callback_helpers.h"
 +#include "base/logging.h"
-+#include "base/no_destructor.h"
 +#include "base/numerics/safe_conversions.h"
 +#include "base/posix/eintr_wrapper.h"
-+#include "base/synchronization/lock.h"
 +#include "base/task/bind_post_task.h"
 +#include "base/task/sequenced_task_runner.h"
 +#include "media/base/color_plane_layout.h"
@@ -128,6 +729,7 @@
 +#include "media/base/video_frame_layout.h"
 +#include "media/ffmpeg/ffmpeg_common.h"
 +#include "media/gpu/chromeos/video_frame_resource.h"
++#include "media/gpu/vulkan/vulkan_video_device.h"
 +
 +extern "C" {
 +#include <libavcodec/avcodec.h>
@@ -157,162 +759,6 @@
 +  }
 +  return false;
 +}
-+
-+struct VkCopyProcs {
-+  PFN_vkCreateImage vkCreateImage = nullptr;
-+  PFN_vkDestroyImage vkDestroyImage = nullptr;
-+  PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements = nullptr;
-+  PFN_vkAllocateMemory vkAllocateMemory = nullptr;
-+  PFN_vkFreeMemory vkFreeMemory = nullptr;
-+  PFN_vkBindImageMemory vkBindImageMemory = nullptr;
-+  PFN_vkGetImageSubresourceLayout vkGetImageSubresourceLayout = nullptr;
-+  PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR = nullptr;
-+  PFN_vkCreateCommandPool vkCreateCommandPool = nullptr;
-+  PFN_vkDestroyCommandPool vkDestroyCommandPool = nullptr;
-+  PFN_vkResetCommandPool vkResetCommandPool = nullptr;
-+  PFN_vkAllocateCommandBuffers vkAllocateCommandBuffers = nullptr;
-+  PFN_vkBeginCommandBuffer vkBeginCommandBuffer = nullptr;
-+  PFN_vkEndCommandBuffer vkEndCommandBuffer = nullptr;
-+  PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier = nullptr;
-+  PFN_vkCmdCopyImage vkCmdCopyImage = nullptr;
-+  PFN_vkCreateFence vkCreateFence = nullptr;
-+  PFN_vkDestroyFence vkDestroyFence = nullptr;
-+  PFN_vkResetFences vkResetFences = nullptr;
-+  PFN_vkWaitForFences vkWaitForFences = nullptr;
-+  PFN_vkQueueSubmit vkQueueSubmit = nullptr;
-+  PFN_vkGetDeviceQueue vkGetDeviceQueue = nullptr;
-+  PFN_vkGetPhysicalDeviceMemoryProperties
-+      vkGetPhysicalDeviceMemoryProperties = nullptr;
-+};
-+
-+struct VkCopyInfo {
-+  VkCopyProcs procs;
-+  VkPhysicalDeviceMemoryProperties mem_props{};
-+  uint32_t copy_queue_family = 0;
-+  bool procs_ready = false;
-+};
-+
-+NO_SANITIZE("cfi") __attribute__((noinline))
-+void InitCopyInfo(AVVulkanDeviceContext* vk_dev, VkCopyInfo* info) {
-+  if (!vk_dev || !vk_dev->act_dev || !vk_dev->phys_dev || !vk_dev->inst ||
-+      !vk_dev->get_proc_addr) {
-+    return;
-+  }
-+
-+  auto vk_get_dev_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-+      vk_dev->get_proc_addr(vk_dev->inst, "vkGetDeviceProcAddr"));
-+  if (!vk_get_dev_proc) {
-+    return;
-+  }
-+
-+#define LOAD_DEV_PROC(name) \
-+  info->procs.name = reinterpret_cast<PFN_##name>( \
-+      vk_get_dev_proc(vk_dev->act_dev, #name))
-+  LOAD_DEV_PROC(vkCreateImage);
-+  LOAD_DEV_PROC(vkDestroyImage);
-+  LOAD_DEV_PROC(vkGetImageMemoryRequirements);
-+  LOAD_DEV_PROC(vkAllocateMemory);
-+  LOAD_DEV_PROC(vkFreeMemory);
-+  LOAD_DEV_PROC(vkBindImageMemory);
-+  LOAD_DEV_PROC(vkGetImageSubresourceLayout);
-+  LOAD_DEV_PROC(vkGetMemoryFdKHR);
-+  LOAD_DEV_PROC(vkCreateCommandPool);
-+  LOAD_DEV_PROC(vkDestroyCommandPool);
-+  LOAD_DEV_PROC(vkResetCommandPool);
-+  LOAD_DEV_PROC(vkAllocateCommandBuffers);
-+  LOAD_DEV_PROC(vkBeginCommandBuffer);
-+  LOAD_DEV_PROC(vkEndCommandBuffer);
-+  LOAD_DEV_PROC(vkCmdPipelineBarrier);
-+  LOAD_DEV_PROC(vkCmdCopyImage);
-+  LOAD_DEV_PROC(vkCreateFence);
-+  LOAD_DEV_PROC(vkDestroyFence);
-+  LOAD_DEV_PROC(vkResetFences);
-+  LOAD_DEV_PROC(vkWaitForFences);
-+  LOAD_DEV_PROC(vkQueueSubmit);
-+  LOAD_DEV_PROC(vkGetDeviceQueue);
-+#undef LOAD_DEV_PROC
-+
-+  info->procs.vkGetPhysicalDeviceMemoryProperties =
-+      reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(
-+          vk_dev->get_proc_addr(vk_dev->inst,
-+                                "vkGetPhysicalDeviceMemoryProperties"));
-+
-+  const auto& p = info->procs;
-+  if (!p.vkCreateImage || !p.vkDestroyImage ||
-+      !p.vkGetImageMemoryRequirements || !p.vkAllocateMemory ||
-+      !p.vkFreeMemory || !p.vkBindImageMemory ||
-+      !p.vkGetImageSubresourceLayout || !p.vkGetMemoryFdKHR ||
-+      !p.vkCreateCommandPool || !p.vkDestroyCommandPool ||
-+      !p.vkResetCommandPool || !p.vkAllocateCommandBuffers ||
-+      !p.vkBeginCommandBuffer || !p.vkEndCommandBuffer ||
-+      !p.vkCmdPipelineBarrier || !p.vkCmdCopyImage || !p.vkCreateFence ||
-+      !p.vkDestroyFence || !p.vkResetFences || !p.vkWaitForFences ||
-+      !p.vkQueueSubmit || !p.vkGetDeviceQueue ||
-+      !p.vkGetPhysicalDeviceMemoryProperties) {
-+    return;
-+  }
-+
-+  p.vkGetPhysicalDeviceMemoryProperties(vk_dev->phys_dev, &info->mem_props);
-+
-+  uint32_t qf =
-+      vk_dev->nb_qf > 0 ? static_cast<uint32_t>(vk_dev->qf[0].idx) : 0u;
-+  for (int qi = 0; qi < vk_dev->nb_qf; ++qi) {
-+    if (vk_dev->qf[qi].flags &
-+        (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT)) {
-+      qf = static_cast<uint32_t>(vk_dev->qf[qi].idx);
-+      if (vk_dev->qf[qi].flags & VK_QUEUE_GRAPHICS_BIT) {
-+        break;
-+      }
-+    }
-+  }
-+  info->copy_queue_family = qf;
-+  info->procs_ready = true;
-+}
-+
-+// Holds a single GPU-process-wide FFmpeg AV_HWDEVICE_TYPE_VULKAN context and
-+// pre-resolved Vulkan function pointers so decoder creation avoids repeated
-+// vkCreateDevice calls during autoplay/preview scrolling.
-+class SharedVulkanDevice {
-+ public:
-+  static SharedVulkanDevice* GetInstance() {
-+    static base::NoDestructor<SharedVulkanDevice> instance;
-+    return instance.get();
-+  }
-+
-+  AVBufferRef* AcquireDevice() {
-+    base::AutoLock lock(lock_);
-+    if (!device_ctx_) {
-+      int err = av_hwdevice_ctx_create(&device_ctx_, AV_HWDEVICE_TYPE_VULKAN,
-+                                       nullptr, nullptr, 0);
-+      if (err < 0 || !device_ctx_) {
-+        LOG(ERROR) << "VulkanVideoDecoder: av_hwdevice_ctx_create failed: "
-+                   << AVErrorToString(err);
-+        return nullptr;
-+      }
-+    }
-+    if (!copy_info_attempted_) {
-+      copy_info_attempted_ = true;
-+      auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(device_ctx_->data);
-+      auto* vk_dev =
-+          dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx)
-+                  : nullptr;
-+      InitCopyInfo(vk_dev, &copy_info_);
-+    }
-+    return av_buffer_ref(device_ctx_);
-+  }
-+
-+  const VkCopyInfo* GetCopyInfo() const { return &copy_info_; }
-+
-+ private:
-+  friend class base::NoDestructor<SharedVulkanDevice>;
-+  SharedVulkanDevice() = default;
-+  ~SharedVulkanDevice() = delete;
-+
-+  base::Lock lock_;
-+  AVBufferRef* device_ctx_ = nullptr;
-+  VkCopyInfo copy_info_;
-+  bool copy_info_attempted_ = false;
-+};
 +
 +struct OutputSlot {
 +  VkImage img = VK_NULL_HANDLE;
@@ -346,82 +792,6 @@
 +      }
 +    }
 +    av_buffer_unref(&alloc.dev_ctx_ref);
-+  }
-+}
-+
-+NO_SANITIZE("cfi") __attribute__((noinline))
-+void DestroyCopyCmdResources(AVVulkanDeviceContext* vk_dev,
-+                             const VkCopyProcs& procs,
-+                             VkCommandPool pool,
-+                             VkFence fence) {
-+  if (!vk_dev || !vk_dev->act_dev) {
-+    return;
-+  }
-+  if (fence != VK_NULL_HANDLE && procs.vkDestroyFence) {
-+    procs.vkDestroyFence(vk_dev->act_dev, fence, nullptr);
-+  }
-+  if (pool != VK_NULL_HANDLE && procs.vkDestroyCommandPool) {
-+    procs.vkDestroyCommandPool(vk_dev->act_dev, pool, nullptr);
-+  }
-+}
-+
-+NO_SANITIZE("cfi") __attribute__((noinline))
-+bool CreateCopyCmdResources(AVVulkanDeviceContext* vk_dev,
-+                            const VkCopyInfo& info,
-+                            VkCommandPool* pool_out,
-+                            VkCommandBuffer* buf_out,
-+                            VkFence* fence_out) {
-+  const auto& p = info.procs;
-+  VkCommandPoolCreateInfo cpci{
-+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-+      .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
-+               VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-+      .queueFamilyIndex = info.copy_queue_family,
-+  };
-+  VkCommandPool pool = VK_NULL_HANDLE;
-+  if (p.vkCreateCommandPool(vk_dev->act_dev, &cpci, nullptr, &pool) !=
-+      VK_SUCCESS) {
-+    return false;
-+  }
-+
-+  VkCommandBufferAllocateInfo cbai{
-+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-+      .commandPool = pool,
-+      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-+      .commandBufferCount = 1,
-+  };
-+  VkCommandBuffer cb = VK_NULL_HANDLE;
-+  if (p.vkAllocateCommandBuffers(vk_dev->act_dev, &cbai, &cb) != VK_SUCCESS) {
-+    p.vkDestroyCommandPool(vk_dev->act_dev, pool, nullptr);
-+    return false;
-+  }
-+
-+  VkFenceCreateInfo fci{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-+  VkFence fence = VK_NULL_HANDLE;
-+  if (p.vkCreateFence(vk_dev->act_dev, &fci, nullptr, &fence) != VK_SUCCESS) {
-+    p.vkDestroyCommandPool(vk_dev->act_dev, pool, nullptr);
-+    return false;
-+  }
-+
-+  *pool_out = pool;
-+  *buf_out = cb;
-+  *fence_out = fence;
-+  return true;
-+}
-+
-+NO_SANITIZE("cfi") __attribute__((noinline))
-+void CleanupVkImageMemory(AVVulkanDeviceContext* vk_dev,
-+                          const VkCopyProcs& p,
-+                          VkImage img,
-+                          VkDeviceMemory mem) {
-+  if (!vk_dev || !vk_dev->act_dev) {
-+    return;
-+  }
-+  if (img != VK_NULL_HANDLE && p.vkDestroyImage) {
-+    p.vkDestroyImage(vk_dev->act_dev, img, nullptr);
-+  }
-+  if (mem != VK_NULL_HANDLE && p.vkFreeMemory) {
-+    p.vkFreeMemory(vk_dev->act_dev, mem, nullptr);
 +  }
 +}
 +
@@ -812,20 +1182,33 @@
 +
 +// static
 +SupportedVideoDecoderConfigs VulkanVideoDecoder::GetSupportedConfigs() {
-+  return {
-+      {H264PROFILE_MIN, H264PROFILE_MAX, gfx::Size(64, 64),
-+       gfx::Size(4096, 4096), /*allow_encrypted=*/false,
-+       /*require_encrypted=*/false},
-+      {HEVCPROFILE_MIN, HEVCPROFILE_MAX, gfx::Size(64, 64),
-+       gfx::Size(8192, 8192), /*allow_encrypted=*/false,
-+       /*require_encrypted=*/false},
-+      {VP9PROFILE_MIN, VP9PROFILE_MAX, gfx::Size(64, 64),
-+       gfx::Size(8192, 8192), /*allow_encrypted=*/false,
-+       /*require_encrypted=*/false},
-+      {AV1PROFILE_MIN, AV1PROFILE_MAX, gfx::Size(64, 64),
-+       gfx::Size(8192, 8192), /*allow_encrypted=*/false,
-+       /*require_encrypted=*/false},
-+  };
++  const auto& caps = VulkanVideoDevice::GetInstance()->GetCapabilities();
++  SupportedVideoDecoderConfigs configs;
++  if (caps.decode_h264.supported) {
++    configs.emplace_back(H264PROFILE_MIN, H264PROFILE_MAX,
++                         caps.decode_h264.min_size, caps.decode_h264.max_size,
++                         /*allow_encrypted=*/false,
++                         /*require_encrypted=*/false);
++  }
++  if (caps.decode_hevc.supported) {
++    configs.emplace_back(HEVCPROFILE_MIN, HEVCPROFILE_MAX,
++                         caps.decode_hevc.min_size, caps.decode_hevc.max_size,
++                         /*allow_encrypted=*/false,
++                         /*require_encrypted=*/false);
++  }
++  if (caps.decode_vp9.supported) {
++    configs.emplace_back(VP9PROFILE_MIN, VP9PROFILE_MAX,
++                         caps.decode_vp9.min_size, caps.decode_vp9.max_size,
++                         /*allow_encrypted=*/false,
++                         /*require_encrypted=*/false);
++  }
++  if (caps.decode_av1.supported) {
++    configs.emplace_back(AV1PROFILE_MIN, AV1PROFILE_MAX,
++                         caps.decode_av1.min_size, caps.decode_av1.max_size,
++                         /*allow_encrypted=*/false,
++                         /*require_encrypted=*/false);
++  }
++  return configs;
 +}
 +
 +// static
@@ -833,15 +1216,36 @@
 +  if (config.is_encrypted()) {
 +    return false;
 +  }
++  const auto& caps = VulkanVideoDevice::GetInstance()->GetCapabilities();
++  const CodecCapability* cap = nullptr;
 +  switch (config.codec()) {
 +    case VideoCodec::kH264:
++      cap = &caps.decode_h264;
++      break;
 +    case VideoCodec::kHEVC:
-+    case VideoCodec::kAV1:
++      cap = &caps.decode_hevc;
++      break;
 +    case VideoCodec::kVP9:
-+      return true;
++      cap = &caps.decode_vp9;
++      break;
++    case VideoCodec::kAV1:
++      cap = &caps.decode_av1;
++      break;
 +    default:
 +      return false;
 +  }
++  if (!cap->supported) {
++    return false;
++  }
++  const gfx::Size& coded_size = config.coded_size();
++  if (!coded_size.IsEmpty() &&
++      (coded_size.width() < cap->min_size.width() ||
++       coded_size.height() < cap->min_size.height() ||
++       coded_size.width() > cap->max_size.width() ||
++       coded_size.height() > cap->max_size.height())) {
++    return false;
++  }
++  return true;
 +}
 +
 +VulkanVideoDecoder::VulkanVideoDecoder(
@@ -930,7 +1334,7 @@
 +    has_decoder_slot_ = true;
 +  }
 +
-+  hw_device_ctx_ = SharedVulkanDevice::GetInstance()->AcquireDevice();
++  hw_device_ctx_ = VulkanVideoDevice::GetInstance()->AcquireDevice();
 +  if (!hw_device_ctx_) {
 +    ReleaseResources(/*release_slot=*/true);
 +    return false;
@@ -977,7 +1381,7 @@
 +      auto* vk_dev =
 +          dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx)
 +                  : nullptr;
-+      const auto* copy_info = SharedVulkanDevice::GetInstance()->GetCopyInfo();
++      const auto* copy_info = VulkanVideoDevice::GetInstance()->GetCopyInfo();
 +      if (vk_dev && copy_info && copy_info->procs_ready) {
 +        DestroyCopyCmdResources(vk_dev, copy_info->procs,
 +                                copy_state_->cmd_pool, copy_state_->fence);
@@ -1077,7 +1481,7 @@
 +  if (!hw_frame || !hw_frame->hw_frames_ctx || !hw_device_ctx_) {
 +    return nullptr;
 +  }
-+  const auto* copy_info = SharedVulkanDevice::GetInstance()->GetCopyInfo();
++  const auto* copy_info = VulkanVideoDevice::GetInstance()->GetCopyInfo();
 +  if (!copy_info || !copy_info->procs_ready) {
 +    return nullptr;
 +  }
@@ -1353,7 +1757,7 @@
 +}  // namespace media
 --- a/media/gpu/BUILD.gn
 +++ b/media/gpu/BUILD.gn
-@@ -182,6 +182,14 @@
+@@ -179,6 +179,20 @@
      }
    }
  
@@ -1361,8 +1765,14 @@
 +    sources += [
 +      "vulkan/vulkan_video_decoder.cc",
 +      "vulkan/vulkan_video_decoder.h",
++      "vulkan/vulkan_video_device.cc",
++      "vulkan/vulkan_video_device.h",
 +    ]
-+    deps += [ "//third_party/ffmpeg" ]
++    deps += [
++      "//third_party/ffmpeg",
++      "//third_party/libyuv",
++      "//third_party/vulkan-headers/src:vulkan_headers",
++    ]
 +  }
 +
    if (use_v4l2_codec) {
@@ -1396,7 +1806,7 @@
      const auto decoder_type =
          GetActualPlatformDecoderImplementation(gpu_preferences_, gpu_info_);
      // The browser process guarantees this CHECK.
-@@ -203,6 +215,12 @@
+@@ -204,6 +216,12 @@
        mojo::PendingRemote<mojom::VideoDecoder> oop_video_decoder,
        base::OnceCallback<void(mojo::PendingRemote<mojom::VideoDecoder>)> cb)
        final {
@@ -1409,7 +1819,7 @@
      switch (
          GetActualPlatformDecoderImplementation(gpu_preferences_, gpu_info_)) {
        case VideoDecoderType::kOutOfProcess:
-@@ -219,7 +237,12 @@
+@@ -219,6 +237,11 @@
  
    std::optional<SupportedVideoDecoderConfigs>
    GetPlatformSupportedVideoDecoderConfigs() final {
@@ -1421,4 +1831,3 @@
      VideoDecoderType decoder_implementation =
          GetActualPlatformDecoderImplementation(gpu_preferences_, gpu_info_);
      base::UmaHistogramEnumeration("Media.VaapiLinux.SupportedVideoDecoder",
-                                   decoder_implementation);

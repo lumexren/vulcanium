@@ -1,6 +1,13 @@
 --- a/third_party/ffmpeg/ffmpeg_generated.gni
 +++ b/third_party/ffmpeg/ffmpeg_generated.gni
-@@ -622,7 +622,16 @@
+@@ -616,13 +616,23 @@
+ 
+ if (is_linux && current_cpu == "x64" && ffmpeg_branding == "Chrome") {
+   ffmpeg_c_sources += [
++    "libavcodec/av1_levels.c",
+     "libavcodec/av1_parse.c",
+     "libavcodec/av1dec.c",
+     "libavcodec/bsf/vp9_superframe_split.c",
      "libavcodec/cbs.c",
      "libavcodec/cbs_av1.c",
      "libavcodec/cbs_bsf.c",
@@ -17,11 +24,12 @@
      "libavcodec/vp9.c",
      "libavcodec/vp9block.c",
      "libavcodec/vp9data.c",
-@@ -638,6 +647,9 @@
+@@ -638,6 +648,10 @@
      "libavcodec/vulkan.c",
      "libavcodec/vulkan_av1.c",
      "libavcodec/vulkan_decode.c",
 +    "libavcodec/vulkan_encode.c",
++    "libavcodec/vulkan_encode_av1.c",
 +    "libavcodec/vulkan_encode_h264.c",
 +    "libavcodec/vulkan_encode_h265.c",
      "libavcodec/vulkan_h264.c",
@@ -51,6 +59,15 @@
  #define CONFIG_WMA_FREQS 0
 --- a/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config_components.h
 +++ b/third_party/ffmpeg/chromium/config/Chrome/linux/x64/config_components.h
+@@ -892,7 +892,7 @@
+ #define CONFIG_AV1_AMF_ENCODER 0
+ #define CONFIG_AV1_MF_ENCODER 0
+ #define CONFIG_AV1_VAAPI_ENCODER 0
+-#define CONFIG_AV1_VULKAN_ENCODER 0
++#define CONFIG_AV1_VULKAN_ENCODER 1
+ #define CONFIG_LIBOPENH264_ENCODER 0
+ #define CONFIG_H264_AMF_ENCODER 0
+ #define CONFIG_H264_D3D12VA_ENCODER 0
 @@ -903,7 +903,7 @@
  #define CONFIG_H264_V4L2M2M_ENCODER 0
  #define CONFIG_H264_VAAPI_ENCODER 0
@@ -71,12 +88,13 @@
  #define CONFIG_MJPEG_VAAPI_ENCODER 0
 --- a/third_party/ffmpeg/chromium/config/Chrome/linux/x64/libavcodec/codec_list.c
 +++ b/third_party/ffmpeg/chromium/config/Chrome/linux/x64/libavcodec/codec_list.c
-@@ -1,6 +1,8 @@
+@@ -1,6 +1,9 @@
  static const FFCodec * const codec_list[] = {
      &ff_h264_decoder,
      &ff_hevc_decoder,
 +    &ff_h264_vulkan_encoder,
 +    &ff_hevc_vulkan_encoder,
++    &ff_av1_vulkan_encoder,
      &ff_vp9_decoder,
      &ff_av1_decoder,
      &ff_aac_decoder,

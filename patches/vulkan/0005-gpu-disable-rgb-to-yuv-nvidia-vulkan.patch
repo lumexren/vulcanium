@@ -1,0 +1,11 @@
+--- a/gpu/config/gpu_driver_bug_list.json
++++ b/gpu/config/gpu_driver_bug_list.json
+@@ -3322,7 +3322,7 @@
+       "os": {
+         "type": "linux"
+       },
+-      "gl_vendor": "NVIDIA.*",
++      "vendor_id": "0x10de",
+       "features": [
+         "disable_rgb_to_yuv_conversion"
+       ]
