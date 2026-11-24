@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.h
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,147 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -46,6 +46,7 @@
 +  PFN_vkCreateFence vkCreateFence = nullptr;
 +  PFN_vkDestroyFence vkDestroyFence = nullptr;
 +  PFN_vkResetFences vkResetFences = nullptr;
++  PFN_vkGetFenceStatus vkGetFenceStatus = nullptr;
 +  PFN_vkWaitForFences vkWaitForFences = nullptr;
 +  PFN_vkQueueSubmit vkQueueSubmit = nullptr;
 +  PFN_vkGetDeviceQueue vkGetDeviceQueue = nullptr;
@@ -130,6 +131,15 @@
 +                                              VkCommandPool pool,
 +                                              VkFence fence);
 +
++MEDIA_GPU_EXPORT VkResult GetFenceStatus(AVVulkanDeviceContext* vk_dev,
++                                         const VkCopyProcs& procs,
++                                         VkFence fence);
++
++MEDIA_GPU_EXPORT VkResult WaitForFence(AVVulkanDeviceContext* vk_dev,
++                                       const VkCopyProcs& procs,
++                                       VkFence fence,
++                                       uint64_t timeout_ns);
++
 +MEDIA_GPU_EXPORT void CleanupVkImageMemory(AVVulkanDeviceContext* vk_dev,
 +                                           const VkCopyProcs& procs,
 +                                           VkImage img,
@@ -140,7 +150,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DEVICE_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.cc
-@@ -0,0 +1,626 @@
+@@ -0,0 +1,651 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -206,6 +216,7 @@
 +  LOAD_DEV_PROC(vkCreateFence);
 +  LOAD_DEV_PROC(vkDestroyFence);
 +  LOAD_DEV_PROC(vkResetFences);
++  LOAD_DEV_PROC(vkGetFenceStatus);
 +  LOAD_DEV_PROC(vkWaitForFences);
 +  LOAD_DEV_PROC(vkQueueSubmit);
 +  LOAD_DEV_PROC(vkGetDeviceQueue);
@@ -255,8 +266,8 @@
 +      !p.vkResetCommandPool || !p.vkAllocateCommandBuffers ||
 +      !p.vkBeginCommandBuffer || !p.vkEndCommandBuffer ||
 +      !p.vkCmdPipelineBarrier || !p.vkCmdCopyImage || !p.vkCreateFence ||
-+      !p.vkDestroyFence || !p.vkResetFences || !p.vkWaitForFences ||
-+      !p.vkQueueSubmit || !p.vkGetDeviceQueue ||
++      !p.vkDestroyFence || !p.vkResetFences || !p.vkGetFenceStatus ||
++      !p.vkWaitForFences || !p.vkQueueSubmit || !p.vkGetDeviceQueue ||
 +      !p.vkGetPhysicalDeviceMemoryProperties) {
 +    return;
 +  }
@@ -751,6 +762,30 @@
 +}
 +
 +NO_SANITIZE("cfi") __attribute__((noinline))
++VkResult GetFenceStatus(AVVulkanDeviceContext* vk_dev,
++                        const VkCopyProcs& procs,
++                        VkFence fence) {
++  if (!vk_dev || !vk_dev->act_dev || fence == VK_NULL_HANDLE ||
++      !procs.vkGetFenceStatus) {
++    return VK_ERROR_INITIALIZATION_FAILED;
++  }
++  return procs.vkGetFenceStatus(vk_dev->act_dev, fence);
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++VkResult WaitForFence(AVVulkanDeviceContext* vk_dev,
++                      const VkCopyProcs& procs,
++                      VkFence fence,
++                      uint64_t timeout_ns) {
++  if (!vk_dev || !vk_dev->act_dev || fence == VK_NULL_HANDLE ||
++      !procs.vkWaitForFences) {
++    return VK_ERROR_INITIALIZATION_FAILED;
++  }
++  return procs.vkWaitForFences(vk_dev->act_dev, 1, &fence, VK_TRUE,
++                               timeout_ns);
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
 +void CleanupVkImageMemory(AVVulkanDeviceContext* vk_dev,
 +                          const VkCopyProcs& procs,
 +                          VkImage img,
@@ -769,7 +804,7 @@
 +}  // namespace media
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.h
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,108 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -777,12 +812,15 @@
 +#ifndef MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 +#define MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 +
++#include <cstdint>
 +#include <memory>
 +
++#include "base/containers/circular_deque.h"
 +#include "base/functional/callback.h"
 +#include "base/memory/scoped_refptr.h"
 +#include "base/memory/weak_ptr.h"
 +#include "base/sequence_checker.h"
++#include "base/timer/timer.h"
 +#include "base/unguessable_token.h"
 +#include "media/base/supported_video_decoder_config.h"
 +#include "media/base/video_decoder.h"
@@ -832,15 +870,17 @@
 +  bool ConfigureVulkanDecoder(const VideoDecoderConfig& config);
 +  void ReleaseResources(bool release_slot);
 +  bool DrainDecodedFrames();
++  void DrainPendingEmits(bool wait_all);
++  void DiscardPendingEmits();
++  void PollPendingEmits();
++  bool StepFrontPendingEmit(bool wait_if_busy);
 +  bool EmitFrame(AVFrame* hw_frame);
-+  scoped_refptr<FrameResource> EmitGpuCopyFrame(
-+      AVFrame* hw_frame,
-+      VideoPixelFormat pixel_format,
-+      const gfx::Rect& visible_rect,
-+      const gfx::Size& natural_size,
-+      const gfx::ColorSpace& color_space,
-+      base::TimeDelta pts,
-+      bool* is_pooled);
++  bool EmitGpuCopyFrameAsync(AVFrame* hw_frame,
++                             VideoPixelFormat pixel_format,
++                             const gfx::Rect& visible_rect,
++                             const gfx::Size& natural_size,
++                             const gfx::ColorSpace& color_space,
++                             base::TimeDelta pts);
 +  void ReleaseOutputSlot(base::UnguessableToken token);
 +  FrameResource* GetOriginalFrame(const base::UnguessableToken& tracking_token);
 +  void OnFrameConverted(scoped_refptr<VideoFrame> frame);
@@ -856,9 +896,13 @@
 +  AVBufferRef* hw_device_ctx_ = nullptr;
 +  std::unique_ptr<AVCodecContext, ScopedPtrAVFreeContext> codec_context_;
 +  std::unique_ptr<VulkanCopyState> copy_state_;
++  base::OneShotTimer pending_emit_timer_;
 +  AVPacket* reusable_packet_ = nullptr;
 +  AVFrame* reusable_hw_frame_ = nullptr;
 +  FrameResource* current_unpooled_origin_ = nullptr;
++  uint64_t zero_wait_emits_ = 0;
++  uint64_t waited_emits_ = 0;
++  bool logged_async_copy_ = false;
 +  bool has_decoder_slot_ = false;
 +  bool drm_prime_map_supported_ = true;
 +  bool initialized_ = false;
@@ -871,7 +915,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,1301 @@
+@@ -0,0 +1,1444 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -882,11 +926,13 @@
 +#include <unistd.h>
 +
 +#include <algorithm>
++#include <array>
 +#include <atomic>
 +#include <cstring>
 +#include <ios>
 +#include <map>
 +#include <optional>
++#include <utility>
 +#include <vector>
 +
 +#include "base/compiler_specific.h"
@@ -1209,13 +1255,13 @@
 +}
 +
 +NO_SANITIZE("cfi") __attribute__((noinline))
-+bool CopyVkFrameToVkImage(AVVulkanDeviceContext* vk_dev,
-+                          const VkCopyInfo& info,
-+                          VkCommandPool cmd_pool,
-+                          VkCommandBuffer cb,
-+                          VkFence fence,
-+                          AVFrame* hw_frame,
-+                          VkImage dst_img) {
++bool SubmitCopyVkFrameToVkImage(AVVulkanDeviceContext* vk_dev,
++                                const VkCopyInfo& info,
++                                VkCommandPool cmd_pool,
++                                VkCommandBuffer cb,
++                                VkFence fence,
++                                AVFrame* hw_frame,
++                                VkImage dst_img) {
 +  if (!vk_dev || !vk_dev->act_dev || !info.procs_ready ||
 +      cmd_pool == VK_NULL_HANDLE || cb == VK_NULL_HANDLE ||
 +      fence == VK_NULL_HANDLE || !hw_frame || !hw_frame->hw_frames_ctx ||
@@ -1405,13 +1451,13 @@
 +      src_vk->sem_value[1] += 1;
 +    }
 +  }
-+  VkResult wr = VK_ERROR_UNKNOWN;
-+  if (sr == VK_SUCCESS) {
++  VkResult wr = VK_SUCCESS;
++  if (sr == VK_SUCCESS && sem_count == 0) {
 +    wr = p.vkWaitForFences(vk_dev->act_dev, 1, &fence, VK_TRUE, 1000000000ULL);
 +  }
 +  if (sr != VK_SUCCESS || wr != VK_SUCCESS) {
-+    LOG(WARNING) << "VulkanVideoDecoder: CopyVkFrameToVkImage failed sr=" << sr
-+                 << " wr=" << wr << " qf=" << qf;
++    LOG(WARNING) << "VulkanVideoDecoder: SubmitCopyVkFrameToVkImage failed sr="
++                 << sr << " wr=" << wr << " qf=" << qf;
 +    return false;
 +  }
 +  return true;
@@ -1456,10 +1502,25 @@
 +
 +}  // namespace
 +
-+struct VulkanCopyState {
++constexpr size_t kDecodeCopyRingSize = 3;
++
++struct DecodeCopyCmd {
 +  VkCommandPool cmd_pool = VK_NULL_HANDLE;
 +  VkCommandBuffer cmd_buf = VK_NULL_HANDLE;
 +  VkFence fence = VK_NULL_HANDLE;
++  bool in_flight = false;
++};
++
++struct PendingGpuEmit {
++  size_t cmd_idx = 0;
++  scoped_refptr<FrameResource> resource;
++  bool is_pooled = false;
++};
++
++struct VulkanCopyState {
++  std::array<DecodeCopyCmd, kDecodeCopyRingSize> cmds;
++  size_t next_cmd = 0;
++  base::circular_deque<PendingGpuEmit> pending_emits;
 +  gfx::Size pool_size;
 +  VideoPixelFormat pool_format = PIXEL_FORMAT_UNKNOWN;
 +  std::vector<OutputSlot> slots;
@@ -1611,6 +1672,7 @@
 +      config_.profile() == config.profile() &&
 +      config_.coded_size() == config.coded_size() &&
 +      config_.extra_data() == config.extra_data()) {
++    DiscardPendingEmits();
 +    avcodec_flush_buffers(codec_context_.get());
 +    config_ = config;
 +    output_cb_ = output_cb;
@@ -1708,6 +1770,13 @@
 +}
 +
 +void VulkanVideoDecoder::ReleaseResources(bool release_slot) {
++  if (zero_wait_emits_ > 0 || waited_emits_ > 0) {
++    VLOG(1) << "VulkanVideoDecoder copy stats: zero_wait=" << zero_wait_emits_
++            << " waited=" << waited_emits_;
++    zero_wait_emits_ = 0;
++    waited_emits_ = 0;
++  }
++  DiscardPendingEmits();
 +  codec_context_.reset();
 +  av_packet_free(&reusable_packet_);
 +  av_frame_free(&reusable_hw_frame_);
@@ -1719,13 +1788,15 @@
 +                  : nullptr;
 +      const auto* copy_info = VulkanVideoDevice::GetInstance()->GetCopyInfo();
 +      if (vk_dev && copy_info && copy_info->procs_ready) {
-+        DestroyCopyCmdResources(vk_dev, copy_info->procs,
-+                                copy_state_->cmd_pool, copy_state_->fence);
++        for (auto& cmd : copy_state_->cmds) {
++          DestroyCopyCmdResources(vk_dev, copy_info->procs, cmd.cmd_pool,
++                                  cmd.fence);
++          cmd.cmd_pool = VK_NULL_HANDLE;
++          cmd.cmd_buf = VK_NULL_HANDLE;
++          cmd.fence = VK_NULL_HANDLE;
++        }
 +      }
 +    }
-+    copy_state_->cmd_pool = VK_NULL_HANDLE;
-+    copy_state_->cmd_buf = VK_NULL_HANDLE;
-+    copy_state_->fence = VK_NULL_HANDLE;
 +    copy_state_.reset();
 +  }
 +  if (hw_device_ctx_) {
@@ -1826,57 +1897,161 @@
 +  }
 +
 +  if (buffer->end_of_stream()) {
++    DrainPendingEmits(/*wait_all=*/true);
 +    eos_reached_ = true;
 +  }
 +  std::move(bound_cb).Run(DecoderStatus::Codes::kOk);
 +}
 +
-+scoped_refptr<FrameResource> VulkanVideoDecoder::EmitGpuCopyFrame(
++bool VulkanVideoDecoder::StepFrontPendingEmit(bool wait_if_busy) {
++  if (!copy_state_ || copy_state_->pending_emits.empty()) {
++    return false;
++  }
++  const auto* copy_info = VulkanVideoDevice::GetInstance()->GetCopyInfo();
++  AVVulkanDeviceContext* vk_dev = nullptr;
++  if (hw_device_ctx_) {
++    auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ctx_->data);
++    vk_dev =
++        dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx) : nullptr;
++  }
++  if (!vk_dev || !vk_dev->act_dev || !copy_info || !copy_info->procs_ready) {
++    copy_state_->pending_emits.clear();
++    return false;
++  }
++
++  PendingGpuEmit& front = copy_state_->pending_emits.front();
++  DecodeCopyCmd& cmd = copy_state_->cmds[front.cmd_idx];
++  VkResult st = GetFenceStatus(vk_dev, copy_info->procs, cmd.fence);
++  if (st == VK_NOT_READY) {
++    if (!wait_if_busy) {
++      return false;
++    }
++    WaitForFence(vk_dev, copy_info->procs, cmd.fence, 1000000000ULL);
++    ++waited_emits_;
++  } else {
++    ++zero_wait_emits_;
++  }
++
++  scoped_refptr<FrameResource> res = std::move(front.resource);
++  const bool is_pooled = front.is_pooled;
++  copy_state_->pending_emits.pop_front();
++  cmd.in_flight = false;
++
++  if (frame_converter_ && res) {
++    auto weak_self = weak_factory_.GetWeakPtr();
++    if (!is_pooled) {
++      current_unpooled_origin_ = res.get();
++    }
++    frame_converter_->ConvertFrame(std::move(res));
++    if (!weak_self) {
++      return false;
++    }
++    if (!is_pooled) {
++      current_unpooled_origin_ = nullptr;
++    }
++  }
++  return true;
++}
++
++void VulkanVideoDecoder::DrainPendingEmits(bool wait_all) {
++  while (StepFrontPendingEmit(wait_all)) {
++  }
++  if (copy_state_ && copy_state_->pending_emits.empty()) {
++    pending_emit_timer_.Stop();
++  }
++}
++
++void VulkanVideoDecoder::PollPendingEmits() {
++  DrainPendingEmits(/*wait_all=*/false);
++  if (copy_state_ && !copy_state_->pending_emits.empty()) {
++    pending_emit_timer_.Start(FROM_HERE, base::Milliseconds(1), this,
++                              &VulkanVideoDecoder::PollPendingEmits);
++  }
++}
++
++void VulkanVideoDecoder::DiscardPendingEmits() {
++  pending_emit_timer_.Stop();
++  if (!copy_state_) {
++    return;
++  }
++  const auto* copy_info = VulkanVideoDevice::GetInstance()->GetCopyInfo();
++  AVVulkanDeviceContext* vk_dev = nullptr;
++  if (hw_device_ctx_) {
++    auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ctx_->data);
++    vk_dev =
++        dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx) : nullptr;
++  }
++  const bool can_vk =
++      vk_dev && vk_dev->act_dev && copy_info && copy_info->procs_ready;
++  for (auto& cmd : copy_state_->cmds) {
++    if (cmd.in_flight) {
++      if (can_vk) {
++        WaitForFence(vk_dev, copy_info->procs, cmd.fence, 1000000000ULL);
++      }
++      cmd.in_flight = false;
++    }
++  }
++  copy_state_->pending_emits.clear();
++}
++
++bool VulkanVideoDecoder::EmitGpuCopyFrameAsync(
 +    AVFrame* hw_frame,
 +    VideoPixelFormat pixel_format,
 +    const gfx::Rect& visible_rect,
 +    const gfx::Size& natural_size,
 +    const gfx::ColorSpace& color_space,
-+    base::TimeDelta pts,
-+    bool* is_pooled) {
-+  *is_pooled = false;
-+  if (!hw_frame || !hw_frame->hw_frames_ctx || !hw_device_ctx_) {
-+    return nullptr;
++    base::TimeDelta pts) {
++  if (!hw_frame || !hw_frame->hw_frames_ctx || !hw_device_ctx_ ||
++      !frame_converter_) {
++    return false;
 +  }
 +  const auto* copy_info = VulkanVideoDevice::GetInstance()->GetCopyInfo();
 +  if (!copy_info || !copy_info->procs_ready) {
-+    return nullptr;
++    return false;
 +  }
 +  auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ctx_->data);
 +  auto* vk_dev =
 +      dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx) : nullptr;
 +  if (!vk_dev || !vk_dev->act_dev) {
-+    return nullptr;
++    return false;
 +  }
 +
 +  const int w = hw_frame->width;
 +  const int h = hw_frame->height;
 +  const gfx::Size coded_size(w, h);
 +  if (w <= 0 || h <= 0) {
-+    return nullptr;
++    return false;
 +  }
 +
 +  if (!copy_state_) {
 +    copy_state_ = std::make_unique<VulkanCopyState>();
 +  }
-+  if (copy_state_->cmd_pool == VK_NULL_HANDLE) {
-+    if (!CreateCopyCmdResources(vk_dev, *copy_info, &copy_state_->cmd_pool,
-+                                &copy_state_->cmd_buf, &copy_state_->fence)) {
-+      return nullptr;
-+    }
-+  }
++
++  DrainPendingEmits(/*wait_all=*/false);
 +
 +  if (copy_state_->pool_size != coded_size ||
 +      copy_state_->pool_format != pixel_format) {
++    DrainPendingEmits(/*wait_all=*/true);
 +    copy_state_->slots.clear();
 +    copy_state_->origin_frames_by_token.clear();
 +    copy_state_->pool_size = coded_size;
 +    copy_state_->pool_format = pixel_format;
++  }
++
++  const size_t cmd_idx = copy_state_->next_cmd;
++  while (copy_state_->cmds[cmd_idx].in_flight &&
++         StepFrontPendingEmit(/*wait_if_busy=*/true)) {
++  }
++  if (!copy_state_ || copy_state_->cmds[cmd_idx].in_flight) {
++    return false;
++  }
++
++  DecodeCopyCmd& cmd = copy_state_->cmds[cmd_idx];
++  if (cmd.cmd_pool == VK_NULL_HANDLE) {
++    if (!CreateCopyCmdResources(vk_dev, *copy_info, &cmd.cmd_pool, &cmd.cmd_buf,
++                                &cmd.fence)) {
++      return false;
++    }
 +  }
 +
 +  OutputSlot* chosen = nullptr;
@@ -1892,7 +2067,7 @@
 +        hw_device_ctx_, vk_dev, *copy_info, w, h, pixel_format, visible_rect,
 +        natural_size, color_space, config_.hdr_metadata(), pts);
 +    if (!new_slot) {
-+      return nullptr;
++      return false;
 +    }
 +    copy_state_->origin_frames_by_token.emplace(new_slot->token,
 +                                                new_slot->origin_frame);
@@ -1900,16 +2075,18 @@
 +    chosen = &copy_state_->slots.back();
 +  }
 +
++  scoped_refptr<FrameResource> resource;
++  bool is_pooled = false;
 +  if (chosen) {
-+    if (!CopyVkFrameToVkImage(vk_dev, *copy_info, copy_state_->cmd_pool,
-+                              copy_state_->cmd_buf, copy_state_->fence,
-+                              hw_frame, chosen->img)) {
-+      return nullptr;
++    if (!SubmitCopyVkFrameToVkImage(vk_dev, *copy_info, cmd.cmd_pool,
++                                    cmd.cmd_buf, cmd.fence, hw_frame,
++                                    chosen->img)) {
++      return false;
 +    }
 +    auto wrapped =
 +        chosen->origin_frame->CreateWrappingFrame(visible_rect, natural_size);
 +    if (!wrapped) {
-+      return nullptr;
++      return false;
 +    }
 +    wrapped->set_timestamp(pts);
 +    wrapped->set_color_space(color_space);
@@ -1919,25 +2096,42 @@
 +    wrapped->AddDestructionObserver(base::BindPostTaskToCurrentDefault(
 +        base::BindOnce(&VulkanVideoDecoder::ReleaseOutputSlot,
 +                       weak_factory_.GetWeakPtr(), chosen->token)));
-+    *is_pooled = true;
-+    return wrapped;
++    resource = std::move(wrapped);
++    is_pooled = true;
++  } else {
++    // All pooled slots are currently held downstream; emit a one-shot unpooled
++    // buffer whose GPU backing is freed as soon as the frame is released.
++    auto temp_slot = CreateDmabufSlot(
++        hw_device_ctx_, vk_dev, *copy_info, w, h, pixel_format, visible_rect,
++        natural_size, color_space, config_.hdr_metadata(), pts);
++    if (!temp_slot) {
++      return false;
++    }
++    if (!SubmitCopyVkFrameToVkImage(vk_dev, *copy_info, cmd.cmd_pool,
++                                    cmd.cmd_buf, cmd.fence, hw_frame,
++                                    temp_slot->img)) {
++      return false;
++    }
++    resource = temp_slot->origin_frame;
++    is_pooled = false;
 +  }
 +
-+  // All pooled slots are currently held downstream; emit a one-shot unpooled
-+  // buffer whose GPU backing is freed as soon as the frame is released.
-+  auto temp_slot = CreateDmabufSlot(
-+      hw_device_ctx_, vk_dev, *copy_info, w, h, pixel_format, visible_rect,
-+      natural_size, color_space, config_.hdr_metadata(), pts);
-+  if (!temp_slot) {
-+    return nullptr;
++  cmd.in_flight = true;
++  copy_state_->next_cmd = (cmd_idx + 1) % kDecodeCopyRingSize;
++  copy_state_->pending_emits.push_back(
++      PendingGpuEmit{cmd_idx, std::move(resource), is_pooled});
++  if (!logged_async_copy_) {
++    logged_async_copy_ = true;
++    VLOG(1) << "VulkanVideoDecoder: async pipelined GPU copy active (ring=3)";
 +  }
-+  if (!CopyVkFrameToVkImage(vk_dev, *copy_info, copy_state_->cmd_pool,
-+                            copy_state_->cmd_buf, copy_state_->fence, hw_frame,
-+                            temp_slot->img)) {
-+    return nullptr;
++
++  DrainPendingEmits(/*wait_all=*/false);
++  if (copy_state_ && !copy_state_->pending_emits.empty() &&
++      !pending_emit_timer_.IsRunning()) {
++    pending_emit_timer_.Start(FROM_HERE, base::Milliseconds(1), this,
++                              &VulkanVideoDecoder::PollPendingEmits);
 +  }
-+  *is_pooled = false;
-+  return temp_slot->origin_frame;
++  return true;
 +}
 +
 +void VulkanVideoDecoder::ReleaseOutputSlot(base::UnguessableToken token) {
@@ -2062,6 +2256,7 @@
 +                auto resource =
 +                    VideoFrameResource::Create(std::move(video_frame));
 +                if (resource) {
++                  DrainPendingEmits(/*wait_all=*/true);
 +                  auto weak_self = weak_factory_.GetWeakPtr();
 +                  current_unpooled_origin_ = resource.get();
 +                  frame_converter_->ConvertFrame(std::move(resource));
@@ -2082,18 +2277,8 @@
 +  }
 +
 +  if (hw_frame->format == AV_PIX_FMT_VULKAN && frame_converter_) {
-+    bool is_pooled = false;
-+    if (auto resource = EmitGpuCopyFrame(hw_frame, pixel_format, visible_rect,
-+                                         natural_size, color_space, pts,
-+                                         &is_pooled)) {
-+      auto weak_self = weak_factory_.GetWeakPtr();
-+      if (!is_pooled) {
-+        current_unpooled_origin_ = resource.get();
-+      }
-+      frame_converter_->ConvertFrame(std::move(resource));
-+      if (!is_pooled && weak_self) {
-+        current_unpooled_origin_ = nullptr;
-+      }
++    if (EmitGpuCopyFrameAsync(hw_frame, pixel_format, visible_rect,
++                              natural_size, color_space, pts)) {
 +      return true;
 +    }
 +    static bool logged_fb = false;
@@ -2148,6 +2333,7 @@
 +  video_frame->set_hdr_metadata(config_.hdr_metadata());
 +  video_frame->metadata().power_efficient = true;
 +  av_frame_free(&sw_frame);
++  DrainPendingEmits(/*wait_all=*/true);
 +  output_cb_.Run(std::move(video_frame));
 +  return true;
 +}
@@ -2161,6 +2347,7 @@
 +
 +void VulkanVideoDecoder::Reset(base::OnceClosure closure) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  DiscardPendingEmits();
 +  if (frame_converter_) {
 +    frame_converter_->AbortPendingFrames();
 +  }

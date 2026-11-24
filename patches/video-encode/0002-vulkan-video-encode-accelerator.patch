@@ -107,7 +107,7 @@
  #endif  // BUILDFLAG(IS_LINUX)
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_encode_accelerator.h
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,120 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -195,7 +195,8 @@
 +  };
 +
 +  bool ConfigureEncoder(const Config& config);
-+  bool TryEncodeZeroCopyDmabuf(const VideoFrame& frame, AVFrame* hw_frame);
++  bool TryEncodeZeroCopyDmabuf(scoped_refptr<VideoFrame> frame,
++                               AVFrame* hw_frame);
 +  void DrainPackets();
 +  void DrainOutputs();
 +  void ReleaseResources();
@@ -229,7 +230,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_ENCODE_ACCELERATOR_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_encode_accelerator.cc
-@@ -0,0 +1,1340 @@
+@@ -0,0 +1,1435 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -240,6 +241,7 @@
 +#include <unistd.h>
 +
 +#include <algorithm>
++#include <array>
 +#include <cstring>
 +#include <utility>
 +#include <vector>
@@ -397,7 +399,12 @@
 +                         const gfx::Rect& visible_rect,
 +                         int enc_w,
 +                         int enc_h,
-+                         AVFrame* dst_hw_frame) {
++                         AVFrame* dst_hw_frame,
++                         VkImage* out_src_img,
++                         VkDeviceMemory out_src_mem[2]) {
++  *out_src_img = VK_NULL_HANDLE;
++  out_src_mem[0] = VK_NULL_HANDLE;
++  out_src_mem[1] = VK_NULL_HANDLE;
 +  if (!vk_dev || !vk_dev->act_dev || !info.procs_ready ||
 +      !info.procs.vkGetMemoryFdPropertiesKHR || cmd_pool == VK_NULL_HANDLE ||
 +      cb == VK_NULL_HANDLE || fence == VK_NULL_HANDLE ||
@@ -897,7 +904,6 @@
 +
 +  const VkImageLayout orig_dst_layout = dst_vk->layout[0];
 +  const uint32_t orig_dst_qf = dst_vk->queue_family[0];
-+  VkResult wr = VK_ERROR_UNKNOWN;
 +  if (sr == VK_SUCCESS) {
 +    dst_vk->layout[0] = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 +    dst_vk->access[0] = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -918,7 +924,6 @@
 +        dst_vk->sem[1] != dst_vk->sem[0]) {
 +      dst_vk->sem_value[1] += 1;
 +    }
-+    wr = p.vkWaitForFences(vk_dev->act_dev, 1, &fence, VK_TRUE, 1000000000ULL);
 +  }
 +
 +  static bool logged_diag = false;
@@ -937,19 +942,56 @@
 +            << " two_dst=" << two_dst_imgs
 +            << " orig_dst_layout=" << orig_dst_layout
 +            << " orig_dst_qf=" << orig_dst_qf
-+            << " sr=" << sr << " wr=" << wr;
++            << " sr=" << sr;
 +  }
 +
-+  CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
-+  return sr == VK_SUCCESS && wr == VK_SUCCESS;
++  if (sr != VK_SUCCESS) {
++    CleanupDmabufImport(vk_dev->act_dev, p, &src_img, src_mem);
++    return false;
++  }
++
++  *out_src_img = src_img;
++  out_src_mem[0] = src_mem[0];
++  out_src_mem[1] = src_mem[1];
++  return true;
++}
++
++constexpr size_t kEncodeCopyRingSize = 4;
++
++struct EncodeCopySlot {
++  VkCommandPool cmd_pool = VK_NULL_HANDLE;
++  VkCommandBuffer cmd_buf = VK_NULL_HANDLE;
++  VkFence fence = VK_NULL_HANDLE;
++  VkImage src_img = VK_NULL_HANDLE;
++  VkDeviceMemory src_mem[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++  scoped_refptr<VideoFrame> input_frame;
++  bool in_flight = false;
++};
++
++bool ReapEncodeCopySlot(AVVulkanDeviceContext* vk_dev,
++                        const VkCopyProcs& p,
++                        EncodeCopySlot& slot,
++                        bool wait) {
++  if (!slot.in_flight) {
++    return true;
++  }
++  if (!wait && GetFenceStatus(vk_dev, p, slot.fence) == VK_NOT_READY) {
++    return false;
++  }
++  if (wait) {
++    WaitForFence(vk_dev, p, slot.fence, 1000000000ULL);
++  }
++  CleanupDmabufImport(vk_dev->act_dev, p, &slot.src_img, slot.src_mem);
++  slot.input_frame.reset();
++  slot.in_flight = false;
++  return true;
 +}
 +
 +}  // namespace
 +
 +struct VulkanEncodeCopyState {
-+  VkCommandPool cmd_pool = VK_NULL_HANDLE;
-+  VkCommandBuffer cmd_buf = VK_NULL_HANDLE;
-+  VkFence fence = VK_NULL_HANDLE;
++  std::array<EncodeCopySlot, kEncodeCopyRingSize> slots;
++  size_t next_slot = 0;
 +};
 +
 +VulkanVideoEncodeAccelerator::OutputBuffer::OutputBuffer(
@@ -1172,9 +1214,10 @@
 +}
 +
 +bool VulkanVideoEncodeAccelerator::TryEncodeZeroCopyDmabuf(
-+    const VideoFrame& frame,
++    scoped_refptr<VideoFrame> frame,
 +    AVFrame* hw_frame) {
-+  if (frame.format() != PIXEL_FORMAT_NV12 || !hw_device_ctx_ || !hw_frame) {
++  if (!frame || frame->format() != PIXEL_FORMAT_NV12 || !hw_device_ctx_ ||
++      !hw_frame) {
 +    return false;
 +  }
 +
@@ -1194,19 +1237,19 @@
 +  gfx::NativePixmapHandle pixmap_handle;
 +  bool have_handle = false;
 +
-+  if (frame.HasMappableSharedImage()) {
-+    gfx::GpuMemoryBufferHandle gmb_handle = frame.GetGpuMemoryBufferHandle();
++  if (frame->HasMappableSharedImage()) {
++    gfx::GpuMemoryBufferHandle gmb_handle = frame->GetGpuMemoryBufferHandle();
 +    if (gmb_handle.type == gfx::GpuMemoryBufferType::NATIVE_PIXMAP) {
 +      pixmap_handle = std::move(gmb_handle).native_pixmap_handle();
 +      have_handle = pixmap_handle.planes.size() >= 2;
 +    }
-+  } else if (frame.storage_type() == VideoFrame::STORAGE_DMABUFS &&
-+             frame.layout().num_planes() >= 2 && frame.NumDmabufFds() >= 1) {
-+    const size_t num_fds = frame.NumDmabufFds();
-+    const auto& layout_planes = frame.layout().planes();
++  } else if (frame->storage_type() == VideoFrame::STORAGE_DMABUFS &&
++             frame->layout().num_planes() >= 2 && frame->NumDmabufFds() >= 1) {
++    const size_t num_fds = frame->NumDmabufFds();
++    const auto& layout_planes = frame->layout().planes();
 +    for (size_t i = 0; i < 2; ++i) {
 +      const size_t fd_idx = (i < num_fds) ? i : 0;
-+      base::ScopedFD dup_fd(HANDLE_EINTR(dup(frame.GetDmabufFd(fd_idx))));
++      base::ScopedFD dup_fd(HANDLE_EINTR(dup(frame->GetDmabufFd(fd_idx))));
 +      if (!dup_fd.is_valid()) {
 +        return false;
 +      }
@@ -1215,7 +1258,7 @@
 +                                        layout_planes[i].size,
 +                                        std::move(dup_fd));
 +    }
-+    pixmap_handle.modifier = frame.layout().modifier();
++    pixmap_handle.modifier = frame->layout().modifier();
 +    have_handle = true;
 +  }
 +
@@ -1226,18 +1269,38 @@
 +  if (!copy_state_) {
 +    copy_state_ = std::make_unique<VulkanEncodeCopyState>();
 +  }
-+  if (copy_state_->cmd_pool == VK_NULL_HANDLE) {
-+    if (!CreateCopyCmdResources(vk_dev, *copy_info, &copy_state_->cmd_pool,
-+                                &copy_state_->cmd_buf, &copy_state_->fence)) {
++  for (auto& s : copy_state_->slots) {
++    ReapEncodeCopySlot(vk_dev, copy_info->procs, s, /*wait=*/false);
++  }
++
++  EncodeCopySlot& slot = copy_state_->slots[copy_state_->next_slot];
++  copy_state_->next_slot = (copy_state_->next_slot + 1) % kEncodeCopyRingSize;
++  if (slot.cmd_pool == VK_NULL_HANDLE) {
++    if (!CreateCopyCmdResources(vk_dev, *copy_info, &slot.cmd_pool,
++                                &slot.cmd_buf, &slot.fence)) {
 +      return false;
 +    }
 +  }
++  if (slot.in_flight) {
++    ReapEncodeCopySlot(vk_dev, copy_info->procs, slot, /*wait=*/true);
++  }
 +
-+  return CopyDmabufToVkFrame(
-+      vk_dev, *copy_info, copy_state_->cmd_pool, copy_state_->cmd_buf,
-+      copy_state_->fence, pixmap_handle, frame.coded_size(),
-+      frame.visible_rect(), codec_context_->width, codec_context_->height,
-+      hw_frame);
++  VkImage out_img = VK_NULL_HANDLE;
++  VkDeviceMemory out_mem[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++  if (!CopyDmabufToVkFrame(vk_dev, *copy_info, slot.cmd_pool, slot.cmd_buf,
++                           slot.fence, pixmap_handle, frame->coded_size(),
++                           frame->visible_rect(), codec_context_->width,
++                           codec_context_->height, hw_frame, &out_img,
++                           out_mem)) {
++    return false;
++  }
++
++  slot.src_img = out_img;
++  slot.src_mem[0] = out_mem[0];
++  slot.src_mem[1] = out_mem[1];
++  slot.input_frame = std::move(frame);
++  slot.in_flight = true;
++  return true;
 +}
 +
 +void VulkanVideoEncodeAccelerator::Encode(scoped_refptr<VideoFrame> frame,
@@ -1276,11 +1339,12 @@
 +    return;
 +  }
 +
-+  bool uploaded = TryEncodeZeroCopyDmabuf(*frame, reusable_hw_frame_);
++  bool uploaded = TryEncodeZeroCopyDmabuf(frame, reusable_hw_frame_);
 +  if (uploaded) {
 +    if (!logged_zero_copy_) {
 +      logged_zero_copy_ = true;
-+      VLOG(1) << "VulkanVideoEncodeAccelerator: zero-copy DMA-BUF GPU copy active";
++      VLOG(1) << "VulkanVideoEncodeAccelerator: async zero-copy DMA-BUF GPU "
++                 "copy active (ring=4)";
 +    }
 +  } else {
 +    scoped_refptr<VideoFrame> cpu_frame = frame;
@@ -1517,6 +1581,17 @@
 +  }
 +  DrainPackets();
 +  DrainOutputs();
++  if (copy_state_ && hw_device_ctx_) {
++    auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ctx_->data);
++    auto* vk_dev =
++        dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx) : nullptr;
++    const auto* copy_info = VulkanVideoDevice::GetInstance()->GetCopyInfo();
++    if (vk_dev && vk_dev->act_dev && copy_info && copy_info->procs_ready) {
++      for (auto& slot : copy_state_->slots) {
++        ReapEncodeCopySlot(vk_dev, copy_info->procs, slot, /*wait=*/true);
++      }
++    }
++  }
 +  std::move(flush_callback).Run(!has_error_);
 +}
 +
@@ -1531,6 +1606,25 @@
 +}
 +
 +void VulkanVideoEncodeAccelerator::ReleaseResources() {
++  if (copy_state_) {
++    AVVulkanDeviceContext* vk_dev = nullptr;
++    if (hw_device_ctx_) {
++      auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ctx_->data);
++      vk_dev = dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx)
++                       : nullptr;
++    }
++    const auto* copy_info = VulkanVideoDevice::GetInstance()->GetCopyInfo();
++    const bool can_vk =
++        vk_dev && vk_dev->act_dev && copy_info && copy_info->procs_ready;
++    for (auto& slot : copy_state_->slots) {
++      if (can_vk) {
++        ReapEncodeCopySlot(vk_dev, copy_info->procs, slot, /*wait=*/true);
++      } else {
++        slot.input_frame.reset();
++        slot.in_flight = false;
++      }
++    }
++  }
 +  codec_context_.reset();
 +  av_packet_free(&reusable_packet_);
 +  av_frame_free(&reusable_sw_frame_);
@@ -1543,13 +1637,15 @@
 +                  : nullptr;
 +      const auto* copy_info = VulkanVideoDevice::GetInstance()->GetCopyInfo();
 +      if (vk_dev && copy_info && copy_info->procs_ready) {
-+        DestroyCopyCmdResources(vk_dev, copy_info->procs,
-+                                copy_state_->cmd_pool, copy_state_->fence);
++        for (auto& slot : copy_state_->slots) {
++          DestroyCopyCmdResources(vk_dev, copy_info->procs, slot.cmd_pool,
++                                  slot.fence);
++          slot.cmd_pool = VK_NULL_HANDLE;
++          slot.cmd_buf = VK_NULL_HANDLE;
++          slot.fence = VK_NULL_HANDLE;
++        }
 +      }
 +    }
-+    copy_state_->cmd_pool = VK_NULL_HANDLE;
-+    copy_state_->cmd_buf = VK_NULL_HANDLE;
-+    copy_state_->fence = VK_NULL_HANDLE;
 +    copy_state_.reset();
 +  }
 +  if (hw_frames_ctx_) {

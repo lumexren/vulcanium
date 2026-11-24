@@ -11,14 +11,13 @@ vulkan/0002-skia-vk-ozone-general-layout-for-dmabuf.patch
 vulkan/0003-vulkan-image-no-export-on-dmabuf-import.patch
 vulkan/0004-vulkan-ycbcr-dmabuf-import.patch
 vulkan/0005-gpu-disable-rgb-to-yuv-nvidia-vulkan.patch
+vulkan/0006-viz-skia-graphite-wayland-dmabuf.patch
 
 # Wayland / Ozone
 wayland/0001-ozone-wayland-vulkan-enable.patch
 wayland/0002-wayland-gbm-vulkan-modifier-fallback.patch
 wayland/0003-wayland-disable-syncobj-on-vulkan.patch
 wayland/0004-wayland-vulkan-linear-dmabuf-pixmap.patch
-wayland/0005-wayland-khr-surface-swapchain.patch
-wayland/0006-wayland-vulkan-surface-alpha-and-windowing.patch
 wayland/0007-wayland-pwa-desktop-app-id.patch
 
 # Vulkan Video Decoding

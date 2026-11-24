@@ -18,32 +18,33 @@ All `.patch` files are applied in the order listed in `patches/series` against C
   - `chrome/browser/ui/startup/bad_flags_prompt.cc`
 
 ### 2. `vulkan/`
-- **ANGLE DMA-BUF, Skia Vulkan & Out-of-Process DMA-BUF Import**:
+- **ANGLE DMA-BUF, Skia Vulkan, Graphite & Out-of-Process DMA-BUF Import**:
   - Graceful fallback in `DmaBufImageSiblingVkLinux::initImpl` when DRM modifiers are rejected (`0001`).
   - `VK_IMAGE_LAYOUT_GENERAL` transitions for Ozone Vulkan SharedImages (`0002`).
   - Drops `VkExportMemoryAllocateInfo` when importing DMA-BUFs into `VulkanImage` so NVIDIA out-of-process GPU mode doesn't create shadow allocations / black screens (`0003`).
   - Uses YCbCr-compatible Vulkan image usage flags (`SAMPLED | TRANSFER_SRC | TRANSFER_DST`) when importing multi-planar NV12/P010 DMA-BUFs (`0004`).
   - Matches `disable_rgb_to_yuv_conversion` (`gpu_driver_bug_list.json` #474) by NVIDIA PCI vendor ID (`0x10de`) instead of OpenGL vendor string so Skia+ANGLE+Vulkan also avoids broken hardware RGB->YUV conversion into 2-plane NV12 pixmaps (`0005`).
+  - Experimental Linux Wayland Skia Graphite + Dawn Vulkan support (`SkiaOutputDeviceBufferQueue` in `InitializeForDawn` and `SharedTextureMemoryDmaBuf` in `DawnContextProvider` / `WebGPUDecoderImpl`, `0006`; upstream Dawn still lacks `DRM_FORMAT_P010` and `PaintCanvasVideoRenderer` NV12 `CopySharedImage` readback on Linux).
 - Target files:
   - `third_party/angle/src/libANGLE/renderer/vulkan/linux/DmaBufImageSiblingVkLinux.cpp`
   - `gpu/command_buffer/service/shared_image/skia_vk_ozone_image_representation.cc`
   - `gpu/vulkan/vulkan_image_linux.cc`, `ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc`
   - `gpu/config/gpu_driver_bug_list.json`
+  - `components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc`, `gpu/command_buffer/service/dawn_context_provider.cc`, `gpu/command_buffer/service/webgpu_decoder_impl.cc`
 
 ### 3. `wayland/`
-- **Ozone/Wayland, `VK_KHR_wayland_surface` Swapchain & PWA Grouping**:
-  - Enable Vulkan on Wayland (`0001`), GBM modifier fallback (`0002`), selectively disable `wp_linux_drm_syncobj_v1` only when Vulkan is active so explicit sync remains enabled on non-Vulkan sessions (`0003`), and linear DMA-BUF pixmap allocation supporting 8-bit (`RGBA/BGRA/RGBX/BGRX_8888`), 10-bit (`BGRA/RGBA_1010102`), and `RGBA_F16` formats (`0004`).
-  - Direct `VK_KHR_wayland_surface` swapchain (`0005`), premultiplied alpha + preserved CSD border alpha (dropping `z_order == 0` opaque override) + `ack_configure` / `set_window_geometry` sync (`0006`).
+- **Ozone/Wayland, DMA-BUF Pixmaps & PWA Grouping**:
+  - Enable Vulkan on Wayland (`0001`), GBM modifier fallback & CSD alpha preservation (`0002`), selectively disable `wp_linux_drm_syncobj_v1` only when Vulkan is active so explicit sync remains enabled on non-Vulkan sessions (`0003`), and linear DMA-BUF pixmap allocation supporting 8-bit (`RGBA/BGRA/RGBX/BGRX_8888`), 10-bit (`BGRA/RGBA_1010102`), and `RGBA_F16` formats (`0004`).
   - Prefixes Wayland PWA `.desktop` files and `xdg_toplevel` `app_id` with the browser's desktop ID (`vulcanium-*` / `helcanium-*`) so installed web apps group separately from the main browser window (`0007`).
 - Target files:
-  - `ui/ozone/platform/wayland/...`, `gpu/ipc/service/gpu_init.cc`, `gpu/vulkan/vulkan_surface.cc`
+  - `ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc`, `ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.{h,cc}`, `ui/ozone/platform/wayland/host/wayland_connection.cc`
   - `chrome/browser/web_applications/os_integration/web_app_shortcut_linux.cc`, `chrome/browser/shell_integration_linux.cc`
 
 ### 4. `video-decode/`
 - **Vulkan Video Decoding (`VkVideo`)**:
   - Shared GPU-process `VulkanVideoDevice` singleton (`vulkan_video_device.{h,cc}`) with `vkGetPhysicalDeviceVideoCapabilitiesKHR` probing across `H.264`, `HEVC` (8-bit and Main10 10-bit), `VP9` (8-bit and Profile 2 10-bit), and `AV1` (8-bit and Main 10-bit) decode/encode queues and extent limits, dedicated `VK_QUEUE_TRANSFER_BIT` queue preference, and exportable NV12 DRM modifier probing.
   - `VulkanVideoDecoder` backed by FFmpeg `AV_HWDEVICE_TYPE_VULKAN` (`H.264`, `HEVC/H.265`, `VP9`, `AV1`) gated by probed GPU capabilities, outputting 8-bit NV12 (tiled/linear) or 10-bit `P010LE` DMA-BUFs (`vkCmdCopyImage` with semaphore-narrowed pipeline barriers -> 2-plane DMA-BUF -> `MailboxVideoFrameConverter` `SharedImage`) with CPU fallback, `AVERROR(EAGAIN)` drain loop in `Decode()`, `MediaLog` decoder reporting, and `visible_rect`/`natural_size`/`ColorSpace`/`hdr_metadata` propagation.
-  - Concurrent decoder cap (`kMaxConcurrentDecoders = 8`) with software fallback, reusable `AVPacket`/`AVFrame`/`VkCommandPool`/`VkCommandBuffer`/`VkFence`, same-config flush fast-path, and bounded DMA-BUF `OutputSlot` pool (`kMaxOutputPoolSize = 12`) with frame-lifetime tracking.
+  - Concurrent decoder cap (`kMaxConcurrentDecoders = 8`) with software fallback, reusable `AVPacket`/`AVFrame`, same-config flush fast-path, async pipelined 3-slot `VkCommandPool`/`VkCommandBuffer`/`VkFence` copy ring (polling `vkGetFenceStatus` without per-frame `vkWaitForFences` stalls), and bounded DMA-BUF `OutputSlot` pool (`kMaxOutputPoolSize = 12`) with frame-lifetime tracking.
 - Target files:
   - `media/base/media_switches.{h,cc}` (`VulkanVideoDecode`)
   - `third_party/ffmpeg/` (Vulkan hwaccel & VP9/AV1/HEVC decoder enablement)
@@ -52,7 +53,7 @@ All `.patch` files are applied in the order listed in `patches/series` against C
 ### 5. `video-encode/`
 - **Vulkan Video Encoding (`VkVideo`)**:
   - `VulkanVideoEncodeAccelerator` backed by FFmpeg `h264_vulkan`, `hevc_vulkan`, and `av1_vulkan` (`VK_KHR_video_encode_queue`, dynamically gated by GPU capability probing via `VulkanVideoDevice`).
-  - Zero-copy GPU-to-GPU DMA-BUF input path (`CopyDmabufToVkFrame`: imports `MappableSharedImage`/`STORAGE_DMABUFS` native pixmap handles with explicit modifier, image format property, and DMA-BUF size validation into `AVVkFrame` via `vkCmdCopyImage` with semaphore-narrowed barriers), with reusable `AVFrame`/`AVPacket`, low-latency tuning (`tune=ll`, `usage=stream`, `async_depth`), dynamic CBR/VBR bitrate updates, and `ConvertToMemoryMappedFrame` CPU upload fallback.
+  - Async zero-copy GPU-to-GPU DMA-BUF input path (`CopyDmabufToVkFrame`: imports `MappableSharedImage`/`STORAGE_DMABUFS` native pixmap handles with explicit modifier, image format property, and DMA-BUF size validation into `AVVkFrame` via a 4-slot pipelined `VkCommandPool`/`VkCommandBuffer`/`VkFence` ring retaining source frames/imports until GPU completion without per-frame `vkWaitForFences` stalls), with reusable `AVFrame`/`AVPacket`, low-latency tuning (`tune=ll`, `usage=stream`, `async_depth`), dynamic CBR/VBR bitrate updates, and `ConvertToMemoryMappedFrame` CPU upload fallback.
 - Target files:
   - `third_party/ffmpeg/` (`CONFIG_VULKAN_ENCODE`, `h264_vulkan`, `hevc_vulkan`, `av1_vulkan`)
   - `media/base/media_switches.{h,cc}` (`VulkanVideoEncode`)

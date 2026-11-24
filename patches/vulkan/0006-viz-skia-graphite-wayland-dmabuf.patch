@@ -1,0 +1,44 @@
+--- a/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
++++ b/components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc
+@@ -2166,7 +2166,17 @@
+         GetDidSwapBuffersCompleteCallback());
+     return !!output_device_;
+   }
+-  NOTREACHED();
++  scoped_refptr<gl::Presenter> presenter = dependency_->CreatePresenter();
++  presenter_ = presenter.get();
++  if (!presenter_) {
++    return false;
++  }
++  output_device_ = std::make_unique<SkiaOutputDeviceBufferQueue>(
++      std::make_unique<OutputPresenterGL>(std::move(presenter), dependency_),
++      dependency_, shared_image_representation_factory_.get(),
++      shared_gpu_deps_->memory_tracker(), GetDidSwapBuffersCompleteCallback(),
++      GetReleaseOverlaysCallback());
++  return true;
+ 
+ #elif BUILDFLAG(IS_WIN)
+   scoped_refptr<gl::Presenter> presenter = dependency_->CreatePresenter();
+--- a/gpu/command_buffer/service/dawn_context_provider.cc
++++ b/gpu/command_buffer/service/dawn_context_provider.cc
+@@ -369,6 +369,9 @@
+       // backend on Android.
+       wgpu::FeatureName::SharedTextureMemoryAHardwareBuffer,
+       wgpu::FeatureName::SharedFenceSyncFD,
++#if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)
++      wgpu::FeatureName::SharedTextureMemoryDmaBuf,
++#endif
+       wgpu::FeatureName::RenderPassRenderArea,
+       wgpu::FeatureName::OpaqueYCbCrAndroidForExternalTexture,
+ 
+--- a/gpu/command_buffer/service/webgpu_decoder_impl.cc
++++ b/gpu/command_buffer/service/webgpu_decoder_impl.cc
+@@ -1523,7 +1523,7 @@
+       wgpu::FeatureName::SharedTextureMemoryIOSurface,
+       wgpu::FeatureName::SharedFenceMTLSharedEvent,
+ 
+-#if BUILDFLAG(IS_CHROMEOS)
++#if BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_LINUX)
+       wgpu::FeatureName::SharedTextureMemoryDmaBuf,
+       wgpu::FeatureName::SharedFenceSyncFD,
+ #endif
