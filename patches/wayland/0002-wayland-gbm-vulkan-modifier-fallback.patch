@@ -1,10 +1,18 @@
 --- a/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
 +++ b/ui/ozone/platform/wayland/gpu/gbm_pixmap_wayland.cc
-@@ -86,7 +86,14 @@ bool GbmPixmapWayland::InitializeBuffer(
+@@ -86,7 +86,22 @@
      // rendering, while wlroots would announce MOD_LINEAR and MOD_INVALID).
      // In such cases gbm_bo allocation may fail, where we should fallback to
      // creation without modifiers, and leave the choices to driver.
 -    if (!gbm_bo_ && buffer_manager_->AllowsImplicitModifierForFormat(format)) {
++    // Try implicit driver-selected (typically tiled) allocation before falling
++    // back to linear when usage permits tiling and the compositor allows it.
++    const bool require_linear =
++        (gbm_flags & (GBM_BO_USE_LINEAR | GBM_BO_USE_FRONT_RENDERING)) != 0;
++    if (!gbm_bo_ && !require_linear &&
++        buffer_manager_->AllowsImplicitModifierForFormat(format)) {
++      gbm_bo_ = gbm_device->CreateBuffer(fourcc_format, size, gbm_flags);
++    }
 +    if (!gbm_bo_) {
 +      std::vector<uint64_t> linear_mod = {DRM_FORMAT_MOD_LINEAR};
 +      gbm_bo_ = gbm_device->CreateBufferWithModifiers(
@@ -16,7 +24,7 @@
        gbm_bo_ = gbm_device->CreateBuffer(fourcc_format, size, gbm_flags);
      }
    }
-@@ -256,9 +263,18 @@ void GbmPixmapWayland::CreateDmabufBasedWlBuffer(
+@@ -255,10 +270,19 @@
    // The wl_buffer must be destroyed once this pixmap is destroyed.
    created_wl_buffer_ = true;
  
@@ -36,3 +44,4 @@
 +      wl_format, plane_count, overlay_plane_data.color_space,
        overlay_plane_data.hdr_metadata, buffer_id_);
  }
+ 

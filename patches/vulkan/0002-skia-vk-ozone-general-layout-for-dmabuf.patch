@@ -1,11 +1,70 @@
+--- a/gpu/command_buffer/service/shared_image/skia_vk_ozone_image_representation.h
++++ b/gpu/command_buffer/service/shared_image/skia_vk_ozone_image_representation.h
+@@ -75,7 +75,7 @@
+                    std::vector<GrBackendSemaphore>* begin_semaphores,
+                    std::vector<GrBackendSemaphore>* end_semaphores);
+   void EndAccess(bool readonly);
+-  std::unique_ptr<skgpu::MutableTextureState> GetEndAccessState();
++  std::unique_ptr<skgpu::MutableTextureState> GetEndAccessState(bool readonly);
+ 
+   VkDevice vk_device();
+   VulkanImplementation* vk_implementation();
 --- a/gpu/command_buffer/service/shared_image/skia_vk_ozone_image_representation.cc
 +++ b/gpu/command_buffer/service/shared_image/skia_vk_ozone_image_representation.cc
-@@ -292,7 +292,7 @@ SkiaVkOzoneImageRepresentation::GetEndAccessState() {
+@@ -125,7 +125,7 @@
+     surface_msaa_count_ = final_msaa_count;
+   }
+ 
+-  *end_state = GetEndAccessState();
++  *end_state = GetEndAccessState(/*readonly=*/false);
+ 
+   return surfaces_;
+ }
+@@ -141,7 +141,7 @@
+     return {};
+   }
+ 
+-  *end_state = GetEndAccessState();
++  *end_state = GetEndAccessState(/*readonly=*/false);
+ 
+   return promise_textures_;
+ }
+@@ -167,7 +167,7 @@
+     return {};
+   }
+ 
+-  *end_state = GetEndAccessState();
++  *end_state = GetEndAccessState(/*readonly=*/true);
+ 
+   return promise_textures_;
+ }
+@@ -265,7 +265,7 @@
+ }
+ 
+ std::unique_ptr<skgpu::MutableTextureState>
+-SkiaVkOzoneImageRepresentation::GetEndAccessState() {
++SkiaVkOzoneImageRepresentation::GetEndAccessState(bool readonly) {
+   // `kSingleDeviceUsage` defines the set of usages for which only the Vulkan
+   // device from SharedContextState is used. If the SI has any usages outside
+   // this set (e.g., if it has any GLES2 usage), then it will be accessed
+@@ -291,8 +291,19 @@
+     }
      DCHECK_NE(queue_family_index, VK_QUEUE_FAMILY_IGNORED);
  
++    // Avoid unconditional VK_IMAGE_LAYOUT_GENERAL transitions on read-only
++    // scans/samplers when no external writer shares the backing; Skia preserves
++    // the current optimal layout when passed VK_IMAGE_LAYOUT_UNDEFINED.
++    const SharedImageUsageSet kExternalWriteUsage =
++        SHARED_IMAGE_USAGE_GLES2_WRITE | SHARED_IMAGE_USAGE_WEBGPU_WRITE |
++        SHARED_IMAGE_USAGE_WEBGPU_STORAGE_TEXTURE |
++        SHARED_IMAGE_USAGE_WEBGPU_SWAP_CHAIN_TEXTURE;
++    const VkImageLayout end_layout =
++        (!readonly || ozone_backing()->usage().HasAny(kExternalWriteUsage))
++            ? VK_IMAGE_LAYOUT_GENERAL
++            : VK_IMAGE_LAYOUT_UNDEFINED;
      return std::make_unique<skgpu::MutableTextureState>(
 -        skgpu::MutableTextureStates::MakeVulkan(VK_IMAGE_LAYOUT_UNDEFINED,
-+        skgpu::MutableTextureStates::MakeVulkan(VK_IMAGE_LAYOUT_GENERAL,
++        skgpu::MutableTextureStates::MakeVulkan(end_layout,
                                                  queue_family_index));
    }
    return nullptr;

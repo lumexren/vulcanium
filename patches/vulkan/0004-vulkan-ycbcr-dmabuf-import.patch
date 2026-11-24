@@ -36,3 +36,86 @@
  }
  
  bool VulkanImage::InitializeWithExternalMemoryAndModifiers(
+@@ -136,7 +136,7 @@
+   vkGetPhysicalDeviceFormatProperties2(physical_device, format, &format_props);
+ 
+   // Call GetImageFormatProperties with every modifier and filter the list
+-  // down to those that we know work.
++  // down to those that we know work and support DMA-BUF export.
+   std::erase_if(props_vector, [&](const VkDrmFormatModifierPropertiesEXT& p) {
+     VkPhysicalDeviceImageDrmFormatModifierInfoEXT mod_info = {
+         .sType =
+@@ -144,21 +144,32 @@
+         .drmFormatModifier = p.drmFormatModifier,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+     };
++    VkPhysicalDeviceExternalImageFormatInfo ext_fmt_info = {
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
++        .pNext = &mod_info,
++        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++    };
+     VkPhysicalDeviceImageFormatInfo2 format_info = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+-        .pNext = &mod_info,
++        .pNext = &ext_fmt_info,
+         .format = format,
+         .type = VK_IMAGE_TYPE_2D,
+         .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+         .usage = usage,
+         .flags = flags,
+     };
++    VkExternalImageFormatProperties ext_props = {
++        .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
++    };
+     VkImageFormatProperties2 format_props = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
++        .pNext = &ext_props,
+     };
+     auto result = vkGetPhysicalDeviceImageFormatProperties2(
+         physical_device, &format_info, &format_props);
+-    return result != VK_SUCCESS;
++    return result != VK_SUCCESS ||
++           (ext_props.externalMemoryProperties.externalMemoryFeatures &
++            VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) == 0;
+   });
+   if (props_vector.empty())
+     return false;
+@@ -207,20 +218,28 @@
+   DCHECK_LE(plane_count_, 3u);
+ 
+   for (uint32_t i = 0; i < plane_count_; i++) {
+-    // Based on spec VK_IMAGE_ASPECT_MEMORY_PLANE_i_BIT_EXT should be used for
+-    // VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT tiling. But we have to use
+-    // VK_IMAGE_ASPECT_PLANE_i_BIT because mesa only handles
+-    // VK_IMAGE_ASPECT_PLANE_i_BIT.
+-    // TODO(penghuang): use VK_IMAGE_ASPECT_MEMORY_PLANE_i_BIT_EXT when the mesa
+-    // can handle VK_IMAGE_ASPECT_MEMORY_PLANE_i_BIT_EXT.
+-    const VkImageSubresource image_subresource = {
+-        .aspectMask =
+-            static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_PLANE_0_BIT << i),
++    layouts_[i] = {};
++    // Spec VUID-vkGetImageSubresourceLayout-tiling-02271 requires
++    // VK_IMAGE_ASPECT_MEMORY_PLANE_i_BIT_EXT for DRM modifier tiling; fall back
++    // to VK_IMAGE_ASPECT_PLANE_i_BIT if a driver reports an empty layout.
++    const VkImageSubresource memory_subresource = {
++        .aspectMask = static_cast<VkImageAspectFlags>(
++            VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << i),
+         .mipLevel = 0,
+         .arrayLayer = 0,
+     };
+     vkGetImageSubresourceLayout(device_queue->GetVulkanDevice(), image_,
+-                                &image_subresource, &layouts_[i]);
++                                &memory_subresource, &layouts_[i]);
++    if (layouts_[i].rowPitch == 0 && layouts_[i].size == 0) {
++      const VkImageSubresource plane_subresource = {
++          .aspectMask =
++              static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_PLANE_0_BIT << i),
++          .mipLevel = 0,
++          .arrayLayer = 0,
++      };
++      vkGetImageSubresourceLayout(device_queue->GetVulkanDevice(), image_,
++                                  &plane_subresource, &layouts_[i]);
++    }
+   }
+ 
+   return true;

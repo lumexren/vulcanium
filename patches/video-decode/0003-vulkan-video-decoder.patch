@@ -25,7 +25,7 @@
  
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.h
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,148 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -93,6 +93,7 @@
 +  VkCopyProcs procs;
 +  VkPhysicalDeviceMemoryProperties mem_props{};
 +  std::vector<uint64_t> preferred_nv12_modifiers;
++  std::vector<uint64_t> preferred_p010_modifiers;
 +  uint32_t copy_queue_family = 0;
 +  bool copy_queue_is_dedicated_transfer = false;
 +  bool procs_ready = false;
@@ -175,7 +176,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DEVICE_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.cc
-@@ -0,0 +1,651 @@
+@@ -0,0 +1,674 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -202,6 +203,96 @@
 +namespace media {
 +
 +namespace {
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++std::vector<uint64_t> ProbeExportable2PlaneModifiers(
++    AVVulkanDeviceContext* vk_dev,
++    const VkCopyProcs& p,
++    VkFormat vk_format) {
++  std::vector<uint64_t> result;
++  if (!p.vkGetPhysicalDeviceFormatProperties2 || !vk_dev->phys_dev) {
++    return result;
++  }
++
++  VkDrmFormatModifierPropertiesListEXT mod_list{
++      .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
++  };
++  VkFormatProperties2 fmt_props{
++      .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
++      .pNext = &mod_list,
++  };
++  p.vkGetPhysicalDeviceFormatProperties2(vk_dev->phys_dev, vk_format,
++                                         &fmt_props);
++  if (mod_list.drmFormatModifierCount == 0) {
++    return result;
++  }
++
++  std::vector<VkDrmFormatModifierPropertiesEXT> mod_props(
++      mod_list.drmFormatModifierCount);
++  mod_list.pDrmFormatModifierProperties = mod_props.data();
++  p.vkGetPhysicalDeviceFormatProperties2(vk_dev->phys_dev, vk_format,
++                                         &fmt_props);
++
++  constexpr VkFormatFeatureFlags kRequiredFeatures =
++      VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
++  bool linear_supported = false;
++  for (const auto& mp : mod_props) {
++    if (mp.drmFormatModifierPlaneCount != 2 ||
++        (mp.drmFormatModifierTilingFeatures & kRequiredFeatures) !=
++            kRequiredFeatures) {
++      continue;
++    }
++    bool exportable = true;
++    if (p.vkGetPhysicalDeviceImageFormatProperties2) {
++      VkPhysicalDeviceImageDrmFormatModifierInfoEXT mod_info{
++          .sType =
++              VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
++          .drmFormatModifier = mp.drmFormatModifier,
++          .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      };
++      VkPhysicalDeviceExternalImageFormatInfo ext_info{
++          .sType =
++              VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
++          .pNext = &mod_info,
++          .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++      };
++      VkPhysicalDeviceImageFormatInfo2 img_info{
++          .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
++          .pNext = &ext_info,
++          .format = vk_format,
++          .type = VK_IMAGE_TYPE_2D,
++          .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++          .usage =
++              VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++      };
++      VkExternalImageFormatProperties ext_props{
++          .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
++      };
++      VkImageFormatProperties2 img_props{
++          .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
++          .pNext = &ext_props,
++      };
++      VkResult res = p.vkGetPhysicalDeviceImageFormatProperties2(
++          vk_dev->phys_dev, &img_info, &img_props);
++      exportable =
++          (res == VK_SUCCESS) &&
++          ((ext_props.externalMemoryProperties.externalMemoryFeatures &
++            VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) != 0);
++    }
++    if (!exportable) {
++      continue;
++    }
++    if (mp.drmFormatModifier == DRM_FORMAT_MOD_LINEAR) {
++      linear_supported = true;
++    } else {
++      result.push_back(mp.drmFormatModifier);
++    }
++  }
++  if (linear_supported) {
++    result.push_back(DRM_FORMAT_MOD_LINEAR);
++  }
++  return result;
++}
 +
 +NO_SANITIZE("cfi") __attribute__((noinline))
 +void InitCopyInfo(AVVulkanDeviceContext* vk_dev, VkCopyInfo* info) {
@@ -325,93 +416,26 @@
 +  info->copy_queue_family = qf;
 +  info->copy_queue_is_dedicated_transfer = dedicated_transfer;
 +
-+  info->preferred_nv12_modifiers.clear();
-+  if (p.vkGetPhysicalDeviceFormatProperties2 && vk_dev->phys_dev) {
-+    VkDrmFormatModifierPropertiesListEXT mod_list{
-+        .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
-+    };
-+    VkFormatProperties2 fmt_props{
-+        .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
-+        .pNext = &mod_list,
-+    };
-+    p.vkGetPhysicalDeviceFormatProperties2(
-+        vk_dev->phys_dev, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &fmt_props);
-+    if (mod_list.drmFormatModifierCount > 0) {
-+      std::vector<VkDrmFormatModifierPropertiesEXT> mod_props(
-+          mod_list.drmFormatModifierCount);
-+      mod_list.pDrmFormatModifierProperties = mod_props.data();
-+      p.vkGetPhysicalDeviceFormatProperties2(
-+          vk_dev->phys_dev, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &fmt_props);
-+
-+      constexpr VkFormatFeatureFlags kRequiredFeatures =
-+          VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
-+      bool linear_supported = false;
-+      for (const auto& mp : mod_props) {
-+        if (mp.drmFormatModifierPlaneCount != 2 ||
-+            (mp.drmFormatModifierTilingFeatures & kRequiredFeatures) !=
-+                kRequiredFeatures) {
-+          continue;
-+        }
-+        bool exportable = true;
-+        if (p.vkGetPhysicalDeviceImageFormatProperties2) {
-+          VkPhysicalDeviceImageDrmFormatModifierInfoEXT mod_info{
-+              .sType =
-+                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
-+              .drmFormatModifier = mp.drmFormatModifier,
-+              .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-+          };
-+          VkPhysicalDeviceExternalImageFormatInfo ext_info{
-+              .sType =
-+                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
-+              .pNext = &mod_info,
-+              .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-+          };
-+          VkPhysicalDeviceImageFormatInfo2 img_info{
-+              .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
-+              .pNext = &ext_info,
-+              .format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
-+              .type = VK_IMAGE_TYPE_2D,
-+              .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-+              .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-+                       VK_IMAGE_USAGE_SAMPLED_BIT,
-+          };
-+          VkExternalImageFormatProperties ext_props{
-+              .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
-+          };
-+          VkImageFormatProperties2 img_props{
-+              .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
-+              .pNext = &ext_props,
-+          };
-+          VkResult res = p.vkGetPhysicalDeviceImageFormatProperties2(
-+              vk_dev->phys_dev, &img_info, &img_props);
-+          exportable =
-+              (res == VK_SUCCESS) &&
-+              ((ext_props.externalMemoryProperties.externalMemoryFeatures &
-+                VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) != 0);
-+        }
-+        if (!exportable) {
-+          continue;
-+        }
-+        if (mp.drmFormatModifier == DRM_FORMAT_MOD_LINEAR) {
-+          linear_supported = true;
-+        } else {
-+          info->preferred_nv12_modifiers.push_back(mp.drmFormatModifier);
-+        }
-+      }
-+      if (linear_supported) {
-+        info->preferred_nv12_modifiers.push_back(DRM_FORMAT_MOD_LINEAR);
-+      }
-+    }
-+  }
++  info->preferred_nv12_modifiers = ProbeExportable2PlaneModifiers(
++      vk_dev, p, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM);
++  info->preferred_p010_modifiers = ProbeExportable2PlaneModifiers(
++      vk_dev, p, VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16);
 +
 +  VLOG(1) << "VulkanVideoDevice copy queue family=" << info->copy_queue_family
 +          << " dedicated_transfer=" << info->copy_queue_is_dedicated_transfer
 +          << " preferred_nv12_modifiers="
 +          << info->preferred_nv12_modifiers.size()
-+          << " first_mod=0x" << std::hex
++          << " first_nv12=0x" << std::hex
 +          << (info->preferred_nv12_modifiers.empty()
 +                  ? 0ULL
 +                  : info->preferred_nv12_modifiers.front())
++          << std::dec
++          << " preferred_p010_modifiers="
++          << info->preferred_p010_modifiers.size()
++          << " first_p010=0x" << std::hex
++          << (info->preferred_p010_modifiers.empty()
++                  ? 0ULL
++                  : info->preferred_p010_modifiers.front())
 +          << std::dec;
 +  info->procs_ready = true;
 +}
@@ -829,7 +853,7 @@
 +}  // namespace media
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.h
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,107 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -929,7 +953,6 @@
 +  uint64_t waited_emits_ = 0;
 +  bool logged_async_copy_ = false;
 +  bool has_decoder_slot_ = false;
-+  bool drm_prime_map_supported_ = true;
 +  bool initialized_ = false;
 +  bool eos_reached_ = false;
 +  base::WeakPtrFactory<VulkanVideoDecoder> weak_factory_{this};
@@ -940,7 +963,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,1444 @@
+@@ -0,0 +1,1445 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -997,6 +1020,7 @@
 +constexpr size_t kMaxOutputPoolSize = 12;
 +
 +std::atomic<int> g_active_decoders{0};
++std::atomic<bool> g_drm_prime_map_supported{true};
 +
 +bool TryAcquireDecoderSlot() {
 +  int cur = g_active_decoders.load(std::memory_order_relaxed);
@@ -1075,15 +1099,15 @@
 +
 +  uint64_t linear_mod = DRM_FORMAT_MOD_LINEAR;
 +  uint64_t chosen_mod = DRM_FORMAT_MOD_LINEAR;
++  const auto& preferred_mods =
++      is_p010 ? info.preferred_p010_modifiers : info.preferred_nv12_modifiers;
 +  const bool try_preferred =
-+      !is_p010 && !info.preferred_nv12_modifiers.empty() &&
++      !preferred_mods.empty() &&
 +      p.vkGetImageDrmFormatModifierPropertiesEXT != nullptr;
 +  const uint64_t* mod_ptr =
-+      try_preferred ? info.preferred_nv12_modifiers.data() : &linear_mod;
++      try_preferred ? preferred_mods.data() : &linear_mod;
 +  const uint32_t mod_count =
-+      try_preferred
-+          ? static_cast<uint32_t>(info.preferred_nv12_modifiers.size())
-+          : 1u;
++      try_preferred ? static_cast<uint32_t>(preferred_mods.size()) : 1u;
 +
 +  VkImageDrmFormatModifierListCreateInfoEXT mod_list{
 +      .sType =
@@ -1527,7 +1551,7 @@
 +
 +}  // namespace
 +
-+constexpr size_t kDecodeCopyRingSize = 3;
++constexpr size_t kDecodeCopyRingSize = 6;
 +
 +struct DecodeCopyCmd {
 +  VkCommandPool cmd_pool = VK_NULL_HANDLE;
@@ -1744,7 +1768,6 @@
 +bool VulkanVideoDecoder::ConfigureVulkanDecoder(
 +    const VideoDecoderConfig& config) {
 +  ReleaseResources(/*release_slot=*/false);
-+  drm_prime_map_supported_ = true;
 +
 +  if (!has_decoder_slot_) {
 +    if (!TryAcquireDecoderSlot()) {
@@ -2147,7 +2170,7 @@
 +      PendingGpuEmit{cmd_idx, std::move(resource), is_pooled});
 +  if (!logged_async_copy_) {
 +    logged_async_copy_ = true;
-+    VLOG(1) << "VulkanVideoDecoder: async pipelined GPU copy active (ring=3)";
++    VLOG(1) << "VulkanVideoDecoder: async pipelined GPU copy active (ring=6)";
 +  }
 +
 +  DrainPendingEmits(/*wait_all=*/false);
@@ -2231,7 +2254,8 @@
 +
 +  // Zero-copy path: map AV_PIX_FMT_VULKAN -> AV_PIX_FMT_DRM_PRIME and wrap
 +  // exported DMA-BUF file descriptors directly into a VideoFrame.
-+  if (hw_frame->format == AV_PIX_FMT_VULKAN && drm_prime_map_supported_) {
++  if (hw_frame->format == AV_PIX_FMT_VULKAN &&
++      g_drm_prime_map_supported.load(std::memory_order_relaxed)) {
 +    AVFrame* drm_frame = av_frame_alloc();
 +    if (drm_frame) {
 +      drm_frame->format = AV_PIX_FMT_DRM_PRIME;
@@ -2295,7 +2319,7 @@
 +          }
 +        }
 +      } else {
-+        drm_prime_map_supported_ = false;
++        g_drm_prime_map_supported.store(false, std::memory_order_relaxed);
 +      }
 +      av_frame_free(&drm_frame);
 +    }

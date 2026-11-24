@@ -11,25 +11,26 @@
  namespace ui {
  
  class WaylandBufferManagerGpu;
-@@ -53,6 +57,13 @@
+@@ -53,6 +57,14 @@
                                    viz::SharedImageFormat format,
                                    gfx::NativePixmapHandle handle);
  
-+  bool InitializeVulkanLinearBuffer(
++  bool InitializeVulkanBuffer(
 +      gfx::AcceleratedWidget widget,
 +      gpu::VulkanDeviceQueue* device_queue,
 +      gfx::Size size,
 +      viz::SharedImageFormat format,
++      NativePixmapUsageSet usage,
 +      std::optional<gfx::Size> visible_area_size = std::nullopt);
 +
    // gfx::NativePixmap overrides:
    bool AreDmaBufFdsValid() const override;
    int GetDmaBufFd(size_t plane) const override;
-@@ -80,6 +91,11 @@
+@@ -80,6 +92,11 @@
    // gbm_bo wrapper for struct gbm_bo.
    std::unique_ptr<GbmBuffer> gbm_bo_;
  
-+  // Direct Vulkan-allocated linear DMA-BUF handle (bypasses gbm_bo_).
++  // Direct Vulkan-allocated DMA-BUF handle (bypasses gbm_bo_).
 +  std::optional<gfx::NativePixmapHandle> vulkan_handle_;
 +  viz::SharedImageFormat vulkan_format_;
 +  gfx::Size vulkan_size_;
@@ -52,15 +53,16 @@
  
  namespace ui {
  
-@@ -146,27 +152,115 @@
+@@ -154,27 +160,195 @@
    return true;
  }
  
-+bool GbmPixmapWayland::InitializeVulkanLinearBuffer(
++bool GbmPixmapWayland::InitializeVulkanBuffer(
 +    gfx::AcceleratedWidget widget,
 +    gpu::VulkanDeviceQueue* device_queue,
 +    gfx::Size size,
 +    viz::SharedImageFormat format,
++    NativePixmapUsageSet usage,
 +    std::optional<gfx::Size> visible_area_size) {
 +#if BUILDFLAG(ENABLE_VULKAN)
 +  if (!device_queue) {
@@ -88,32 +90,103 @@
 +  constexpr VkImageUsageFlags kUsage =
 +      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
 +      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-+  auto vk_image = gpu::VulkanImage::CreateWithExternalMemoryAndModifiers(
-+      device_queue, size, vk_format, {DRM_FORMAT_MOD_LINEAR}, kUsage, 0);
-+  if (!vk_image) {
-+    return false;
-+  }
 +
-+  base::ScopedFD fd =
-+      vk_image->GetMemoryFd(VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
-+  if (!fd.is_valid()) {
++  const auto try_allocate = [&](std::vector<uint64_t> mods)
++      -> std::optional<gfx::NativePixmapHandle> {
++    if (mods.empty()) {
++      return std::nullopt;
++    }
++    auto vk_image = gpu::VulkanImage::CreateWithExternalMemoryAndModifiers(
++        device_queue, size, vk_format, std::move(mods), kUsage, 0);
++    if (!vk_image) {
++      return std::nullopt;
++    }
++
++    const size_t plane_count = vk_image->plane_count();
++    const uint64_t chosen_mod = vk_image->modifier();
++    if (plane_count == 0 || plane_count > vk_image->layouts().size()) {
++      vk_image->Destroy();
++      return std::nullopt;
++    }
++    if (chosen_mod != DRM_FORMAT_MOD_LINEAR) {
++      for (size_t i = 0; i < plane_count; ++i) {
++        if (vk_image->layouts()[i].rowPitch == 0) {
++          vk_image->Destroy();
++          return std::nullopt;
++        }
++      }
++    }
++
++    base::ScopedFD fd =
++        vk_image->GetMemoryFd(VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
++    if (!fd.is_valid()) {
++      vk_image->Destroy();
++      return std::nullopt;
++    }
++
++    gfx::NativePixmapHandle handle;
++    handle.modifier = chosen_mod;
++    handle.planes.reserve(plane_count);
++    for (size_t i = 0; i < plane_count; ++i) {
++      base::ScopedFD plane_fd;
++      if (i + 1 < plane_count) {
++        plane_fd.reset(HANDLE_EINTR(dup(fd.get())));
++        if (!plane_fd.is_valid()) {
++          vk_image->Destroy();
++          return std::nullopt;
++        }
++      } else {
++        plane_fd = std::move(fd);
++      }
++
++      const auto& layout = vk_image->layouts()[i];
++      uint32_t stride =
++          layout.rowPitch > 0
++              ? static_cast<uint32_t>(layout.rowPitch)
++              : static_cast<uint32_t>(size.width() * bytes_per_pixel);
++      uint64_t plane_size =
++          layout.size > 0
++              ? static_cast<uint64_t>(layout.size)
++              : (chosen_mod == DRM_FORMAT_MOD_LINEAR
++                     ? static_cast<uint64_t>(stride) * size.height()
++                     : static_cast<uint64_t>(vk_image->device_size()));
++      handle.planes.emplace_back(stride, static_cast<uint64_t>(layout.offset),
++                                 plane_size, std::move(plane_fd));
++    }
 +    vk_image->Destroy();
++    return handle;
++  };
++
++  const uint32_t gbm_flags = ui::NativePixmapUsageToGbmFlags(usage);
++  const bool require_linear =
++      (gbm_flags & (GBM_BO_USE_LINEAR | GBM_BO_USE_FRONT_RENDERING)) != 0;
++
++  std::optional<gfx::NativePixmapHandle> handle;
++  if (!require_linear) {
++    std::vector<uint64_t> tiled_modifiers;
++    for (uint64_t mod : buffer_manager_->GetModifiersForFormat(format)) {
++      if (mod != DRM_FORMAT_MOD_INVALID && mod != DRM_FORMAT_MOD_LINEAR) {
++        tiled_modifiers.push_back(mod);
++      }
++    }
++    if (!tiled_modifiers.empty()) {
++      handle = try_allocate(std::move(tiled_modifiers));
++    }
++  }
++  if (!handle) {
++    handle = try_allocate({DRM_FORMAT_MOD_LINEAR});
++  }
++  if (!handle) {
 +    return false;
 +  }
 +
-+  gfx::NativePixmapHandle handle;
-+  const auto& layout = vk_image->layouts()[0];
-+  uint32_t stride =
-+      layout.rowPitch > 0
-+          ? static_cast<uint32_t>(layout.rowPitch)
-+          : static_cast<uint32_t>(size.width() * bytes_per_pixel);
-+  uint64_t plane_size = layout.size > 0
-+                            ? static_cast<uint64_t>(layout.size)
-+                            : static_cast<uint64_t>(stride) * size.height();
-+  handle.planes.emplace_back(stride, static_cast<uint64_t>(layout.offset),
-+                             plane_size, std::move(fd));
-+  handle.modifier = vk_image->modifier();
-+  vk_image->Destroy();
++  static bool logged_vk_pixmap = false;
++  if (!logged_vk_pixmap) {
++    logged_vk_pixmap = true;
++    VLOG(1) << "GbmPixmapWayland::InitializeVulkanBuffer selected modifier=0x"
++            << std::hex << handle->modifier << std::dec
++            << " planes=" << handle->planes.size();
++  }
 +
 +  widget_ = widget;
 +  vulkan_handle_ = std::move(handle);
@@ -128,7 +201,15 @@
 +
  bool GbmPixmapWayland::AreDmaBufFdsValid() const {
 +  if (vulkan_handle_) {
-+    return !vulkan_handle_->planes.empty() && vulkan_handle_->planes[0].fd.is_valid();
++    if (vulkan_handle_->planes.empty()) {
++      return false;
++    }
++    for (const auto& plane : vulkan_handle_->planes) {
++      if (!plane.fd.is_valid()) {
++        return false;
++      }
++    }
++    return true;
 +  }
    return gbm_bo_->AreFdsValid();
  }
@@ -168,7 +249,7 @@
    return gbm_bo_->GetNumPlanes();
  }
  
-@@ -177,18 +271,30 @@
+@@ -185,18 +359,30 @@
  }
  
  uint64_t GbmPixmapWayland::GetFormatModifier() const {
@@ -199,7 +280,7 @@
    return gbm_bo_->GetHandle();
  }
  
-@@ -220,7 +326,7 @@
+@@ -228,7 +414,7 @@
  gfx::NativePixmapHandle GbmPixmapWayland::ExportHandle() const {
    gfx::NativePixmapHandle handle;
  
@@ -208,7 +289,7 @@
    std::vector<base::ScopedFD> scoped_fds(num_planes);
    for (size_t i = 0; i < num_planes; ++i) {
      scoped_fds[i] = base::ScopedFD(HANDLE_EINTR(dup(GetDmaBufFd(i))));
-@@ -232,7 +338,7 @@
+@@ -240,7 +426,7 @@
  
    for (size_t i = 0; i < num_planes; ++i) {
      handle.planes.emplace_back(GetDmaBufPitch(i), GetDmaBufOffset(i),
@@ -217,7 +298,7 @@
                                 std::move(scoped_fds[i]));
    }
    handle.modifier = GetFormatModifier();
-@@ -241,13 +347,13 @@
+@@ -249,13 +435,13 @@
  
  void GbmPixmapWayland::CreateDmabufBasedWlBuffer(
      const gfx::OverlayPlaneData& overlay_plane_data) {
@@ -233,7 +314,7 @@
    for (size_t i = 0; i < plane_count; ++i) {
      strides.push_back(GetDmaBufPitch(i));
      offsets.push_back(GetDmaBufOffset(i));
-@@ -262,7 +368,9 @@
+@@ -270,7 +456,9 @@
    // The wl_buffer must be destroyed once this pixmap is destroyed.
    created_wl_buffer_ = true;
  
@@ -246,10 +327,18 @@
        wl_format = DRM_FORMAT_XBGR8888;
 --- a/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
 +++ b/ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc
-@@ -268,11 +268,25 @@
+@@ -261,18 +261,32 @@
+     return nullptr;
+   }
+ #if defined(WAYLAND_GBM)
++  auto native_usage = BufferUsageToNativePixmapUsage(usage);
+   auto* gbm_device = buffer_manager_->GetGbmDevice();
+   if (gbm_device && gbm_device->CanCreateBufferForFormat(
+                         GetFourCCFormatFromSharedImageFormat(format))) {
+     scoped_refptr<GbmPixmapWayland> pixmap =
          base::MakeRefCounted<GbmPixmapWayland>(buffer_manager_);
  
-     auto native_usage = BufferUsageToNativePixmapUsage(usage);
+-    auto native_usage = BufferUsageToNativePixmapUsage(usage);
 -    if (!pixmap->InitializeBuffer(widget, size, format, native_usage,
 -                                  framebuffer_size)) {
 -      return nullptr;
@@ -268,8 +357,8 @@
 +       format == viz::SinglePlaneFormat::kRGBA_F16)) {
 +    scoped_refptr<GbmPixmapWayland> vk_pixmap =
 +        base::MakeRefCounted<GbmPixmapWayland>(buffer_manager_);
-+    if (vk_pixmap->InitializeVulkanLinearBuffer(widget, device_queue, size,
-+                                                format, framebuffer_size)) {
++    if (vk_pixmap->InitializeVulkanBuffer(widget, device_queue, size, format,
++                                          native_usage, framebuffer_size)) {
 +      return vk_pixmap;
      }
 -    return pixmap;
