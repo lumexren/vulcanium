@@ -41,9 +41,9 @@ All `.patch` files are applied in the order listed in `patches/series` against C
 
 ### 4. `video-decode/`
 - **Vulkan Video Decoding (`VkVideo`)**:
-  - Shared GPU-process `VulkanVideoDevice` singleton (`vulkan_video_device.{h,cc}`) with `vkGetPhysicalDeviceVideoCapabilitiesKHR` probing across `H.264`, `HEVC`, `VP9`, and `AV1` decode/encode queues and extent limits.
-  - `VulkanVideoDecoder` backed by FFmpeg `AV_HWDEVICE_TYPE_VULKAN` (`H.264`, `HEVC/H.265`, `VP9`, `AV1`) gated by probed GPU capabilities, with zero-copy NVIDIA output (`vkCmdCopyImage` -> 2-plane DMA-BUF -> `MailboxVideoFrameConverter` `SharedImage`).
-  - Concurrent decoder cap (`kMaxConcurrentDecoders = 8`) with software fallback, reusable `VkCommandPool`/`VkCommandBuffer`/`VkFence`, same-config flush fast-path, and bounded DMA-BUF `OutputSlot` pool (`kMaxOutputPoolSize = 12`) with frame-lifetime tracking.
+  - Shared GPU-process `VulkanVideoDevice` singleton (`vulkan_video_device.{h,cc}`) with `vkGetPhysicalDeviceVideoCapabilitiesKHR` probing across `H.264`, `HEVC`, `VP9`, and `AV1` decode/encode queues and extent limits, dedicated `VK_QUEUE_TRANSFER_BIT` queue preference, and exportable NV12 DRM modifier probing.
+  - `VulkanVideoDecoder` backed by FFmpeg `AV_HWDEVICE_TYPE_VULKAN` (`H.264`, `HEVC/H.265`, `VP9`, `AV1`) gated by probed GPU capabilities, with tiled/linear DMA-BUF output (`vkCmdCopyImage` with semaphore-narrowed pipeline barriers -> 2-plane DMA-BUF -> `MailboxVideoFrameConverter` `SharedImage`).
+  - Concurrent decoder cap (`kMaxConcurrentDecoders = 8`) with software fallback, reusable `AVPacket`/`AVFrame`/`VkCommandPool`/`VkCommandBuffer`/`VkFence`, same-config flush fast-path, and bounded DMA-BUF `OutputSlot` pool (`kMaxOutputPoolSize = 12`) with frame-lifetime tracking.
 - Target files:
   - `media/base/media_switches.{h,cc}` (`VulkanVideoDecode`)
   - `third_party/ffmpeg/` (Vulkan hwaccel & VP9/AV1/HEVC decoder enablement)
@@ -52,7 +52,7 @@ All `.patch` files are applied in the order listed in `patches/series` against C
 ### 5. `video-encode/`
 - **Vulkan Video Encoding (`VkVideo`)**:
   - `VulkanVideoEncodeAccelerator` backed by FFmpeg `h264_vulkan`, `hevc_vulkan`, and `av1_vulkan` (`VK_KHR_video_encode_queue`, dynamically gated by GPU capability probing via `VulkanVideoDevice`).
-  - Zero-copy GPU-to-GPU DMA-BUF input path (`CopyDmabufToVkFrame`: imports `MappableSharedImage`/`STORAGE_DMABUFS` native pixmap handles with explicit modifier/size validation into `AVVkFrame` via `vkCmdCopyImage`), with `ConvertToMemoryMappedFrame` CPU upload fallback.
+  - Zero-copy GPU-to-GPU DMA-BUF input path (`CopyDmabufToVkFrame`: imports `MappableSharedImage`/`STORAGE_DMABUFS` native pixmap handles with explicit modifier, image format property, and DMA-BUF size validation into `AVVkFrame` via `vkCmdCopyImage` with semaphore-narrowed barriers), with reusable `AVFrame`/`AVPacket`, low-latency tuning (`tune=ll`, `usage=stream`, `async_depth`), dynamic CBR/VBR bitrate updates, and `ConvertToMemoryMappedFrame` CPU upload fallback.
 - Target files:
   - `third_party/ffmpeg/` (`CONFIG_VULKAN_ENCODE`, `h264_vulkan`, `hevc_vulkan`, `av1_vulkan`)
   - `media/base/media_switches.{h,cc}` (`VulkanVideoEncode`)

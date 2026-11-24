@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.h
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,134 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -9,6 +9,9 @@
 +#define MEDIA_GPU_VULKAN_VULKAN_VIDEO_DEVICE_H_
 +
 +#include <vulkan/vulkan.h>
++
++#include <cstdint>
++#include <vector>
 +
 +#include "base/no_destructor.h"
 +#include "base/synchronization/lock.h"
@@ -56,12 +59,16 @@
 +      vkGetPhysicalDeviceFormatProperties2 = nullptr;
 +  PFN_vkGetPhysicalDeviceImageFormatProperties2
 +      vkGetPhysicalDeviceImageFormatProperties2 = nullptr;
++  PFN_vkGetImageDrmFormatModifierPropertiesEXT
++      vkGetImageDrmFormatModifierPropertiesEXT = nullptr;
 +};
 +
 +struct VkCopyInfo {
 +  VkCopyProcs procs;
 +  VkPhysicalDeviceMemoryProperties mem_props{};
++  std::vector<uint64_t> preferred_nv12_modifiers;
 +  uint32_t copy_queue_family = 0;
++  bool copy_queue_is_dedicated_transfer = false;
 +  bool procs_ready = false;
 +};
 +
@@ -130,14 +137,17 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DEVICE_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.cc
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,576 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
 +
 +#include "media/gpu/vulkan/vulkan_video_device.h"
 +
++#include <drm_fourcc.h>
++
 +#include <algorithm>
++#include <ios>
 +#include <string_view>
 +#include <vector>
 +
@@ -196,6 +206,7 @@
 +  LOAD_DEV_PROC(vkWaitForFences);
 +  LOAD_DEV_PROC(vkQueueSubmit);
 +  LOAD_DEV_PROC(vkGetDeviceQueue);
++  LOAD_DEV_PROC(vkGetImageDrmFormatModifierPropertiesEXT);
 +#undef LOAD_DEV_PROC
 +
 +  if (!info->procs.vkGetImageMemoryRequirements2) {
@@ -251,16 +262,118 @@
 +
 +  uint32_t qf =
 +      vk_dev->nb_qf > 0 ? static_cast<uint32_t>(vk_dev->qf[0].idx) : 0u;
++  bool dedicated_transfer = false;
 +  for (int qi = 0; qi < vk_dev->nb_qf; ++qi) {
-+    if (vk_dev->qf[qi].flags &
-+        (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT)) {
++    const VkQueueFlags flags = vk_dev->qf[qi].flags;
++    if ((flags & VK_QUEUE_TRANSFER_BIT) &&
++        !(flags & VK_QUEUE_GRAPHICS_BIT)) {
 +      qf = static_cast<uint32_t>(vk_dev->qf[qi].idx);
-+      if (vk_dev->qf[qi].flags & VK_QUEUE_GRAPHICS_BIT) {
-+        break;
++      dedicated_transfer = true;
++      break;
++    }
++  }
++  if (!dedicated_transfer) {
++    for (int qi = 0; qi < vk_dev->nb_qf; ++qi) {
++      const VkQueueFlags flags = vk_dev->qf[qi].flags;
++      if (flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT)) {
++        qf = static_cast<uint32_t>(vk_dev->qf[qi].idx);
++        if (flags & VK_QUEUE_GRAPHICS_BIT) {
++          break;
++        }
 +      }
 +    }
 +  }
 +  info->copy_queue_family = qf;
++  info->copy_queue_is_dedicated_transfer = dedicated_transfer;
++
++  info->preferred_nv12_modifiers.clear();
++  if (p.vkGetPhysicalDeviceFormatProperties2 && vk_dev->phys_dev) {
++    VkDrmFormatModifierPropertiesListEXT mod_list{
++        .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
++    };
++    VkFormatProperties2 fmt_props{
++        .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
++        .pNext = &mod_list,
++    };
++    p.vkGetPhysicalDeviceFormatProperties2(
++        vk_dev->phys_dev, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &fmt_props);
++    if (mod_list.drmFormatModifierCount > 0) {
++      std::vector<VkDrmFormatModifierPropertiesEXT> mod_props(
++          mod_list.drmFormatModifierCount);
++      mod_list.pDrmFormatModifierProperties = mod_props.data();
++      p.vkGetPhysicalDeviceFormatProperties2(
++          vk_dev->phys_dev, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, &fmt_props);
++
++      constexpr VkFormatFeatureFlags kRequiredFeatures =
++          VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
++      bool linear_supported = false;
++      for (const auto& mp : mod_props) {
++        if (mp.drmFormatModifierPlaneCount != 2 ||
++            (mp.drmFormatModifierTilingFeatures & kRequiredFeatures) !=
++                kRequiredFeatures) {
++          continue;
++        }
++        bool exportable = true;
++        if (p.vkGetPhysicalDeviceImageFormatProperties2) {
++          VkPhysicalDeviceImageDrmFormatModifierInfoEXT mod_info{
++              .sType =
++                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
++              .drmFormatModifier = mp.drmFormatModifier,
++              .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++          };
++          VkPhysicalDeviceExternalImageFormatInfo ext_info{
++              .sType =
++                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
++              .pNext = &mod_info,
++              .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++          };
++          VkPhysicalDeviceImageFormatInfo2 img_info{
++              .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
++              .pNext = &ext_info,
++              .format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
++              .type = VK_IMAGE_TYPE_2D,
++              .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++              .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++                       VK_IMAGE_USAGE_SAMPLED_BIT,
++          };
++          VkExternalImageFormatProperties ext_props{
++              .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
++          };
++          VkImageFormatProperties2 img_props{
++              .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
++              .pNext = &ext_props,
++          };
++          VkResult res = p.vkGetPhysicalDeviceImageFormatProperties2(
++              vk_dev->phys_dev, &img_info, &img_props);
++          exportable =
++              (res == VK_SUCCESS) &&
++              ((ext_props.externalMemoryProperties.externalMemoryFeatures &
++                VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) != 0);
++        }
++        if (!exportable) {
++          continue;
++        }
++        if (mp.drmFormatModifier == DRM_FORMAT_MOD_LINEAR) {
++          linear_supported = true;
++        } else {
++          info->preferred_nv12_modifiers.push_back(mp.drmFormatModifier);
++        }
++      }
++      if (linear_supported) {
++        info->preferred_nv12_modifiers.push_back(DRM_FORMAT_MOD_LINEAR);
++      }
++    }
++  }
++
++  VLOG(1) << "VulkanVideoDevice copy queue family=" << info->copy_queue_family
++          << " dedicated_transfer=" << info->copy_queue_is_dedicated_transfer
++          << " preferred_nv12_modifiers="
++          << info->preferred_nv12_modifiers.size()
++          << " first_mod=0x" << std::hex
++          << (info->preferred_nv12_modifiers.empty()
++                  ? 0ULL
++                  : info->preferred_nv12_modifiers.front())
++          << std::dec;
 +  info->procs_ready = true;
 +}
 +
@@ -603,7 +716,7 @@
 +}  // namespace media
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.h
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,93 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -628,6 +741,7 @@
 +struct AVBufferRef;
 +struct AVCodecContext;
 +struct AVFrame;
++struct AVPacket;
 +
 +namespace media {
 +
@@ -683,6 +797,8 @@
 +  AVBufferRef* hw_device_ctx_ = nullptr;
 +  std::unique_ptr<AVCodecContext, ScopedPtrAVFreeContext> codec_context_;
 +  std::unique_ptr<VulkanCopyState> copy_state_;
++  AVPacket* reusable_packet_ = nullptr;
++  AVFrame* reusable_hw_frame_ = nullptr;
 +  FrameResource* current_unpooled_origin_ = nullptr;
 +  bool has_decoder_slot_ = false;
 +  bool drm_prime_map_supported_ = true;
@@ -696,7 +812,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,1058 @@
+@@ -0,0 +1,1126 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -709,6 +825,7 @@
 +#include <algorithm>
 +#include <atomic>
 +#include <cstring>
++#include <ios>
 +#include <map>
 +#include <optional>
 +#include <vector>
@@ -815,11 +932,22 @@
 +  VkDeviceMemory dst_mem = VK_NULL_HANDLE;
 +
 +  uint64_t linear_mod = DRM_FORMAT_MOD_LINEAR;
++  uint64_t chosen_mod = DRM_FORMAT_MOD_LINEAR;
++  const bool try_preferred =
++      !info.preferred_nv12_modifiers.empty() &&
++      p.vkGetImageDrmFormatModifierPropertiesEXT != nullptr;
++  const uint64_t* mod_ptr =
++      try_preferred ? info.preferred_nv12_modifiers.data() : &linear_mod;
++  const uint32_t mod_count =
++      try_preferred
++          ? static_cast<uint32_t>(info.preferred_nv12_modifiers.size())
++          : 1u;
++
 +  VkImageDrmFormatModifierListCreateInfoEXT mod_list{
 +      .sType =
 +          VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
-+      .drmFormatModifierCount = 1,
-+      .pDrmFormatModifiers = &linear_mod,
++      .drmFormatModifierCount = mod_count,
++      .pDrmFormatModifiers = mod_ptr,
 +  };
 +  VkExternalMemoryImageCreateInfo ext_info{
 +      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -841,11 +969,36 @@
 +      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 +  };
 +  VkResult ci_res = p.vkCreateImage(vk_dev->act_dev, &img_ci, nullptr, &dst_img);
++  if (ci_res == VK_SUCCESS && try_preferred) {
++    VkImageDrmFormatModifierPropertiesEXT mod_props{
++        .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT,
++    };
++    if (p.vkGetImageDrmFormatModifierPropertiesEXT(vk_dev->act_dev, dst_img,
++                                                   &mod_props) == VK_SUCCESS) {
++      chosen_mod = mod_props.drmFormatModifier;
++    } else {
++      p.vkDestroyImage(vk_dev->act_dev, dst_img, nullptr);
++      dst_img = VK_NULL_HANDLE;
++      ci_res = VK_ERROR_UNKNOWN;
++    }
++  }
++  if (ci_res != VK_SUCCESS && try_preferred) {
++    mod_list.drmFormatModifierCount = 1;
++    mod_list.pDrmFormatModifiers = &linear_mod;
++    chosen_mod = DRM_FORMAT_MOD_LINEAR;
++    ci_res = p.vkCreateImage(vk_dev->act_dev, &img_ci, nullptr, &dst_img);
++  }
 +  if (ci_res != VK_SUCCESS) {
 +    LOG(WARNING) << "VulkanVideoDecoder: vkCreateImage 2PLANE failed: "
 +                 << ci_res;
 +    CleanupVkImageMemory(vk_dev, p, dst_img, dst_mem);
 +    return std::nullopt;
++  }
++  static bool logged_slot_mod = false;
++  if (!logged_slot_mod) {
++    logged_slot_mod = true;
++    VLOG(1) << "VulkanVideoDecoder: CreateDmabufSlot selected modifier=0x"
++            << std::hex << chosen_mod << std::dec;
 +  }
 +
 +  VkMemoryRequirements req{};
@@ -929,7 +1082,7 @@
 +
 +  auto layout = VideoFrameLayout::CreateWithPlanes(
 +      PIXEL_FORMAT_NV12, coded_size, std::move(planes),
-+      VideoFrameLayout::kBufferAddressAlignment, linear_mod);
++      VideoFrameLayout::kBufferAddressAlignment, chosen_mod);
 +  if (!layout) {
 +    CleanupVkImageMemory(vk_dev, p, dst_img, dst_mem);
 +    return std::nullopt;
@@ -1018,36 +1171,58 @@
 +  }
 +
 +  const bool two_imgs = (src_vk->img[1] != VK_NULL_HANDLE);
-+  VkImageAspectFlags src_aspect =
-+      two_imgs ? VK_IMAGE_ASPECT_COLOR_BIT
-+               : (VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT);
++  VkSemaphore sems[2] = {};
++  uint64_t wait_vals[2] = {};
++  uint64_t sig_vals[2] = {};
++  VkPipelineStageFlags wait_stages[2] = {
++      VK_PIPELINE_STAGE_TRANSFER_BIT,
++      VK_PIPELINE_STAGE_TRANSFER_BIT,
++  };
++  uint32_t sem_count = 0;
++  if (src_vk->sem[0] != VK_NULL_HANDLE) {
++    sems[sem_count] = src_vk->sem[0];
++    wait_vals[sem_count] = src_vk->sem_value[0];
++    sig_vals[sem_count] = src_vk->sem_value[0] + 1;
++    ++sem_count;
++  }
++  if (two_imgs && src_vk->sem[1] != VK_NULL_HANDLE &&
++      src_vk->sem[1] != src_vk->sem[0]) {
++    sems[sem_count] = src_vk->sem[1];
++    wait_vals[sem_count] = src_vk->sem_value[1];
++    sig_vals[sem_count] = src_vk->sem_value[1] + 1;
++    ++sem_count;
++  }
++  const VkPipelineStageFlags pre_src_stage =
++      (sem_count > 0) ? VK_PIPELINE_STAGE_TRANSFER_BIT
++                      : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++  const VkAccessFlags pre_src_access =
++      (sem_count > 0) ? 0u : VK_ACCESS_MEMORY_WRITE_BIT;
++
 +  VkImageMemoryBarrier pre[3]{
 +      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-+       .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++       .srcAccessMask = pre_src_access,
 +       .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 +       .oldLayout = src_vk->layout[0],
 +       .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 +       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 +       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 +       .image = src_vk->img[0],
-+       .subresourceRange = {src_aspect, 0, 1, 0, 1}},
++       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
 +      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-+       .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT,
++       .srcAccessMask = 0,
 +       .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
 +       .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 +       .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 +       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 +       .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 +       .image = dst_img,
-+       .subresourceRange = {VK_IMAGE_ASPECT_PLANE_0_BIT |
-+                                VK_IMAGE_ASPECT_PLANE_1_BIT,
-+                            0, 1, 0, 1}},
++       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
 +      {},
 +  };
 +  uint32_t pre_count = 2;
 +  if (two_imgs) {
 +    pre[2] = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-+              .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++              .srcAccessMask = pre_src_access,
 +              .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 +              .oldLayout = src_vk->layout[1],
 +              .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -1057,9 +1232,8 @@
 +              .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
 +    pre_count = 3;
 +  }
-+  p.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-+                         nullptr, pre_count, pre);
++  p.vkCmdPipelineBarrier(cb, pre_src_stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                         0, nullptr, 0, nullptr, pre_count, pre);
 +
 +  const uint32_t widths[2] = {static_cast<uint32_t>(w),
 +                              static_cast<uint32_t>((w + 1) / 2)};
@@ -1085,15 +1259,13 @@
 +  VkImageMemoryBarrier post{
 +      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 +      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-+      .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
++      .dstAccessMask = 0,
 +      .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 +      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
 +      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 +      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 +      .image = dst_img,
-+      .subresourceRange = {VK_IMAGE_ASPECT_PLANE_0_BIT |
-+                               VK_IMAGE_ASPECT_PLANE_1_BIT,
-+                           0, 1, 0, 1}};
++      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
 +  p.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
 +                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
 +                         nullptr, 1, &post);
@@ -1104,27 +1276,23 @@
 +  const uint32_t qf = info.copy_queue_family;
 +  VkQueue queue = VK_NULL_HANDLE;
 +  p.vkGetDeviceQueue(vk_dev->act_dev, qf, 0, &queue);
-+  VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-+  uint64_t wait_val = src_vk->sem_value[0];
-+  uint64_t sig_val = wait_val + 1;
 +  VkTimelineSemaphoreSubmitInfo tl_info{
 +      .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
-+      .waitSemaphoreValueCount = 1,
-+      .pWaitSemaphoreValues = &wait_val,
-+      .signalSemaphoreValueCount = 1,
-+      .pSignalSemaphoreValues = &sig_val,
++      .waitSemaphoreValueCount = sem_count,
++      .pWaitSemaphoreValues = wait_vals,
++      .signalSemaphoreValueCount = sem_count,
++      .pSignalSemaphoreValues = sig_vals,
 +  };
-+  const bool has_sem = (src_vk->sem[0] != VK_NULL_HANDLE);
 +  VkSubmitInfo si{
 +      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-+      .pNext = has_sem ? &tl_info : nullptr,
-+      .waitSemaphoreCount = has_sem ? 1u : 0u,
-+      .pWaitSemaphores = has_sem ? &src_vk->sem[0] : nullptr,
-+      .pWaitDstStageMask = has_sem ? &wait_stage : nullptr,
++      .pNext = sem_count > 0 ? &tl_info : nullptr,
++      .waitSemaphoreCount = sem_count,
++      .pWaitSemaphores = sem_count > 0 ? sems : nullptr,
++      .pWaitDstStageMask = sem_count > 0 ? wait_stages : nullptr,
 +      .commandBufferCount = 1,
 +      .pCommandBuffers = &cb,
-+      .signalSemaphoreCount = has_sem ? 1u : 0u,
-+      .pSignalSemaphores = has_sem ? &src_vk->sem[0] : nullptr,
++      .signalSemaphoreCount = sem_count,
++      .pSignalSemaphores = sem_count > 0 ? sems : nullptr,
 +  };
 +  if (vk_dev->lock_queue) {
 +    vk_dev->lock_queue(frames_ctx->device_ctx, qf, 0);
@@ -1136,14 +1304,22 @@
 +  if (sr == VK_SUCCESS) {
 +    src_vk->layout[0] = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 +    src_vk->access[0] = VK_ACCESS_2_TRANSFER_READ_BIT;
-+    src_vk->queue_family[0] = qf;
++    if (src_vk->queue_family[0] != VK_QUEUE_FAMILY_IGNORED) {
++      src_vk->queue_family[0] = qf;
++    }
 +    if (two_imgs) {
 +      src_vk->layout[1] = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 +      src_vk->access[1] = VK_ACCESS_2_TRANSFER_READ_BIT;
-+      src_vk->queue_family[1] = qf;
++      if (src_vk->queue_family[1] != VK_QUEUE_FAMILY_IGNORED) {
++        src_vk->queue_family[1] = qf;
++      }
 +    }
-+    if (has_sem) {
-+      src_vk->sem_value[0] = sig_val;
++    if (src_vk->sem[0] != VK_NULL_HANDLE) {
++      src_vk->sem_value[0] += 1;
++    }
++    if (two_imgs && src_vk->sem[1] != VK_NULL_HANDLE &&
++        src_vk->sem[1] != src_vk->sem[0]) {
++      src_vk->sem_value[1] += 1;
 +    }
 +  }
 +  VkResult wr = VK_ERROR_UNKNOWN;
@@ -1375,6 +1551,8 @@
 +
 +void VulkanVideoDecoder::ReleaseResources(bool release_slot) {
 +  codec_context_.reset();
++  av_packet_free(&reusable_packet_);
++  av_frame_free(&reusable_hw_frame_);
 +  if (copy_state_) {
 +    if (hw_device_ctx_) {
 +      auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ctx_->data);
@@ -1417,56 +1595,62 @@
 +    return;
 +  }
 +
-+  AVPacket* packet = av_packet_alloc();
-+  if (!packet) {
-+    std::move(bound_cb).Run(DecoderStatus::Codes::kOutOfMemory);
-+    return;
++  if (!reusable_packet_) {
++    reusable_packet_ = av_packet_alloc();
++    if (!reusable_packet_) {
++      std::move(bound_cb).Run(DecoderStatus::Codes::kOutOfMemory);
++      return;
++    }
++  } else {
++    av_packet_unref(reusable_packet_);
 +  }
 +
 +  if (buffer->end_of_stream()) {
-+    packet->data = nullptr;
-+    packet->size = 0;
++    reusable_packet_->data = nullptr;
++    reusable_packet_->size = 0;
 +  } else {
 +    auto span = base::span(*buffer);
-+    packet->data = const_cast<uint8_t*>(span.data());
-+    packet->size = base::checked_cast<int>(span.size());
-+    packet->pts =
++    reusable_packet_->data = const_cast<uint8_t*>(span.data());
++    reusable_packet_->size = base::checked_cast<int>(span.size());
++    reusable_packet_->pts =
 +        ConvertToTimeBase(codec_context_->pkt_timebase, buffer->timestamp());
 +  }
 +
-+  int ret = avcodec_send_packet(codec_context_.get(), packet);
-+  av_packet_free(&packet);
++  int ret = avcodec_send_packet(codec_context_.get(), reusable_packet_);
++  av_packet_unref(reusable_packet_);
 +  if (ret < 0 && ret != AVERROR_EOF) {
 +    std::move(bound_cb).Run(DecoderStatus::Codes::kFailed);
 +    return;
 +  }
 +
-+  AVFrame* hw_frame = av_frame_alloc();
-+  if (!hw_frame) {
-+    std::move(bound_cb).Run(DecoderStatus::Codes::kOutOfMemory);
-+    return;
++  if (!reusable_hw_frame_) {
++    reusable_hw_frame_ = av_frame_alloc();
++    if (!reusable_hw_frame_) {
++      std::move(bound_cb).Run(DecoderStatus::Codes::kOutOfMemory);
++      return;
++    }
++  } else {
++    av_frame_unref(reusable_hw_frame_);
 +  }
 +
 +  while (true) {
-+    ret = avcodec_receive_frame(codec_context_.get(), hw_frame);
++    ret = avcodec_receive_frame(codec_context_.get(), reusable_hw_frame_);
 +    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
 +      break;
 +    }
 +    if (ret < 0) {
-+      av_frame_free(&hw_frame);
++      av_frame_unref(reusable_hw_frame_);
 +      std::move(bound_cb).Run(DecoderStatus::Codes::kFailed);
 +      return;
 +    }
-+    if (!EmitFrame(hw_frame)) {
-+      av_frame_unref(hw_frame);
-+      av_frame_free(&hw_frame);
++    if (!EmitFrame(reusable_hw_frame_)) {
++      av_frame_unref(reusable_hw_frame_);
 +      std::move(bound_cb).Run(DecoderStatus::Codes::kFailed);
 +      return;
 +    }
-+    av_frame_unref(hw_frame);
++    av_frame_unref(reusable_hw_frame_);
 +  }
 +
-+  av_frame_free(&hw_frame);
 +  if (buffer->end_of_stream()) {
 +    eos_reached_ = true;
 +  }

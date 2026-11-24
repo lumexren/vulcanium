@@ -107,7 +107,7 @@
  #endif  // BUILDFLAG(IS_LINUX)
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_encode_accelerator.h
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,119 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -135,6 +135,7 @@
 +struct AVBufferRef;
 +struct AVCodecContext;
 +struct AVFrame;
++struct AVPacket;
 +
 +namespace media {
 +
@@ -206,6 +207,9 @@
 +  raw_ptr<AVBufferRef> hw_frames_ctx_ = nullptr;
 +  std::unique_ptr<AVCodecContext, ScopedPtrAVFreeContext> codec_context_;
 +  std::unique_ptr<VulkanEncodeCopyState> copy_state_;
++  AVFrame* reusable_hw_frame_ = nullptr;
++  AVFrame* reusable_sw_frame_ = nullptr;
++  AVPacket* reusable_packet_ = nullptr;
 +
 +  gfx::Size input_visible_size_;
 +  size_t output_buffer_size_ = 0;
@@ -225,7 +229,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_ENCODE_ACCELERATOR_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_encode_accelerator.cc
-@@ -0,0 +1,1271 @@
+@@ -0,0 +1,1340 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -298,6 +302,22 @@
 +      return AV_PROFILE_AV1_MAIN;
 +    default:
 +      return AV_PROFILE_UNKNOWN;
++  }
++}
++
++void SetOptionalAVOpt(AVCodecContext* ctx, const char* name, const char* val) {
++  int err = av_opt_set(ctx, name, val, AV_OPT_SEARCH_CHILDREN);
++  if (err < 0 && err != AVERROR_OPTION_NOT_FOUND) {
++    VLOG(1) << "VulkanVideoEncodeAccelerator: av_opt_set(" << name << "="
++            << val << ") failed: " << AVErrorToString(err);
++  }
++}
++
++void SetOptionalAVOptInt(AVCodecContext* ctx, const char* name, int64_t val) {
++  int err = av_opt_set_int(ctx, name, val, AV_OPT_SEARCH_CHILDREN);
++  if (err < 0 && err != AVERROR_OPTION_NOT_FOUND) {
++    VLOG(1) << "VulkanVideoEncodeAccelerator: av_opt_set_int(" << name << "="
++            << val << ") failed: " << AVErrorToString(err);
 +  }
 +}
 +
@@ -733,13 +753,40 @@
 +  }
 +
 +  const bool two_dst_imgs = (dst_vk->img[1] != VK_NULL_HANDLE);
++  VkSemaphore sems[2] = {};
++  uint64_t wait_vals[2] = {};
++  uint64_t sig_vals[2] = {};
++  VkPipelineStageFlags wait_stages[2] = {
++      VK_PIPELINE_STAGE_TRANSFER_BIT,
++      VK_PIPELINE_STAGE_TRANSFER_BIT,
++  };
++  uint32_t sem_count = 0;
++  if (dst_vk->sem[0] != VK_NULL_HANDLE) {
++    sems[sem_count] = dst_vk->sem[0];
++    wait_vals[sem_count] = dst_vk->sem_value[0];
++    sig_vals[sem_count] = dst_vk->sem_value[0] + 1;
++    ++sem_count;
++  }
++  if (two_dst_imgs && dst_vk->sem[1] != VK_NULL_HANDLE &&
++      dst_vk->sem[1] != dst_vk->sem[0]) {
++    sems[sem_count] = dst_vk->sem[1];
++    wait_vals[sem_count] = dst_vk->sem_value[1];
++    sig_vals[sem_count] = dst_vk->sem_value[1] + 1;
++    ++sem_count;
++  }
++  const VkPipelineStageFlags pre_src_stage =
++      (sem_count > 0) ? VK_PIPELINE_STAGE_TRANSFER_BIT
++                      : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++  const VkAccessFlags dst_src_access =
++      (sem_count > 0) ? 0u : VK_ACCESS_MEMORY_READ_BIT;
++
 +  const VkImageAspectFlags src_aspect_barrier =
 +      disjoint ? (VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT)
 +               : VK_IMAGE_ASPECT_COLOR_BIT;
 +  const VkImageAspectFlags dst_aspect0 = VK_IMAGE_ASPECT_COLOR_BIT;
 +  VkImageMemoryBarrier pre[3]{
 +      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-+       .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++       .srcAccessMask = (sem_count > 0) ? 0u : VK_ACCESS_MEMORY_WRITE_BIT,
 +       .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 +       .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
 +       .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -748,7 +795,7 @@
 +       .image = src_img,
 +       .subresourceRange = {src_aspect_barrier, 0, 1, 0, 1}},
 +      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-+       .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT,
++       .srcAccessMask = dst_src_access,
 +       .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
 +       .oldLayout = dst_vk->layout[0],
 +       .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -761,7 +808,7 @@
 +  uint32_t pre_count = 2;
 +  if (two_dst_imgs) {
 +    pre[2] = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-+              .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT,
++              .srcAccessMask = dst_src_access,
 +              .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
 +              .oldLayout = dst_vk->layout[1],
 +              .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -771,9 +818,8 @@
 +              .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
 +    pre_count = 3;
 +  }
-+  p.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-+                         nullptr, pre_count, pre);
++  p.vkCmdPipelineBarrier(cb, pre_src_stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
++                         0, nullptr, 0, nullptr, pre_count, pre);
 +
 +  const int vis_x = std::max(0, visible_rect.x()) & ~1;
 +  const int vis_y = std::max(0, visible_rect.y()) & ~1;
@@ -823,27 +869,6 @@
 +  const uint32_t qf = info.copy_queue_family;
 +  VkQueue queue = VK_NULL_HANDLE;
 +  p.vkGetDeviceQueue(vk_dev->act_dev, qf, 0, &queue);
-+  VkSemaphore sems[2] = {};
-+  uint64_t wait_vals[2] = {};
-+  uint64_t sig_vals[2] = {};
-+  VkPipelineStageFlags wait_stages[2] = {
-+      VK_PIPELINE_STAGE_TRANSFER_BIT,
-+      VK_PIPELINE_STAGE_TRANSFER_BIT,
-+  };
-+  uint32_t sem_count = 0;
-+  if (dst_vk->sem[0] != VK_NULL_HANDLE) {
-+    sems[sem_count] = dst_vk->sem[0];
-+    wait_vals[sem_count] = dst_vk->sem_value[0];
-+    sig_vals[sem_count] = dst_vk->sem_value[0] + 1;
-+    ++sem_count;
-+  }
-+  if (two_dst_imgs && dst_vk->sem[1] != VK_NULL_HANDLE &&
-+      dst_vk->sem[1] != dst_vk->sem[0]) {
-+    sems[sem_count] = dst_vk->sem[1];
-+    wait_vals[sem_count] = dst_vk->sem_value[1];
-+    sig_vals[sem_count] = dst_vk->sem_value[1] + 1;
-+    ++sem_count;
-+  }
 +  VkTimelineSemaphoreSubmitInfo tl_info{
 +      .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
 +      .waitSemaphoreValueCount = sem_count,
@@ -1109,9 +1134,28 @@
 +    codec_context_->rc_min_rate = target_bps;
 +    codec_context_->rc_max_rate = target_bps;
 +    codec_context_->rc_buffer_size = static_cast<int>(target_bps);
-+  } else if (config.bitrate.peak_bps() > 0) {
-+    codec_context_->rc_max_rate = config.bitrate.peak_bps();
++    SetOptionalAVOpt(codec_context_.get(), "rc_mode", "cbr");
++  } else {
++    codec_context_->rc_min_rate = 0;
++    codec_context_->rc_max_rate = config.bitrate.peak_bps() > 0
++                                      ? config.bitrate.peak_bps()
++                                      : target_bps;
++    codec_context_->rc_buffer_size =
++        static_cast<int>(codec_context_->rc_max_rate);
++    SetOptionalAVOpt(codec_context_.get(), "rc_mode", "vbr");
 +  }
++
++  if (config.require_low_delay) {
++    SetOptionalAVOpt(codec_context_.get(), "tune", "ll");
++    SetOptionalAVOpt(codec_context_.get(), "usage", "stream");
++    SetOptionalAVOptInt(codec_context_.get(), "async_depth", 1);
++  } else {
++    SetOptionalAVOptInt(codec_context_.get(), "async_depth", 2);
++  }
++  SetOptionalAVOpt(
++      codec_context_.get(), "content",
++      config.content_type == Config::ContentType::kDisplay ? "desktop"
++                                                           : "camera");
 +
 +  err = avcodec_open2(codec_context_.get(), codec, nullptr);
 +  if (err < 0) {
@@ -1120,9 +1164,10 @@
 +    return false;
 +  }
 +
-+  LOG(WARNING) << "VulkanVideoEncodeAccelerator: initialized " << encoder_name
-+               << " (" << codec_context_->width << "x"
-+               << codec_context_->height << ")";
++  VLOG(1) << "VulkanVideoEncodeAccelerator: initialized " << encoder_name
++          << " (" << codec_context_->width << "x"
++          << codec_context_->height << ", low_delay=" << config.require_low_delay
++          << ")";
 +  return true;
 +}
 +
@@ -1210,16 +1255,20 @@
 +    return;
 +  }
 +
-+  AVFrame* hw_frame = av_frame_alloc();
-+  if (!hw_frame) {
-+    has_error_ = true;
-+    client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
-+    return;
++  if (!reusable_hw_frame_) {
++    reusable_hw_frame_ = av_frame_alloc();
++    if (!reusable_hw_frame_) {
++      has_error_ = true;
++      client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
++      return;
++    }
++  } else {
++    av_frame_unref(reusable_hw_frame_);
 +  }
 +
-+  int err = av_hwframe_get_buffer(hw_frames_ctx_, hw_frame, 0);
++  int err = av_hwframe_get_buffer(hw_frames_ctx_, reusable_hw_frame_, 0);
 +  if (err < 0) {
-+    av_frame_free(&hw_frame);
++    av_frame_unref(reusable_hw_frame_);
 +    LOG(ERROR) << "VulkanVideoEncodeAccelerator: av_hwframe_get_buffer failed: "
 +               << AVErrorToString(err);
 +    has_error_ = true;
@@ -1227,7 +1276,7 @@
 +    return;
 +  }
 +
-+  bool uploaded = TryEncodeZeroCopyDmabuf(*frame, hw_frame);
++  bool uploaded = TryEncodeZeroCopyDmabuf(*frame, reusable_hw_frame_);
 +  if (uploaded) {
 +    if (!logged_zero_copy_) {
 +      logged_zero_copy_ = true;
@@ -1240,7 +1289,7 @@
 +    }
 +    if (!cpu_frame || !cpu_frame->HasDirectCpuAccess() ||
 +        !cpu_frame->visible_data(VideoFrame::Plane::kY)) {
-+      av_frame_free(&hw_frame);
++      av_frame_unref(reusable_hw_frame_);
 +      has_error_ = true;
 +      client_->NotifyErrorStatus(
 +          {EncoderStatus::Codes::kUnsupportedFrameFormat,
@@ -1248,21 +1297,31 @@
 +      return;
 +    }
 +
-+    AVFrame* sw_frame = av_frame_alloc();
-+    if (!sw_frame) {
-+      av_frame_free(&hw_frame);
-+      has_error_ = true;
-+      client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
-+      return;
++    if (!reusable_sw_frame_) {
++      reusable_sw_frame_ = av_frame_alloc();
++      if (!reusable_sw_frame_) {
++        av_frame_unref(reusable_hw_frame_);
++        has_error_ = true;
++        client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
++        return;
++      }
 +    }
 +
-+    sw_frame->format = AV_PIX_FMT_NV12;
-+    sw_frame->width = codec_context_->width;
-+    sw_frame->height = codec_context_->height;
-+    err = av_frame_get_buffer(sw_frame, 32);
++    if (!reusable_sw_frame_->buf[0] ||
++        reusable_sw_frame_->format != AV_PIX_FMT_NV12 ||
++        reusable_sw_frame_->width != codec_context_->width ||
++        reusable_sw_frame_->height != codec_context_->height) {
++      av_frame_unref(reusable_sw_frame_);
++      reusable_sw_frame_->format = AV_PIX_FMT_NV12;
++      reusable_sw_frame_->width = codec_context_->width;
++      reusable_sw_frame_->height = codec_context_->height;
++      err = av_frame_get_buffer(reusable_sw_frame_, 32);
++    } else {
++      err = av_frame_make_writable(reusable_sw_frame_);
++    }
 +    if (err < 0) {
-+      av_frame_free(&sw_frame);
-+      av_frame_free(&hw_frame);
++      av_frame_unref(reusable_sw_frame_);
++      av_frame_unref(reusable_hw_frame_);
 +      has_error_ = true;
 +      client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
 +      return;
@@ -1279,8 +1338,8 @@
 +          cpu_frame->stride(VideoFrame::Plane::kY),
 +          cpu_frame->visible_data(VideoFrame::Plane::kUV),
 +          cpu_frame->stride(VideoFrame::Plane::kUV),
-+          sw_frame->data[0], sw_frame->linesize[0],
-+          sw_frame->data[1], sw_frame->linesize[1],
++          reusable_sw_frame_->data[0], reusable_sw_frame_->linesize[0],
++          reusable_sw_frame_->data[1], reusable_sw_frame_->linesize[1],
 +          copy_w, copy_h);
 +    } else if (cpu_frame->format() == PIXEL_FORMAT_I420) {
 +      libyuv::I420ToNV12(
@@ -1290,22 +1349,19 @@
 +          cpu_frame->stride(VideoFrame::Plane::kU),
 +          cpu_frame->visible_data(VideoFrame::Plane::kV),
 +          cpu_frame->stride(VideoFrame::Plane::kV),
-+          sw_frame->data[0], sw_frame->linesize[0],
-+          sw_frame->data[1], sw_frame->linesize[1],
++          reusable_sw_frame_->data[0], reusable_sw_frame_->linesize[0],
++          reusable_sw_frame_->data[1], reusable_sw_frame_->linesize[1],
 +          copy_w, copy_h);
 +    } else {
-+      av_frame_free(&sw_frame);
-+      av_frame_free(&hw_frame);
++      av_frame_unref(reusable_hw_frame_);
 +      has_error_ = true;
 +      client_->NotifyErrorStatus(EncoderStatus::Codes::kUnsupportedFrameFormat);
 +      return;
 +    }
 +
-+    err = av_hwframe_transfer_data(hw_frame, sw_frame, 0);
-+    av_frame_free(&sw_frame);
-+
++    err = av_hwframe_transfer_data(reusable_hw_frame_, reusable_sw_frame_, 0);
 +    if (err < 0) {
-+      av_frame_free(&hw_frame);
++      av_frame_unref(reusable_hw_frame_);
 +      LOG(ERROR) << "VulkanVideoEncodeAccelerator: hwframe upload failed: "
 +                 << AVErrorToString(err);
 +      has_error_ = true;
@@ -1314,14 +1370,13 @@
 +    }
 +  }
 +
-+  hw_frame->pts = frame->timestamp().InMicroseconds();
-+  if (force_keyframe) {
-+    hw_frame->pict_type = AV_PICTURE_TYPE_I;
-+  }
++  reusable_hw_frame_->pts = frame->timestamp().InMicroseconds();
++  reusable_hw_frame_->pict_type =
++      force_keyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
 +  pending_timestamps_.push_back(frame->timestamp());
 +
-+  err = avcodec_send_frame(codec_context_.get(), hw_frame);
-+  av_frame_free(&hw_frame);
++  err = avcodec_send_frame(codec_context_.get(), reusable_hw_frame_);
++  av_frame_unref(reusable_hw_frame_);
 +
 +  if (err < 0) {
 +    LOG(ERROR) << "VulkanVideoEncodeAccelerator: avcodec_send_frame failed: "
@@ -1336,13 +1391,17 @@
 +}
 +
 +void VulkanVideoEncodeAccelerator::DrainPackets() {
-+  AVPacket* pkt = av_packet_alloc();
-+  if (!pkt) {
-+    return;
++  if (!reusable_packet_) {
++    reusable_packet_ = av_packet_alloc();
++    if (!reusable_packet_) {
++      return;
++    }
++  } else {
++    av_packet_unref(reusable_packet_);
 +  }
 +
 +  while (true) {
-+    int err = avcodec_receive_packet(codec_context_.get(), pkt);
++    int err = avcodec_receive_packet(codec_context_.get(), reusable_packet_);
 +    if (err == AVERROR(EAGAIN) || err == AVERROR_EOF) {
 +      break;
 +    }
@@ -1356,19 +1415,18 @@
 +    }
 +
 +    PendingOutput out;
-+    out.data.assign(pkt->data, pkt->data + pkt->size);
-+    out.key_frame = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
++    out.data.assign(reusable_packet_->data,
++                    reusable_packet_->data + reusable_packet_->size);
++    out.key_frame = (reusable_packet_->flags & AV_PKT_FLAG_KEY) != 0;
 +    if (!pending_timestamps_.empty()) {
 +      out.timestamp = pending_timestamps_.front();
 +      pending_timestamps_.pop_front();
 +    } else {
-+      out.timestamp = base::Microseconds(pkt->pts);
++      out.timestamp = base::Microseconds(reusable_packet_->pts);
 +    }
 +    pending_outputs_.push_back(std::move(out));
-+    av_packet_unref(pkt);
++    av_packet_unref(reusable_packet_);
 +  }
-+
-+  av_packet_free(&pkt);
 +}
 +
 +void VulkanVideoEncodeAccelerator::UseOutputBitstreamBuffer(
@@ -1425,7 +1483,19 @@
 +    return;
 +  }
 +  if (bitrate.target_bps() > 0) {
-+    codec_context_->bit_rate = bitrate.target_bps();
++    const int64_t target_bps = bitrate.target_bps();
++    codec_context_->bit_rate = target_bps;
++    if (bitrate.mode() == Bitrate::Mode::kConstant) {
++      codec_context_->rc_min_rate = target_bps;
++      codec_context_->rc_max_rate = target_bps;
++      codec_context_->rc_buffer_size = static_cast<int>(target_bps);
++    } else {
++      codec_context_->rc_min_rate = 0;
++      codec_context_->rc_max_rate =
++          bitrate.peak_bps() > 0 ? bitrate.peak_bps() : target_bps;
++      codec_context_->rc_buffer_size =
++          static_cast<int>(codec_context_->rc_max_rate);
++    }
 +  }
 +  if (framerate > 0) {
 +    codec_context_->framerate =
@@ -1462,6 +1532,9 @@
 +
 +void VulkanVideoEncodeAccelerator::ReleaseResources() {
 +  codec_context_.reset();
++  av_packet_free(&reusable_packet_);
++  av_frame_free(&reusable_sw_frame_);
++  av_frame_free(&reusable_hw_frame_);
 +  if (copy_state_) {
 +    if (hw_device_ctx_) {
 +      auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ctx_->data);
