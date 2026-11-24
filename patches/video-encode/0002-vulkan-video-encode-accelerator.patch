@@ -107,7 +107,7 @@
  #endif  // BUILDFLAG(IS_LINUX)
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_encode_accelerator.h
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,121 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -212,6 +212,7 @@
 +  AVFrame* reusable_sw_frame_ = nullptr;
 +  AVPacket* reusable_packet_ = nullptr;
 +
++  Config active_config_;
 +  gfx::Size input_visible_size_;
 +  size_t output_buffer_size_ = 0;
 +  bool initialized_ = false;
@@ -230,7 +231,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_ENCODE_ACCELERATOR_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_encode_accelerator.cc
-@@ -0,0 +1,1435 @@
+@@ -0,0 +1,1511 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -320,6 +321,53 @@
 +  if (err < 0 && err != AVERROR_OPTION_NOT_FOUND) {
 +    VLOG(1) << "VulkanVideoEncodeAccelerator: av_opt_set_int(" << name << "="
 +            << val << ") failed: " << AVErrorToString(err);
++  }
++}
++
++bool ValidateEncodeSize(VideoCodecProfile profile, const gfx::Size& size) {
++  if (size.IsEmpty()) {
++    return false;
++  }
++  const auto& caps = VulkanVideoDevice::GetInstance()->GetCapabilities();
++  const CodecCapability* cap = nullptr;
++  if (profile >= H264PROFILE_MIN && profile <= H264PROFILE_MAX) {
++    cap = &caps.encode_h264;
++  } else if (profile >= HEVCPROFILE_MIN && profile <= HEVCPROFILE_MAX) {
++    cap = &caps.encode_hevc;
++  } else if (profile >= AV1PROFILE_MIN && profile <= AV1PROFILE_MAX) {
++    cap = &caps.encode_av1;
++  }
++  if (!cap || !cap->supported) {
++    return false;
++  }
++  return size.width() >= cap->min_size.width() &&
++         size.height() >= cap->min_size.height() &&
++         size.width() <= cap->max_size.width() &&
++         size.height() <= cap->max_size.height();
++}
++
++void ApplyDynamicRateAndFramerate(AVCodecContext* ctx,
++                                  const Bitrate& bitrate,
++                                  uint32_t framerate) {
++  if (!ctx) {
++    return;
++  }
++  if (bitrate.target_bps() > 0) {
++    const int64_t target_bps = bitrate.target_bps();
++    ctx->bit_rate = target_bps;
++    if (bitrate.mode() == Bitrate::Mode::kConstant) {
++      ctx->rc_min_rate = target_bps;
++      ctx->rc_max_rate = target_bps;
++      ctx->rc_buffer_size = static_cast<int>(target_bps);
++    } else {
++      ctx->rc_min_rate = 0;
++      ctx->rc_max_rate =
++          bitrate.peak_bps() > 0 ? bitrate.peak_bps() : target_bps;
++      ctx->rc_buffer_size = static_cast<int>(ctx->rc_max_rate);
++    }
++  }
++  if (framerate > 0) {
++    ctx->framerate = AVRational{static_cast<int>(framerate), 1};
 +  }
 +}
 +
@@ -1090,6 +1138,7 @@
 +    return EncoderStatus::Codes::kEncoderInitializationError;
 +  }
 +
++  active_config_ = config;
 +  input_visible_size_ = config.input_visible_size;
 +  output_buffer_size_ =
 +      std::max<size_t>(kMinOutputBufferSize, input_visible_size_.GetArea() * 2);
@@ -1101,7 +1150,7 @@
 +  info.implementation_name = "VulkanVideoEncodeAccelerator";
 +  info.is_hardware_accelerated = true;
 +  info.supports_native_handle = true;
-+  info.supports_frame_size_change = false;
++  info.supports_frame_size_change = true;
 +  client_->NotifyEncoderInfoChange(info);
 +
 +  client_->RequireBitstreamBuffers(/*input_count=*/2, input_visible_size_,
@@ -1543,28 +1592,56 @@
 +    uint32_t framerate,
 +    const std::optional<gfx::Size>& size) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
-+  if (!codec_context_) {
++  if (!initialized_ || has_error_ || !codec_context_) {
 +    return;
 +  }
 +  if (bitrate.target_bps() > 0) {
-+    const int64_t target_bps = bitrate.target_bps();
-+    codec_context_->bit_rate = target_bps;
-+    if (bitrate.mode() == Bitrate::Mode::kConstant) {
-+      codec_context_->rc_min_rate = target_bps;
-+      codec_context_->rc_max_rate = target_bps;
-+      codec_context_->rc_buffer_size = static_cast<int>(target_bps);
-+    } else {
-+      codec_context_->rc_min_rate = 0;
-+      codec_context_->rc_max_rate =
-+          bitrate.peak_bps() > 0 ? bitrate.peak_bps() : target_bps;
-+      codec_context_->rc_buffer_size =
-+          static_cast<int>(codec_context_->rc_max_rate);
-+    }
++    active_config_.bitrate = bitrate;
 +  }
 +  if (framerate > 0) {
-+    codec_context_->framerate =
-+        AVRational{static_cast<int>(framerate), 1};
++    active_config_.framerate = framerate;
 +  }
++  if (size.has_value()) {
++    if (size->IsEmpty() ||
++        !ValidateEncodeSize(active_config_.output_profile, *size)) {
++      has_error_ = true;
++      client_->NotifyErrorStatus({EncoderStatus::Codes::kEncoderUnsupportedConfig,
++                                  "Unsupported Vulkan encode frame size"});
++      return;
++    }
++    if (*size != input_visible_size_) {
++      int err = avcodec_send_frame(codec_context_.get(), nullptr);
++      if (err >= 0 || err == AVERROR_EOF) {
++        DrainPackets();
++        DrainOutputs();
++      }
++      if (has_error_) {
++        return;
++      }
++      active_config_.input_visible_size = *size;
++      if (!ConfigureEncoder(active_config_)) {
++        ReleaseResources();
++        has_error_ = true;
++        client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderInitializationError);
++        return;
++      }
++      input_visible_size_ = *size;
++      output_buffer_size_ = std::max<size_t>(
++          kMinOutputBufferSize, input_visible_size_.GetArea() * 2);
++      initialized_ = true;
++      has_error_ = false;
++      logged_zero_copy_ = false;
++      VLOG(1) << "VulkanVideoEncodeAccelerator: reconfigured frame size to "
++              << input_visible_size_.ToString();
++    } else {
++      ApplyDynamicRateAndFramerate(codec_context_.get(), bitrate, framerate);
++      available_bitstream_buffers_.clear();
++    }
++    client_->RequireBitstreamBuffers(/*input_count=*/2, input_visible_size_,
++                                     output_buffer_size_);
++    return;
++  }
++  ApplyDynamicRateAndFramerate(codec_context_.get(), bitrate, framerate);
 +}
 +
 +void VulkanVideoEncodeAccelerator::Flush(FlushCallback flush_callback) {

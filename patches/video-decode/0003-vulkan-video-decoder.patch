@@ -1,3 +1,28 @@
+--- a/media/base/decoder.h
++++ b/media/base/decoder.h
+@@ -59,9 +59,10 @@
+   kTesting = 17,       // Never send this to UKM, for tests only.
+   kOutOfProcess = 18,  // OOPVideoDecoder (Linux and ChromeOS)
+   kVideoToolbox = 19,  // VideoToolboxVideoDecoder (Mac)
++  kVulkan = 20,        // VulkanVideoDecoder (Linux)
+ 
+   // Keep this at the end and equal to the last entry.
+-  kMaxValue = kVideoToolbox
++  kMaxValue = kVulkan
+ };
+ 
+ MEDIA_EXPORT const char* GetDecoderName(AudioDecoderType type);
+--- a/media/base/decoder.cc
++++ b/media/base/decoder.cc
+@@ -59,6 +59,8 @@
+       return "OOPVideoDecoder";
+     case VideoDecoderType::kVideoToolbox:
+       return "VideoToolboxVideoDecoder";
++    case VideoDecoderType::kVulkan:
++      return "VulkanVideoDecoder";
+   }
+ }
+ 
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.h
 @@ -0,0 +1,147 @@
@@ -1646,7 +1671,7 @@
 +}
 +
 +VideoDecoderType VulkanVideoDecoder::GetDecoderType() const {
-+  return VideoDecoderType::kFFmpeg;
++  return VideoDecoderType::kVulkan;
 +}
 +
 +bool VulkanVideoDecoder::FramesHoldExternalResources() const {
@@ -2436,3 +2461,15 @@
      VideoDecoderType decoder_implementation =
          GetActualPlatformDecoderImplementation(gpu_preferences_, gpu_info_);
      base::UmaHistogramEnumeration("Media.VaapiLinux.SupportedVideoDecoder",
+@@ -235,6 +258,11 @@
+   }
+ 
+   VideoDecoderType GetPlatformDecoderImplementationType() final {
++#if BUILDFLAG(ENABLE_VULKAN)
++    if (base::FeatureList::IsEnabled(kVulkanVideoDecode)) {
++      return VideoDecoderType::kVulkan;
++    }
++#endif
+     // Determine the preferred decoder based purely on compile-time and run-time
+     // flags. This is not intended to determine whether the selected decoder can
+     // be successfully initialized or used to decode.
