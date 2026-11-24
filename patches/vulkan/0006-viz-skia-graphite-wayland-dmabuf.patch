@@ -53,3 +53,79 @@
               base::FEATURE_ENABLED_BY_DEFAULT
  #else
               base::FEATURE_DISABLED_BY_DEFAULT
+--- a/media/gpu/chromeos/mailbox_video_frame_converter.cc
++++ b/media/gpu/chromeos/mailbox_video_frame_converter.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "media/gpu/chromeos/mailbox_video_frame_converter.h"
+ 
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/location.h"
+@@ -15,6 +16,7 @@
+ #include "components/viz/common/resources/shared_image_format.h"
+ #include "gpu/command_buffer/client/client_shared_image.h"
+ #include "gpu/command_buffer/common/shared_image_usage.h"
++#include "gpu/config/gpu_finch_features.h"
+ #include "gpu/ipc/service/gpu_channel.h"
+ #include "gpu/ipc/service/gpu_channel_shared_image_interface.h"
+ #include "media/base/format_utils.h"
+@@ -231,8 +233,13 @@
+   }
+ #if BUILDFLAG(IS_CHROMEOS) || BUILDFLAG(IS_LINUX)
+   // If format is true multiplanar format, we prefer external sampler on
+-  // ChromeOS and Linux.
+-  if (si_format->is_multi_plane()) {
++  // ChromeOS and Linux. Under Skia Graphite on Linux, Dawn does not enable
++  // Vulkan YCbCr external samplers, so keep per-plane sampling so Graphite
++  // uses its multi-plane YUVA path (Plane0 R8 + Plane1 RG8 -> RGB) instead of
++  // sampling only Plane0 (Y) into the red channel.
++  if (si_format->is_multi_plane() &&
++      !features::IsSkiaGraphiteEnabled(
++          base::CommandLine::ForCurrentProcess())) {
+     si_format->SetPrefersExternalSampler();
+   }
+ #endif
+--- a/content/browser/gpu/compositor_util.cc
++++ b/content/browser/gpu/compositor_util.cc
+@@ -230,23 +230,39 @@
+   std::string gpu_access_blocked_reason;
+   bool gpu_access_blocked;
+   gpu::GpuFeatureInfo gpu_feature_info;
++  gpu::GPUInfo gpu_info;
+   bool is_gpu_compositing_disabled;
+   if (type == GpuFeatureInfoType::kCurrent) {
+     gpu_access_blocked = !manager->GpuAccessAllowed(&gpu_access_blocked_reason);
+     gpu_feature_info = manager->GetGpuFeatureInfo();
++    gpu_info = manager->GetGPUInfo();
+     is_gpu_compositing_disabled = manager->IsGpuCompositingDisabled();
+   } else {
+     gpu_access_blocked =
+         !manager->GpuAccessAllowedForHardwareGpu(&gpu_access_blocked_reason);
+     gpu_feature_info = manager->GetGpuFeatureInfoForHardwareGpu();
++    gpu_info = manager->GetGPUInfoForHardwareGpu();
+     is_gpu_compositing_disabled =
+         manager->IsGpuCompositingDisabledForHardwareGpu();
+   }
+ 
++  const bool graphite_uses_vulkan =
++      SafeGetFeatureStatus(gpu_feature_info,
++                           gpu::GPU_FEATURE_TYPE_SKIA_GRAPHITE) ==
++          gpu::kGpuFeatureStatusEnabled &&
++      (gpu_info.skia_backend_type ==
++           gpu::SkiaBackendType::kGraphiteDawnVulkan ||
++       gpu_info.skia_backend_type == gpu::SkiaBackendType::kGraphiteVulkan);
++
+   base::DictValue feature_status_dict;
+ 
+   for (auto& gpu_feature_data :
+        GetGpuFeatureData(gpu_feature_info, is_gpu_compositing_disabled)) {
++    if (gpu_feature_data.name == "vulkan" &&
++        gpu_feature_data.status == gpu::kGpuFeatureStatusDisabled &&
++        graphite_uses_vulkan) {
++      gpu_feature_data.status = gpu::kGpuFeatureStatusEnabled;
++    }
+     std::string status;
+     // Features undergoing a finch controlled roll out.
+     if (gpu_feature_data.name == "direct_rendering_display_compositor") {

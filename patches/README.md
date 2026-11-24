@@ -24,13 +24,13 @@ All `.patch` files are applied in the order listed in `patches/series` against C
   - Drops `VkExportMemoryAllocateInfo` when importing DMA-BUFs into `VulkanImage` so NVIDIA out-of-process GPU mode doesn't create shadow allocations / black screens (`0003`).
   - Uses YCbCr-compatible Vulkan image usage flags (`SAMPLED | TRANSFER_SRC | TRANSFER_DST`) when importing multi-planar NV12/P010 DMA-BUFs, filters modifiers by `VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT`, and queries `VK_IMAGE_ASPECT_MEMORY_PLANE_i_BIT_EXT` subresource layouts with `VK_IMAGE_ASPECT_PLANE_i_BIT` fallback (`0004`).
   - Matches `disable_rgb_to_yuv_conversion` (`gpu_driver_bug_list.json` #474) by NVIDIA PCI vendor ID (`0x10de`) instead of OpenGL vendor string so Skia+ANGLE+Vulkan also avoids broken hardware RGB->YUV conversion into 2-plane NV12 pixmaps (`0005`).
-  - Experimental Linux Wayland Skia Graphite + Dawn Vulkan support (`SkiaOutputDeviceBufferQueue` in `InitializeForDawn`, `SharedTextureMemoryDmaBuf` in `DawnContextProvider` / `WebGPUDecoderImpl`, and `kSkiaGraphiteUsePersistentCache` enabled on Linux, `0006`; upstream Dawn `PhysicalDeviceVk` still lacks `MultiPlanarFormatP010` / `kDrmFormatP010` and `PaintCanvasVideoRenderer` still lacks NV12 `CopySharedImage` readback on Linux).
+  - Experimental Linux Wayland Skia Graphite + Dawn Vulkan support (`SkiaOutputDeviceBufferQueue` in `InitializeForDawn`, `SharedTextureMemoryDmaBuf` in `DawnContextProvider` / `WebGPUDecoderImpl`, `kSkiaGraphiteUsePersistentCache` enabled on Linux, per-plane multi-planar video sampling instead of Linux external-sampler Y-channel-only red rendering or `PaintCanvasVideoRenderer` readback failures on 8-bit NV12, and reporting `Vulkan: Enabled` on `chrome://gpu` when Graphite uses a Vulkan backend, `0006`; upstream Dawn `PhysicalDeviceVk` still lacks `MultiPlanarFormatP010` / `kDrmFormatP010`).
 - Target files:
   - `third_party/angle/src/libANGLE/renderer/vulkan/linux/DmaBufImageSiblingVkLinux.cpp`
   - `gpu/command_buffer/service/shared_image/skia_vk_ozone_image_representation.{h,cc}`
   - `gpu/vulkan/vulkan_image_linux.cc`, `ui/ozone/platform/wayland/gpu/vulkan_implementation_wayland.cc`
   - `gpu/config/gpu_driver_bug_list.json`, `gpu/config/gpu_finch_features.cc`
-  - `components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc`, `gpu/command_buffer/service/dawn_context_provider.cc`, `gpu/command_buffer/service/webgpu_decoder_impl.cc`
+  - `components/viz/service/display_embedder/skia_output_surface_impl_on_gpu.cc`, `gpu/command_buffer/service/dawn_context_provider.cc`, `gpu/command_buffer/service/webgpu_decoder_impl.cc`, `media/gpu/chromeos/mailbox_video_frame_converter.cc`, `content/browser/gpu/compositor_util.cc`
 
 ### 3. `wayland/`
 - **Ozone/Wayland, DMA-BUF Pixmaps & PWA Grouping**:
