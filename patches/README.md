@@ -32,7 +32,7 @@ All `.patch` files are applied in the order listed in `patches/series` against C
 
 ### 3. `wayland/`
 - **Ozone/Wayland, `VK_KHR_wayland_surface` Swapchain & PWA Grouping**:
-  - Enable Vulkan on Wayland (`0001`), GBM modifier fallback (`0002`), disable incompatible `wp_linux_drm_syncobj_v1` on Vulkan (`0003`), linear DMA-BUF pixmap allocation (`0004`).
+  - Enable Vulkan on Wayland (`0001`), GBM modifier fallback (`0002`), selectively disable `wp_linux_drm_syncobj_v1` only when Vulkan is active so explicit sync remains enabled on non-Vulkan sessions (`0003`), and linear DMA-BUF pixmap allocation supporting 8-bit (`RGBA/BGRA/RGBX/BGRX_8888`), 10-bit (`BGRA/RGBA_1010102`), and `RGBA_F16` formats (`0004`).
   - Direct `VK_KHR_wayland_surface` swapchain (`0005`), premultiplied alpha + preserved CSD border alpha (dropping `z_order == 0` opaque override) + `ack_configure` / `set_window_geometry` sync (`0006`).
   - Prefixes Wayland PWA `.desktop` files and `xdg_toplevel` `app_id` with the browser's desktop ID (`vulcanium-*` / `helcanium-*`) so installed web apps group separately from the main browser window (`0007`).
 - Target files:
@@ -41,8 +41,8 @@ All `.patch` files are applied in the order listed in `patches/series` against C
 
 ### 4. `video-decode/`
 - **Vulkan Video Decoding (`VkVideo`)**:
-  - Shared GPU-process `VulkanVideoDevice` singleton (`vulkan_video_device.{h,cc}`) with `vkGetPhysicalDeviceVideoCapabilitiesKHR` probing across `H.264`, `HEVC`, `VP9`, and `AV1` decode/encode queues and extent limits, dedicated `VK_QUEUE_TRANSFER_BIT` queue preference, and exportable NV12 DRM modifier probing.
-  - `VulkanVideoDecoder` backed by FFmpeg `AV_HWDEVICE_TYPE_VULKAN` (`H.264`, `HEVC/H.265`, `VP9`, `AV1`) gated by probed GPU capabilities, with tiled/linear DMA-BUF output (`vkCmdCopyImage` with semaphore-narrowed pipeline barriers -> 2-plane DMA-BUF -> `MailboxVideoFrameConverter` `SharedImage`).
+  - Shared GPU-process `VulkanVideoDevice` singleton (`vulkan_video_device.{h,cc}`) with `vkGetPhysicalDeviceVideoCapabilitiesKHR` probing across `H.264`, `HEVC` (8-bit and Main10 10-bit), `VP9` (8-bit and Profile 2 10-bit), and `AV1` (8-bit and Main 10-bit) decode/encode queues and extent limits, dedicated `VK_QUEUE_TRANSFER_BIT` queue preference, and exportable NV12 DRM modifier probing.
+  - `VulkanVideoDecoder` backed by FFmpeg `AV_HWDEVICE_TYPE_VULKAN` (`H.264`, `HEVC/H.265`, `VP9`, `AV1`) gated by probed GPU capabilities, outputting 8-bit NV12 (tiled/linear) or 10-bit `P010LE` DMA-BUFs (`vkCmdCopyImage` with semaphore-narrowed pipeline barriers -> 2-plane DMA-BUF -> `MailboxVideoFrameConverter` `SharedImage`) with CPU fallback, `AVERROR(EAGAIN)` drain loop in `Decode()`, `MediaLog` decoder reporting, and `visible_rect`/`natural_size`/`ColorSpace`/`hdr_metadata` propagation.
   - Concurrent decoder cap (`kMaxConcurrentDecoders = 8`) with software fallback, reusable `AVPacket`/`AVFrame`/`VkCommandPool`/`VkCommandBuffer`/`VkFence`, same-config flush fast-path, and bounded DMA-BUF `OutputSlot` pool (`kMaxOutputPoolSize = 12`) with frame-lifetime tracking.
 - Target files:
   - `media/base/media_switches.{h,cc}` (`VulkanVideoDecode`)

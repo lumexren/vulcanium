@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.h
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,137 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -84,8 +84,11 @@
 +  bool has_encode_queue = false;
 +  CodecCapability decode_h264;
 +  CodecCapability decode_hevc;
++  CodecCapability decode_hevc_10bit;
 +  CodecCapability decode_vp9;
++  CodecCapability decode_vp9_10bit;
 +  CodecCapability decode_av1;
++  CodecCapability decode_av1_10bit;
 +  CodecCapability encode_h264;
 +  CodecCapability encode_hevc;
 +  CodecCapability encode_av1;
@@ -137,7 +140,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DEVICE_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.cc
-@@ -0,0 +1,576 @@
+@@ -0,0 +1,626 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -378,11 +381,14 @@
 +}
 +
 +NO_SANITIZE("cfi") __attribute__((noinline))
-+CodecCapability QueryProfileCap(AVVulkanDeviceContext* vk_dev,
-+                                const VkCopyProcs& procs,
-+                                VkVideoCodecOperationFlagBitsKHR op,
-+                                const void* profile_pnext,
-+                                void* caps_pnext) {
++CodecCapability QueryProfileCap(
++    AVVulkanDeviceContext* vk_dev,
++    const VkCopyProcs& procs,
++    VkVideoCodecOperationFlagBitsKHR op,
++    const void* profile_pnext,
++    void* caps_pnext,
++    VkVideoComponentBitDepthFlagBitsKHR bit_depth =
++        VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR) {
 +  CodecCapability out;
 +  if (!vk_dev || !vk_dev->phys_dev ||
 +      !procs.vkGetPhysicalDeviceVideoCapabilitiesKHR) {
@@ -394,8 +400,8 @@
 +      .pNext = profile_pnext,
 +      .videoCodecOperation = op,
 +      .chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR,
-+      .lumaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR,
-+      .chromaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR,
++      .lumaBitDepth = bit_depth,
++      .chromaBitDepth = bit_depth,
 +  };
 +  VkVideoCapabilitiesKHR vk_caps{
 +      .sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR,
@@ -486,6 +492,21 @@
 +      caps->decode_hevc = QueryProfileCap(
 +          vk_dev, procs, VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR, &p,
 +          &dec_caps);
++
++      VkVideoDecodeH265ProfileInfoKHR p10{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_PROFILE_INFO_KHR,
++          .stdProfileIdc = STD_VIDEO_H265_PROFILE_IDC_MAIN_10,
++      };
++      VkVideoDecodeH265CapabilitiesKHR h265_caps10{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_H265_CAPABILITIES_KHR,
++      };
++      VkVideoDecodeCapabilitiesKHR dec_caps10{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR,
++          .pNext = &h265_caps10,
++      };
++      caps->decode_hevc_10bit = QueryProfileCap(
++          vk_dev, procs, VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR, &p10,
++          &dec_caps10, VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR);
 +    }
 +    if (has_ext(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)) {
 +      VkVideoDecodeVP9ProfileInfoKHR p{
@@ -502,6 +523,21 @@
 +      caps->decode_vp9 = QueryProfileCap(
 +          vk_dev, procs, VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR, &p,
 +          &dec_caps);
++
++      VkVideoDecodeVP9ProfileInfoKHR p10{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_VP9_PROFILE_INFO_KHR,
++          .stdProfile = STD_VIDEO_VP9_PROFILE_2,
++      };
++      VkVideoDecodeVP9CapabilitiesKHR vp9_caps10{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_VP9_CAPABILITIES_KHR,
++      };
++      VkVideoDecodeCapabilitiesKHR dec_caps10{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR,
++          .pNext = &vp9_caps10,
++      };
++      caps->decode_vp9_10bit = QueryProfileCap(
++          vk_dev, procs, VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR, &p10,
++          &dec_caps10, VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR);
 +    }
 +    if (has_ext(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME)) {
 +      VkVideoDecodeAV1ProfileInfoKHR p{
@@ -519,6 +555,17 @@
 +      caps->decode_av1 = QueryProfileCap(
 +          vk_dev, procs, VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR, &p,
 +          &dec_caps);
++
++      VkVideoDecodeAV1CapabilitiesKHR av1_caps10{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_AV1_CAPABILITIES_KHR,
++      };
++      VkVideoDecodeCapabilitiesKHR dec_caps10{
++          .sType = VK_STRUCTURE_TYPE_VIDEO_DECODE_CAPABILITIES_KHR,
++          .pNext = &av1_caps10,
++      };
++      caps->decode_av1_10bit = QueryProfileCap(
++          vk_dev, procs, VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR, &p,
++          &dec_caps10, VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR);
 +    }
 +  }
 +
@@ -578,10 +625,16 @@
 +          << caps->decode_h264.max_size.ToString()
 +          << ", hevc=" << caps->decode_hevc.supported << " "
 +          << caps->decode_hevc.max_size.ToString()
++          << ", hevc10=" << caps->decode_hevc_10bit.supported << " "
++          << caps->decode_hevc_10bit.max_size.ToString()
 +          << ", vp9=" << caps->decode_vp9.supported << " "
 +          << caps->decode_vp9.max_size.ToString()
++          << ", vp9_10=" << caps->decode_vp9_10bit.supported << " "
++          << caps->decode_vp9_10bit.max_size.ToString()
 +          << ", av1=" << caps->decode_av1.supported << " "
 +          << caps->decode_av1.max_size.ToString()
++          << ", av1_10=" << caps->decode_av1_10bit.supported << " "
++          << caps->decode_av1_10bit.max_size.ToString()
 +          << ") encode(h264=" << caps->encode_h264.supported << " "
 +          << caps->encode_h264.max_size.ToString()
 +          << ", hevc=" << caps->encode_hevc.supported << " "
@@ -716,7 +769,7 @@
 +}  // namespace media
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,99 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -778,10 +831,16 @@
 + private:
 +  bool ConfigureVulkanDecoder(const VideoDecoderConfig& config);
 +  void ReleaseResources(bool release_slot);
++  bool DrainDecodedFrames();
 +  bool EmitFrame(AVFrame* hw_frame);
-+  scoped_refptr<FrameResource> EmitGpuCopyFrame(AVFrame* hw_frame,
-+                                                base::TimeDelta pts,
-+                                                bool* is_pooled);
++  scoped_refptr<FrameResource> EmitGpuCopyFrame(
++      AVFrame* hw_frame,
++      VideoPixelFormat pixel_format,
++      const gfx::Rect& visible_rect,
++      const gfx::Size& natural_size,
++      const gfx::ColorSpace& color_space,
++      base::TimeDelta pts,
++      bool* is_pooled);
 +  void ReleaseOutputSlot(base::UnguessableToken token);
 +  FrameResource* GetOriginalFrame(const base::UnguessableToken& tracking_token);
 +  void OnFrameConverted(scoped_refptr<VideoFrame> frame);
@@ -812,7 +871,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,1126 @@
+@@ -0,0 +1,1301 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -842,11 +901,14 @@
 +#include "media/base/color_plane_layout.h"
 +#include "media/base/decoder_buffer.h"
 +#include "media/base/media_log.h"
++#include "media/base/video_color_space.h"
 +#include "media/base/video_frame.h"
 +#include "media/base/video_frame_layout.h"
 +#include "media/ffmpeg/ffmpeg_common.h"
 +#include "media/gpu/chromeos/video_frame_resource.h"
 +#include "media/gpu/vulkan/vulkan_video_device.h"
++#include "ui/gfx/color_space.h"
++#include "ui/gfx/hdr_metadata.h"
 +
 +extern "C" {
 +#include <libavcodec/avcodec.h>
@@ -913,12 +975,18 @@
 +}
 +
 +NO_SANITIZE("cfi") __attribute__((noinline))
-+std::optional<OutputSlot> CreateDmabufSlot(AVBufferRef* dev_ctx_ref,
-+                                           AVVulkanDeviceContext* vk_dev,
-+                                           const VkCopyInfo& info,
-+                                           int w,
-+                                           int h,
-+                                           base::TimeDelta pts) {
++std::optional<OutputSlot> CreateDmabufSlot(
++    AVBufferRef* dev_ctx_ref,
++    AVVulkanDeviceContext* vk_dev,
++    const VkCopyInfo& info,
++    int w,
++    int h,
++    VideoPixelFormat pixel_format,
++    const gfx::Rect& visible_rect,
++    const gfx::Size& natural_size,
++    const gfx::ColorSpace& color_space,
++    const gfx::HDRMetadata& hdr_metadata,
++    base::TimeDelta pts) {
 +  if (!dev_ctx_ref || !vk_dev || !vk_dev->act_dev || !info.procs_ready ||
 +      w <= 0 || h <= 0) {
 +    return std::nullopt;
@@ -926,7 +994,10 @@
 +
 +  const auto& p = info.procs;
 +  const gfx::Size coded_size(w, h);
-+  const gfx::Rect visible_rect(coded_size);
++  const bool is_p010 = (pixel_format == PIXEL_FORMAT_P010LE);
++  const VkFormat vk_format =
++      is_p010 ? VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16
++              : VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
 +
 +  VkImage dst_img = VK_NULL_HANDLE;
 +  VkDeviceMemory dst_mem = VK_NULL_HANDLE;
@@ -934,7 +1005,7 @@
 +  uint64_t linear_mod = DRM_FORMAT_MOD_LINEAR;
 +  uint64_t chosen_mod = DRM_FORMAT_MOD_LINEAR;
 +  const bool try_preferred =
-+      !info.preferred_nv12_modifiers.empty() &&
++      !is_p010 && !info.preferred_nv12_modifiers.empty() &&
 +      p.vkGetImageDrmFormatModifierPropertiesEXT != nullptr;
 +  const uint64_t* mod_ptr =
 +      try_preferred ? info.preferred_nv12_modifiers.data() : &linear_mod;
@@ -958,7 +1029,7 @@
 +      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 +      .pNext = &ext_info,
 +      .imageType = VK_IMAGE_TYPE_2D,
-+      .format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
++      .format = vk_format,
 +      .extent = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1},
 +      .mipLevels = 1,
 +      .arrayLayers = 1,
@@ -990,15 +1061,24 @@
 +  }
 +  if (ci_res != VK_SUCCESS) {
 +    LOG(WARNING) << "VulkanVideoDecoder: vkCreateImage 2PLANE failed: "
-+                 << ci_res;
++                 << ci_res << " p010=" << is_p010;
 +    CleanupVkImageMemory(vk_dev, p, dst_img, dst_mem);
 +    return std::nullopt;
 +  }
-+  static bool logged_slot_mod = false;
-+  if (!logged_slot_mod) {
-+    logged_slot_mod = true;
-+    VLOG(1) << "VulkanVideoDecoder: CreateDmabufSlot selected modifier=0x"
-+            << std::hex << chosen_mod << std::dec;
++  if (is_p010) {
++    static bool logged_p010_slot = false;
++    if (!logged_p010_slot) {
++      logged_p010_slot = true;
++      VLOG(1) << "VulkanVideoDecoder: CreateDmabufSlot P010 modifier=0x"
++              << std::hex << chosen_mod << std::dec;
++    }
++  } else {
++    static bool logged_slot_mod = false;
++    if (!logged_slot_mod) {
++      logged_slot_mod = true;
++      VLOG(1) << "VulkanVideoDecoder: CreateDmabufSlot selected modifier=0x"
++              << std::hex << chosen_mod << std::dec;
++    }
 +  }
 +
 +  VkMemoryRequirements req{};
@@ -1044,12 +1124,13 @@
 +  uint32_t strides[2]{};
 +  uint64_t offsets[2]{};
 +  uint64_t sizes[2]{};
++  const uint32_t bpp = is_p010 ? 2u : 1u;
 +  for (int i = 0; i < 2; ++i) {
 +    VkImageSubresource sub{.aspectMask = aspects[i]};
 +    VkSubresourceLayout lay{};
 +    p.vkGetImageSubresourceLayout(vk_dev->act_dev, dst_img, &sub, &lay);
 +    strides[i] = lay.rowPitch > 0 ? static_cast<uint32_t>(lay.rowPitch)
-+                                  : static_cast<uint32_t>(w);
++                                  : static_cast<uint32_t>(w) * bpp;
 +    offsets[i] = lay.offset;
 +    sizes[i] = lay.size > 0 ? lay.size : req.size;
 +  }
@@ -1081,7 +1162,7 @@
 +  fds.push_back(std::move(dst_fd_dup));
 +
 +  auto layout = VideoFrameLayout::CreateWithPlanes(
-+      PIXEL_FORMAT_NV12, coded_size, std::move(planes),
++      pixel_format, coded_size, std::move(planes),
 +      VideoFrameLayout::kBufferAddressAlignment, chosen_mod);
 +  if (!layout) {
 +    CleanupVkImageMemory(vk_dev, p, dst_img, dst_mem);
@@ -1089,7 +1170,7 @@
 +  }
 +
 +  auto vf = VideoFrame::WrapExternalDmabufs(
-+      *layout, visible_rect, coded_size, std::move(fds), pts);
++      *layout, visible_rect, natural_size, std::move(fds), pts);
 +  if (!vf) {
 +    CleanupVkImageMemory(vk_dev, p, dst_img, dst_mem);
 +    return std::nullopt;
@@ -1098,6 +1179,8 @@
 +  base::UnguessableToken token = base::UnguessableToken::Create();
 +  vf->metadata().tracking_token = token;
 +  vf->metadata().power_efficient = true;
++  vf->set_color_space(color_space);
++  vf->set_hdr_metadata(hdr_metadata);
 +
 +  auto origin_frame = VideoFrameResource::Create(std::move(vf));
 +  if (!origin_frame) {
@@ -1344,6 +1427,33 @@
 +  return AV_PIX_FMT_NONE;
 +}
 +
++gfx::ColorSpace ResolveFrameColorSpace(const AVFrame* frame,
++                                       const VideoDecoderConfig& config) {
++  const auto range =
++      (frame->color_range == AVCOL_RANGE_JPEG)
++          ? gfx::ColorSpace::RangeID::FULL
++          : (frame->color_range == AVCOL_RANGE_MPEG
++                 ? gfx::ColorSpace::RangeID::LIMITED
++                 : config.color_space_info().range());
++  if (frame->color_primaries != AVCOL_PRI_UNSPECIFIED ||
++      frame->color_trc != AVCOL_TRC_UNSPECIFIED ||
++      frame->colorspace != AVCOL_SPC_UNSPECIFIED) {
++    VideoColorSpace vcs(frame->color_primaries, frame->color_trc,
++                        frame->colorspace, range);
++    gfx::ColorSpace cs = vcs.ToGfxColorSpace();
++    if (cs.IsValid()) {
++      return cs;
++    }
++  }
++  if (config.color_space_info().IsSpecified()) {
++    gfx::ColorSpace cs = config.color_space_info().ToGfxColorSpace();
++    if (cs.IsValid()) {
++      return cs;
++    }
++  }
++  return config.color_space_info().GuessGfxColorSpace();
++}
++
 +}  // namespace
 +
 +struct VulkanCopyState {
@@ -1351,6 +1461,7 @@
 +  VkCommandBuffer cmd_buf = VK_NULL_HANDLE;
 +  VkFence fence = VK_NULL_HANDLE;
 +  gfx::Size pool_size;
++  VideoPixelFormat pool_format = PIXEL_FORMAT_UNKNOWN;
 +  std::vector<OutputSlot> slots;
 +  std::map<base::UnguessableToken, scoped_refptr<VideoFrameResource>>
 +      origin_frames_by_token;
@@ -1367,20 +1478,36 @@
 +                         /*require_encrypted=*/false);
 +  }
 +  if (caps.decode_hevc.supported) {
-+    configs.emplace_back(HEVCPROFILE_MIN, HEVCPROFILE_MAX,
++    configs.emplace_back(HEVCPROFILE_MAIN, HEVCPROFILE_MAIN,
 +                         caps.decode_hevc.min_size, caps.decode_hevc.max_size,
 +                         /*allow_encrypted=*/false,
 +                         /*require_encrypted=*/false);
 +  }
++  if (caps.decode_hevc_10bit.supported) {
++    configs.emplace_back(HEVCPROFILE_MAIN10, HEVCPROFILE_MAIN10,
++                         caps.decode_hevc_10bit.min_size,
++                         caps.decode_hevc_10bit.max_size,
++                         /*allow_encrypted=*/false,
++                         /*require_encrypted=*/false);
++  }
 +  if (caps.decode_vp9.supported) {
-+    configs.emplace_back(VP9PROFILE_MIN, VP9PROFILE_MAX,
++    configs.emplace_back(VP9PROFILE_PROFILE0, VP9PROFILE_PROFILE0,
 +                         caps.decode_vp9.min_size, caps.decode_vp9.max_size,
 +                         /*allow_encrypted=*/false,
 +                         /*require_encrypted=*/false);
 +  }
-+  if (caps.decode_av1.supported) {
-+    configs.emplace_back(AV1PROFILE_MIN, AV1PROFILE_MAX,
-+                         caps.decode_av1.min_size, caps.decode_av1.max_size,
++  if (caps.decode_vp9_10bit.supported) {
++    configs.emplace_back(VP9PROFILE_PROFILE2, VP9PROFILE_PROFILE2,
++                         caps.decode_vp9_10bit.min_size,
++                         caps.decode_vp9_10bit.max_size,
++                         /*allow_encrypted=*/false,
++                         /*require_encrypted=*/false);
++  }
++  if (caps.decode_av1.supported || caps.decode_av1_10bit.supported) {
++    const auto& cap =
++        caps.decode_av1.supported ? caps.decode_av1 : caps.decode_av1_10bit;
++    configs.emplace_back(AV1PROFILE_PROFILE_MAIN, AV1PROFILE_PROFILE_MAIN,
++                         cap.min_size, cap.max_size,
 +                         /*allow_encrypted=*/false,
 +                         /*require_encrypted=*/false);
 +  }
@@ -1399,13 +1526,30 @@
 +      cap = &caps.decode_h264;
 +      break;
 +    case VideoCodec::kHEVC:
-+      cap = &caps.decode_hevc;
++      if (config.profile() == HEVCPROFILE_MAIN10) {
++        cap = &caps.decode_hevc_10bit;
++      } else if (config.profile() == HEVCPROFILE_MAIN ||
++                 config.profile() == HEVCPROFILE_MAIN_STILL_PICTURE) {
++        cap = &caps.decode_hevc;
++      } else {
++        return false;
++      }
 +      break;
 +    case VideoCodec::kVP9:
-+      cap = &caps.decode_vp9;
++      if (config.profile() == VP9PROFILE_PROFILE2) {
++        cap = &caps.decode_vp9_10bit;
++      } else if (config.profile() == VP9PROFILE_PROFILE0) {
++        cap = &caps.decode_vp9;
++      } else {
++        return false;
++      }
 +      break;
 +    case VideoCodec::kAV1:
-+      cap = &caps.decode_av1;
++      if (config.profile() != AV1PROFILE_PROFILE_MAIN) {
++        return false;
++      }
++      cap = caps.decode_av1.supported ? &caps.decode_av1
++                                      : &caps.decode_av1_10bit;
 +      break;
 +    default:
 +      return false;
@@ -1471,6 +1615,11 @@
 +    config_ = config;
 +    output_cb_ = output_cb;
 +    eos_reached_ = false;
++    if (media_log_) {
++      media_log_->SetProperty<MediaLogProperty::kVideoDecoderName>(
++          GetDecoderType());
++      media_log_->SetProperty<MediaLogProperty::kIsPlatformVideoDecoder>(true);
++    }
 +    std::move(bound_init_cb).Run(DecoderStatus::Codes::kOk);
 +    return;
 +  }
@@ -1493,6 +1642,15 @@
 +  }
 +  initialized_ = true;
 +  eos_reached_ = false;
++  if (media_log_) {
++    media_log_->SetProperty<MediaLogProperty::kVideoDecoderName>(
++        GetDecoderType());
++    media_log_->SetProperty<MediaLogProperty::kIsPlatformVideoDecoder>(true);
++    MEDIA_LOG(INFO, media_log_)
++        << "Initialized VulkanVideoDecoder for "
++        << GetCodecName(config.codec()) << " ("
++        << config.coded_size().ToString() << ")";
++  }
 +  std::move(bound_init_cb).Run(DecoderStatus::Codes::kOk);
 +}
 +
@@ -1581,6 +1739,33 @@
 +  }
 +}
 +
++bool VulkanVideoDecoder::DrainDecodedFrames() {
++  if (!reusable_hw_frame_) {
++    reusable_hw_frame_ = av_frame_alloc();
++    if (!reusable_hw_frame_) {
++      return false;
++    }
++  } else {
++    av_frame_unref(reusable_hw_frame_);
++  }
++
++  while (true) {
++    int ret = avcodec_receive_frame(codec_context_.get(), reusable_hw_frame_);
++    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
++      return true;
++    }
++    if (ret < 0) {
++      av_frame_unref(reusable_hw_frame_);
++      return false;
++    }
++    const bool emitted = EmitFrame(reusable_hw_frame_);
++    av_frame_unref(reusable_hw_frame_);
++    if (!emitted) {
++      return false;
++    }
++  }
++}
++
 +void VulkanVideoDecoder::Decode(scoped_refptr<DecoderBuffer> buffer,
 +                                DecodeCB decode_cb) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
@@ -1616,39 +1801,28 @@
 +        ConvertToTimeBase(codec_context_->pkt_timebase, buffer->timestamp());
 +  }
 +
-+  int ret = avcodec_send_packet(codec_context_.get(), reusable_packet_);
++  constexpr int kMaxSendRetries = 8;
++  int ret = AVERROR(EAGAIN);
++  for (int attempt = 0; attempt < kMaxSendRetries; ++attempt) {
++    ret = avcodec_send_packet(codec_context_.get(), reusable_packet_);
++    if (ret != AVERROR(EAGAIN)) {
++      break;
++    }
++    if (!DrainDecodedFrames()) {
++      av_packet_unref(reusable_packet_);
++      std::move(bound_cb).Run(DecoderStatus::Codes::kFailed);
++      return;
++    }
++  }
 +  av_packet_unref(reusable_packet_);
 +  if (ret < 0 && ret != AVERROR_EOF) {
 +    std::move(bound_cb).Run(DecoderStatus::Codes::kFailed);
 +    return;
 +  }
 +
-+  if (!reusable_hw_frame_) {
-+    reusable_hw_frame_ = av_frame_alloc();
-+    if (!reusable_hw_frame_) {
-+      std::move(bound_cb).Run(DecoderStatus::Codes::kOutOfMemory);
-+      return;
-+    }
-+  } else {
-+    av_frame_unref(reusable_hw_frame_);
-+  }
-+
-+  while (true) {
-+    ret = avcodec_receive_frame(codec_context_.get(), reusable_hw_frame_);
-+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-+      break;
-+    }
-+    if (ret < 0) {
-+      av_frame_unref(reusable_hw_frame_);
-+      std::move(bound_cb).Run(DecoderStatus::Codes::kFailed);
-+      return;
-+    }
-+    if (!EmitFrame(reusable_hw_frame_)) {
-+      av_frame_unref(reusable_hw_frame_);
-+      std::move(bound_cb).Run(DecoderStatus::Codes::kFailed);
-+      return;
-+    }
-+    av_frame_unref(reusable_hw_frame_);
++  if (!DrainDecodedFrames()) {
++    std::move(bound_cb).Run(DecoderStatus::Codes::kFailed);
++    return;
 +  }
 +
 +  if (buffer->end_of_stream()) {
@@ -1659,6 +1833,10 @@
 +
 +scoped_refptr<FrameResource> VulkanVideoDecoder::EmitGpuCopyFrame(
 +    AVFrame* hw_frame,
++    VideoPixelFormat pixel_format,
++    const gfx::Rect& visible_rect,
++    const gfx::Size& natural_size,
++    const gfx::ColorSpace& color_space,
 +    base::TimeDelta pts,
 +    bool* is_pooled) {
 +  *is_pooled = false;
@@ -1679,7 +1857,6 @@
 +  const int w = hw_frame->width;
 +  const int h = hw_frame->height;
 +  const gfx::Size coded_size(w, h);
-+  const gfx::Rect visible_rect(coded_size);
 +  if (w <= 0 || h <= 0) {
 +    return nullptr;
 +  }
@@ -1694,10 +1871,12 @@
 +    }
 +  }
 +
-+  if (copy_state_->pool_size != coded_size) {
++  if (copy_state_->pool_size != coded_size ||
++      copy_state_->pool_format != pixel_format) {
 +    copy_state_->slots.clear();
 +    copy_state_->origin_frames_by_token.clear();
 +    copy_state_->pool_size = coded_size;
++    copy_state_->pool_format = pixel_format;
 +  }
 +
 +  OutputSlot* chosen = nullptr;
@@ -1709,8 +1888,9 @@
 +  }
 +
 +  if (!chosen && copy_state_->slots.size() < kMaxOutputPoolSize) {
-+    auto new_slot = CreateDmabufSlot(hw_device_ctx_, vk_dev, *copy_info, w, h,
-+                                     pts);
++    auto new_slot = CreateDmabufSlot(
++        hw_device_ctx_, vk_dev, *copy_info, w, h, pixel_format, visible_rect,
++        natural_size, color_space, config_.hdr_metadata(), pts);
 +    if (!new_slot) {
 +      return nullptr;
 +    }
@@ -1727,11 +1907,13 @@
 +      return nullptr;
 +    }
 +    auto wrapped =
-+        chosen->origin_frame->CreateWrappingFrame(visible_rect, coded_size);
++        chosen->origin_frame->CreateWrappingFrame(visible_rect, natural_size);
 +    if (!wrapped) {
 +      return nullptr;
 +    }
 +    wrapped->set_timestamp(pts);
++    wrapped->set_color_space(color_space);
++    wrapped->set_hdr_metadata(config_.hdr_metadata());
 +    wrapped->metadata().power_efficient = true;
 +    chosen->in_use = true;
 +    wrapped->AddDestructionObserver(base::BindPostTaskToCurrentDefault(
@@ -1743,8 +1925,9 @@
 +
 +  // All pooled slots are currently held downstream; emit a one-shot unpooled
 +  // buffer whose GPU backing is freed as soon as the frame is released.
-+  auto temp_slot =
-+      CreateDmabufSlot(hw_device_ctx_, vk_dev, *copy_info, w, h, pts);
++  auto temp_slot = CreateDmabufSlot(
++      hw_device_ctx_, vk_dev, *copy_info, w, h, pixel_format, visible_rect,
++      natural_size, color_space, config_.hdr_metadata(), pts);
 +  if (!temp_slot) {
 +    return nullptr;
 +  }
@@ -1784,7 +1967,46 @@
 +
 +bool VulkanVideoDecoder::EmitFrame(AVFrame* hw_frame) {
 +  const gfx::Size coded_size(hw_frame->width, hw_frame->height);
-+  const gfx::Rect visible_rect(coded_size);
++  gfx::Rect visible_rect(coded_size);
++  if (hw_frame->crop_left || hw_frame->crop_top || hw_frame->crop_right ||
++      hw_frame->crop_bottom) {
++    const size_t x = std::min(hw_frame->crop_left,
++                              static_cast<size_t>(coded_size.width()));
++    const size_t y = std::min(hw_frame->crop_top,
++                              static_cast<size_t>(coded_size.height()));
++    const size_t max_w = static_cast<size_t>(coded_size.width()) - x;
++    const size_t max_h = static_cast<size_t>(coded_size.height()) - y;
++    const size_t crop_r = std::min(hw_frame->crop_right, max_w);
++    const size_t crop_b = std::min(hw_frame->crop_bottom, max_h);
++    gfx::Rect cropped(static_cast<int>(x), static_cast<int>(y),
++                      static_cast<int>(max_w - crop_r),
++                      static_cast<int>(max_h - crop_b));
++    if (!cropped.IsEmpty()) {
++      visible_rect = cropped;
++    }
++  } else if (!config_.visible_rect().IsEmpty()) {
++    gfx::Rect intersected =
++        gfx::IntersectRects(config_.visible_rect(), gfx::Rect(coded_size));
++    if (!intersected.IsEmpty()) {
++      visible_rect = intersected;
++    }
++  }
++  const gfx::Size natural_size =
++      config_.aspect_ratio().GetNaturalSize(visible_rect);
++  const gfx::ColorSpace color_space = ResolveFrameColorSpace(hw_frame, config_);
++
++  AVPixelFormat sw_fmt = static_cast<AVPixelFormat>(hw_frame->format);
++  if (hw_frame->format == AV_PIX_FMT_VULKAN && hw_frame->hw_frames_ctx) {
++    auto* fctx =
++        reinterpret_cast<AVHWFramesContext*>(hw_frame->hw_frames_ctx->data);
++    if (fctx) {
++      sw_fmt = fctx->sw_format;
++    }
++  }
++  const bool is_p010 = (sw_fmt == AV_PIX_FMT_P010);
++  const VideoPixelFormat pixel_format =
++      is_p010 ? PIXEL_FORMAT_P010LE : PIXEL_FORMAT_NV12;
++
 +  const auto pts =
 +      ConvertFromTimeBase(codec_context_->pkt_timebase, hw_frame->pts);
 +
@@ -1822,16 +2044,18 @@
 +
 +          if (fds_ok) {
 +            auto layout = VideoFrameLayout::CreateWithPlanes(
-+                PIXEL_FORMAT_NV12, coded_size, std::move(planes),
++                pixel_format, coded_size, std::move(planes),
 +                VideoFrameLayout::kBufferAddressAlignment, modifier);
 +            if (layout) {
 +              auto video_frame = VideoFrame::WrapExternalDmabufs(
-+                  *layout, visible_rect, coded_size, std::move(dmabuf_fds),
++                  *layout, visible_rect, natural_size, std::move(dmabuf_fds),
 +                  pts);
 +              if (video_frame && frame_converter_) {
 +                video_frame->metadata().power_efficient = true;
 +                video_frame->metadata().tracking_token =
 +                    base::UnguessableToken::Create();
++                video_frame->set_color_space(color_space);
++                video_frame->set_hdr_metadata(config_.hdr_metadata());
 +                video_frame->AddDestructionObserver(base::BindOnce(
 +                    [](AVFrame* frame) { av_frame_free(&frame); }, drm_frame));
 +                drm_frame = nullptr;
@@ -1859,7 +2083,9 @@
 +
 +  if (hw_frame->format == AV_PIX_FMT_VULKAN && frame_converter_) {
 +    bool is_pooled = false;
-+    if (auto resource = EmitGpuCopyFrame(hw_frame, pts, &is_pooled)) {
++    if (auto resource = EmitGpuCopyFrame(hw_frame, pixel_format, visible_rect,
++                                         natural_size, color_space, pts,
++                                         &is_pooled)) {
 +      auto weak_self = weak_factory_.GetWeakPtr();
 +      if (!is_pooled) {
 +        current_unpooled_origin_ = resource.get();
@@ -1878,7 +2104,7 @@
 +    }
 +  }
 +
-+  // Fallback path: transfer Vulkan surface to host NV12 VideoFrame.
++  // Fallback path: transfer Vulkan surface to host NV12/P010LE VideoFrame.
 +  AVFrame* sw_frame = av_frame_alloc();
 +  if (!sw_frame) {
 +    return false;
@@ -1892,26 +2118,34 @@
 +    return false;
 +  }
 +
-+  auto video_frame = VideoFrame::CreateFrame(PIXEL_FORMAT_NV12, coded_size,
-+                                             visible_rect, coded_size, pts);
++  const bool sw_is_p010 = (sw_frame->format == AV_PIX_FMT_P010);
++  const VideoPixelFormat sw_pixel_format =
++      sw_is_p010 ? PIXEL_FORMAT_P010LE : PIXEL_FORMAT_NV12;
++  auto video_frame = VideoFrame::CreateFrame(sw_pixel_format, coded_size,
++                                             visible_rect, natural_size, pts);
 +  if (!video_frame) {
 +    av_frame_free(&sw_frame);
 +    return false;
 +  }
 +
-+  // Copy Y and interleaved UV planes from transferred NV12 frame.
++  // Copy Y and interleaved UV planes from transferred NV12/P010 frame.
++  const int bpp = sw_is_p010 ? 2 : 1;
 +  for (int plane = 0; plane < 2; ++plane) {
 +    const uint8_t* src = sw_frame->data[plane];
 +    int src_stride = sw_frame->linesize[plane];
 +    uint8_t* dst = video_frame->writable_data(plane);
 +    int dst_stride = video_frame->stride(plane);
 +    int rows = (plane == 0) ? coded_size.height() : (coded_size.height() + 1) / 2;
-+    int row_bytes = std::min(src_stride, dst_stride);
++    int expected_row_bytes =
++        (plane == 0 ? coded_size.width() : ((coded_size.width() + 1) & ~1)) * bpp;
++    int row_bytes = std::min({expected_row_bytes, src_stride, dst_stride});
 +    for (int y = 0; y < rows; ++y) {
 +      std::memcpy(dst + y * dst_stride, src + y * src_stride, row_bytes);
 +    }
 +  }
 +
++  video_frame->set_color_space(color_space);
++  video_frame->set_hdr_metadata(config_.hdr_metadata());
 +  video_frame->metadata().power_efficient = true;
 +  av_frame_free(&sw_frame);
 +  output_cb_.Run(std::move(video_frame));

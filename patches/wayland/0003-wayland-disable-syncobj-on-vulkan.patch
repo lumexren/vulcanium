@@ -1,6 +1,14 @@
 --- a/ui/ozone/platform/wayland/host/wayland_connection.cc
 +++ b/ui/ozone/platform/wayland/host/wayland_connection.cc
-@@ -671,8 +671,11 @@
+@@ -17,6 +17,7 @@
+ #include "base/functional/bind.h"
+ #include "base/logging.h"
+ #include "base/metrics/histogram_functions.h"
++#include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "base/system/sys_info.h"
+ #include "base/trace_event/trace_event.h"
+@@ -671,8 +672,40 @@
    } else if (!linux_drm_syncobj_manager_ &&
               (UNSAFE_TODO(
                    strcmp(interface, "wp_linux_drm_syncobj_manager_v1")) == 0)) {
@@ -9,8 +17,37 @@
 +    // Disable wp_linux_drm_syncobj_manager_v1 when Vulkan is active, as
 +    // NVIDIA SYNC_FD -> drm_syncobj timeline import can leave KWin/Mutter
 +    // waiting on acquire points and rendering a transparent window.
-+    if (false && (enable_linux_drm_syncobj_for_testing_ ||
-+                  MinSupportedKernelForLinuxDrmSyncobj())) {
++    bool vulkan_requested = false;
++    if (const auto* cmd = base::CommandLine::ForCurrentProcess();
++        !cmd || !cmd->HasSwitch("disable-vulkan")) {
++      if (cmd && cmd->HasSwitch("use-vulkan")) {
++        const std::string val = cmd->GetSwitchValueASCII("use-vulkan");
++        vulkan_requested = (val != "disabled" && val != "none");
++      }
++      if (!vulkan_requested) {
++        if (const auto* fl = base::FeatureList::GetInstance()) {
++          vulkan_requested =
++              fl->IsFeatureOverriddenFromCommandLine(
++                  "Vulkan", base::FeatureList::OVERRIDE_ENABLE_FEATURE) ||
++              fl->IsFeatureOverriddenFromCommandLine(
++                  "DefaultANGLEVulkan",
++                  base::FeatureList::OVERRIDE_ENABLE_FEATURE);
++        } else if (cmd) {
++          for (std::string_view tok : base::SplitStringPiece(
++                   cmd->GetSwitchValueASCII("enable-features"), ",",
++                   base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++            std::string_view feat_name = tok.substr(0, tok.find_first_of(":<"));
++            if (feat_name == "Vulkan" || feat_name == "DefaultANGLEVulkan") {
++              vulkan_requested = true;
++              break;
++            }
++          }
++        }
++      }
++    }
++    if ((enable_linux_drm_syncobj_for_testing_ || !vulkan_requested) &&
++        (enable_linux_drm_syncobj_for_testing_ ||
++         MinSupportedKernelForLinuxDrmSyncobj())) {
        linux_drm_syncobj_manager_ = wl::Bind<wp_linux_drm_syncobj_manager_v1>(
            registry, name, std::min(version, kMaxLinuxDrmSyncobjVersion));
        if (!linux_drm_syncobj_manager_) {
