@@ -25,7 +25,7 @@
  
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.h
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,172 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -77,6 +77,8 @@
 +  PFN_vkGetDeviceQueue vkGetDeviceQueue = nullptr;
 +  PFN_vkGetPhysicalDeviceMemoryProperties
 +      vkGetPhysicalDeviceMemoryProperties = nullptr;
++  PFN_vkGetPhysicalDeviceMemoryProperties2
++      vkGetPhysicalDeviceMemoryProperties2 = nullptr;
 +  PFN_vkEnumerateDeviceExtensionProperties
 +      vkEnumerateDeviceExtensionProperties = nullptr;
 +  PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR
@@ -94,8 +96,10 @@
 +  VkPhysicalDeviceMemoryProperties mem_props{};
 +  std::vector<uint64_t> preferred_nv12_modifiers;
 +  std::vector<uint64_t> preferred_p010_modifiers;
++  uint64_t total_device_local_vram_bytes = 0;
 +  uint32_t copy_queue_family = 0;
 +  bool copy_queue_is_dedicated_transfer = false;
++  bool has_memory_budget = false;
 +  bool procs_ready = false;
 +};
 +
@@ -121,6 +125,14 @@
 +  CodecCapability encode_av1;
 +};
 +
++struct VulkanVramBudget {
++  uint64_t total_device_local_bytes = 0;
++  uint64_t budget_bytes = 0;
++  uint64_t usage_bytes = 0;
++  uint64_t available_bytes = 0;
++  bool live_budget_supported = false;
++};
++
 +// Holds a single GPU-process-wide FFmpeg AV_HWDEVICE_TYPE_VULKAN context,
 +// resolved Vulkan function pointers, and cached hardware video capabilities so
 +// decoders and encoders share one VkDevice and avoid repeated device creation.
@@ -131,6 +143,13 @@
 +  AVBufferRef* AcquireDevice();
 +  const VkCopyInfo* GetCopyInfo() const { return &copy_info_; }
 +  const VulkanVideoCapabilities& GetCapabilities();
++  VulkanVramBudget QueryVramBudget();
++  bool TryAcquireDecoderAdmission(uint64_t estimated_bytes,
++                                  int* active_decoders_out = nullptr,
++                                  VulkanVramBudget* budget_out = nullptr);
++  void NotifyDecoderVramAllocated(uint64_t newly_allocated_bytes);
++  void ReleaseDecoderAdmission(uint64_t reserved_bytes,
++                               uint64_t remaining_pending_bytes);
 +
 + private:
 +  friend class base::NoDestructor<VulkanVideoDevice>;
@@ -144,6 +163,11 @@
 +  VkCopyInfo copy_info_;
 +  bool copy_info_attempted_ = false;
 +  VulkanVideoCapabilities caps_;
++
++  base::Lock admission_lock_;
++  int active_decoders_ = 0;
++  uint64_t total_estimated_vram_bytes_ = 0;
++  uint64_t pending_unallocated_vram_bytes_ = 0;
 +};
 +
 +MEDIA_GPU_EXPORT bool CreateCopyCmdResources(AVVulkanDeviceContext* vk_dev,
@@ -176,7 +200,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DEVICE_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.cc
-@@ -0,0 +1,674 @@
+@@ -0,0 +1,877 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -186,12 +210,14 @@
 +#include <drm_fourcc.h>
 +
 +#include <algorithm>
++#include <cstdlib>
 +#include <ios>
 +#include <string_view>
 +#include <vector>
 +
 +#include "base/compiler_specific.h"
 +#include "base/logging.h"
++#include "base/strings/string_number_conversions.h"
 +#include "media/ffmpeg/ffmpeg_common.h"
 +
 +extern "C" {
@@ -354,11 +380,19 @@
 +  info->procs.name = reinterpret_cast<PFN_##name>(        \
 +      vk_dev->get_proc_addr(vk_dev->inst, #name))
 +  LOAD_INST_PROC(vkGetPhysicalDeviceMemoryProperties);
++  LOAD_INST_PROC(vkGetPhysicalDeviceMemoryProperties2);
 +  LOAD_INST_PROC(vkEnumerateDeviceExtensionProperties);
 +  LOAD_INST_PROC(vkGetPhysicalDeviceVideoCapabilitiesKHR);
 +  LOAD_INST_PROC(vkGetPhysicalDeviceFormatProperties2);
 +  LOAD_INST_PROC(vkGetPhysicalDeviceImageFormatProperties2);
 +#undef LOAD_INST_PROC
++
++  if (!info->procs.vkGetPhysicalDeviceMemoryProperties2) {
++    info->procs.vkGetPhysicalDeviceMemoryProperties2 =
++        reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
++            vk_dev->get_proc_addr(vk_dev->inst,
++                                  "vkGetPhysicalDeviceMemoryProperties2KHR"));
++  }
 +
 +  if (!info->procs.vkGetPhysicalDeviceFormatProperties2) {
 +    info->procs.vkGetPhysicalDeviceFormatProperties2 =
@@ -389,6 +423,15 @@
 +  }
 +
 +  p.vkGetPhysicalDeviceMemoryProperties(vk_dev->phys_dev, &info->mem_props);
++
++  uint64_t total_device_local = 0;
++  for (uint32_t i = 0; i < info->mem_props.memoryHeapCount; ++i) {
++    if (info->mem_props.memoryHeaps[i].flags &
++        VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
++      total_device_local += info->mem_props.memoryHeaps[i].size;
++    }
++  }
++  info->total_device_local_vram_bytes = total_device_local;
 +
 +  uint32_t qf =
 +      vk_dev->nb_qf > 0 ? static_cast<uint32_t>(vk_dev->qf[0].idx) : 0u;
@@ -486,7 +529,8 @@
 +NO_SANITIZE("cfi") __attribute__((noinline))
 +void ProbeVideoCapabilities(AVVulkanDeviceContext* vk_dev,
 +                            const VkCopyProcs& procs,
-+                            VulkanVideoCapabilities* caps) {
++                            VulkanVideoCapabilities* caps,
++                            bool* has_memory_budget_out) {
 +  caps->probed = true;
 +  if (!vk_dev || !vk_dev->phys_dev ||
 +      !procs.vkEnumerateDeviceExtensionProperties ||
@@ -518,6 +562,9 @@
 +
 +  caps->has_decode_queue = has_ext(VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME);
 +  caps->has_encode_queue = has_ext(VK_KHR_VIDEO_ENCODE_QUEUE_EXTENSION_NAME);
++  if (has_memory_budget_out) {
++    *has_memory_budget_out = has_ext(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
++  }
 +
 +  if (caps->has_decode_queue) {
 +    if (has_ext(VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME)) {
@@ -700,7 +747,72 @@
 +          << ", hevc=" << caps->encode_hevc.supported << " "
 +          << caps->encode_hevc.max_size.ToString()
 +          << ", av1=" << caps->encode_av1.supported << " "
-+          << caps->encode_av1.max_size.ToString() << ")";
++          << caps->encode_av1.max_size.ToString() << ")"
++          << " has_memory_budget="
++          << (has_memory_budget_out ? *has_memory_budget_out : false);
++}
++
++int GetMaxConcurrentDecodersCap() {
++  static const int kCap = []() {
++    constexpr int kDefaultCap = 32;
++    constexpr int kMinCap = 1;
++    constexpr int kMaxCap = 128;
++    const char* env = std::getenv("VULCANIUM_MAX_DECODERS");
++    if (!env || !*env) {
++      return kDefaultCap;
++    }
++    int parsed = 0;
++    if (!base::StringToInt(env, &parsed)) {
++      return kDefaultCap;
++    }
++    return std::clamp(parsed, kMinCap, kMaxCap);
++  }();
++  return kCap;
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++VulkanVramBudget QueryDeviceLocalVramBudget(AVVulkanDeviceContext* vk_dev,
++                                            const VkCopyInfo& info) {
++  VulkanVramBudget out;
++  out.total_device_local_bytes = info.total_device_local_vram_bytes;
++  if (!vk_dev || !vk_dev->phys_dev || !info.has_memory_budget ||
++      !info.procs.vkGetPhysicalDeviceMemoryProperties2) {
++    return out;
++  }
++
++  VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_props{
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT,
++  };
++  VkPhysicalDeviceMemoryProperties2 mem_props2{
++      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
++      .pNext = &budget_props,
++  };
++  info.procs.vkGetPhysicalDeviceMemoryProperties2(vk_dev->phys_dev, &mem_props2);
++
++  uint64_t total_budget = 0;
++  uint64_t total_usage = 0;
++  uint64_t total_available = 0;
++  const uint32_t heap_count = std::min<uint32_t>(
++      mem_props2.memoryProperties.memoryHeapCount, VK_MAX_MEMORY_HEAPS);
++  for (uint32_t i = 0; i < heap_count; ++i) {
++    if ((mem_props2.memoryProperties.memoryHeaps[i].flags &
++         VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
++      continue;
++    }
++    const uint64_t budget = budget_props.heapBudget[i];
++    const uint64_t usage = budget_props.heapUsage[i];
++    total_budget += budget;
++    total_usage += usage;
++    total_available += (budget > usage ? budget - usage : 0ULL);
++  }
++
++  if (total_budget > 0) {
++    out.budget_bytes = total_budget;
++    out.usage_bytes = total_usage;
++    out.available_bytes = total_available;
++    out.live_budget_supported = true;
++  }
++  return out;
 +}
 +
 +}  // namespace
@@ -728,7 +840,11 @@
 +    auto* vk_dev =
 +        dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx) : nullptr;
 +    InitCopyInfo(vk_dev, &copy_info_);
-+    ProbeVideoCapabilities(vk_dev, copy_info_.procs, &caps_);
++    ProbeVideoCapabilities(vk_dev, copy_info_.procs, &caps_,
++                           &copy_info_.has_memory_budget);
++    VLOG(1) << "VulkanVideoDevice VRAM total="
++            << (copy_info_.total_device_local_vram_bytes / (1024 * 1024))
++            << " MiB has_memory_budget=" << copy_info_.has_memory_budget;
 +  }
 +  return true;
 +}
@@ -745,6 +861,117 @@
 +  base::AutoLock lock(lock_);
 +  EnsureInitializedLocked();
 +  return caps_;
++}
++
++VulkanVramBudget VulkanVideoDevice::QueryVramBudget() {
++  AVVulkanDeviceContext* vk_dev = nullptr;
++  {
++    base::AutoLock lock(lock_);
++    if (!EnsureInitializedLocked() || !device_ctx_) {
++      return VulkanVramBudget{};
++    }
++    auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(device_ctx_->data);
++    vk_dev =
++        dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx) : nullptr;
++  }
++  return QueryDeviceLocalVramBudget(vk_dev, copy_info_);
++}
++
++bool VulkanVideoDevice::TryAcquireDecoderAdmission(
++    uint64_t estimated_bytes,
++    int* active_decoders_out,
++    VulkanVramBudget* budget_out) {
++  AVVulkanDeviceContext* vk_dev = nullptr;
++  {
++    base::AutoLock lock(lock_);
++    if (!EnsureInitializedLocked() || !device_ctx_) {
++      return false;
++    }
++    auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(device_ctx_->data);
++    vk_dev =
++        dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx) : nullptr;
++    if (!vk_dev) {
++      return false;
++    }
++  }
++
++  base::AutoLock admission_lock(admission_lock_);
++  const VulkanVramBudget budget = QueryDeviceLocalVramBudget(vk_dev, copy_info_);
++  if (budget_out) {
++    *budget_out = budget;
++  }
++  if (active_decoders_ >= GetMaxConcurrentDecodersCap()) {
++    if (active_decoders_out) {
++      *active_decoders_out = active_decoders_;
++    }
++    return false;
++  }
++
++  bool admitted = false;
++  if (budget.live_budget_supported && budget.budget_bytes > 0) {
++    constexpr uint64_t kMinHeadroomBytes = uint64_t{128} * 1024 * 1024;
++    constexpr uint64_t kMaxHeadroomBytes = uint64_t{512} * 1024 * 1024;
++    const uint64_t headroom =
++        budget.total_device_local_bytes > 0
++            ? std::clamp<uint64_t>(budget.total_device_local_bytes / 8,
++                                   kMinHeadroomBytes, kMaxHeadroomBytes)
++            : kMinHeadroomBytes;
++    const uint64_t effective_available =
++        budget.available_bytes > pending_unallocated_vram_bytes_
++            ? budget.available_bytes - pending_unallocated_vram_bytes_
++            : 0ULL;
++    admitted = (effective_available >= estimated_bytes + headroom);
++  } else if (budget.total_device_local_bytes > 0) {
++    const uint64_t max_static_vram =
++        (budget.total_device_local_bytes * 40ULL) / 100ULL;
++    admitted = (total_estimated_vram_bytes_ + estimated_bytes <= max_static_vram);
++  } else {
++    admitted = (active_decoders_ < 8);
++  }
++
++  if (!admitted) {
++    if (active_decoders_out) {
++      *active_decoders_out = active_decoders_;
++    }
++    return false;
++  }
++
++  ++active_decoders_;
++  total_estimated_vram_bytes_ += estimated_bytes;
++  pending_unallocated_vram_bytes_ += estimated_bytes;
++  if (active_decoders_out) {
++    *active_decoders_out = active_decoders_;
++  }
++  return true;
++}
++
++void VulkanVideoDevice::NotifyDecoderVramAllocated(
++    uint64_t newly_allocated_bytes) {
++  base::AutoLock admission_lock(admission_lock_);
++  if (pending_unallocated_vram_bytes_ > newly_allocated_bytes) {
++    pending_unallocated_vram_bytes_ -= newly_allocated_bytes;
++  } else {
++    pending_unallocated_vram_bytes_ = 0;
++  }
++}
++
++void VulkanVideoDevice::ReleaseDecoderAdmission(
++    uint64_t reserved_bytes,
++    uint64_t remaining_pending_bytes) {
++  base::AutoLock admission_lock(admission_lock_);
++  if (active_decoders_ > 0) {
++    --active_decoders_;
++  }
++  if (total_estimated_vram_bytes_ > reserved_bytes) {
++    total_estimated_vram_bytes_ -= reserved_bytes;
++  } else {
++    total_estimated_vram_bytes_ = 0;
++  }
++  if (pending_unallocated_vram_bytes_ > remaining_pending_bytes) {
++    pending_unallocated_vram_bytes_ -= remaining_pending_bytes;
++  } else {
++    pending_unallocated_vram_bytes_ = 0;
++  }
 +}
 +
 +NO_SANITIZE("cfi") __attribute__((noinline))
@@ -853,7 +1080,7 @@
 +}  // namespace media
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.h
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,112 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -917,7 +1144,8 @@
 +
 + private:
 +  bool ConfigureVulkanDecoder(const VideoDecoderConfig& config);
-+  void ReleaseResources(bool release_slot);
++  void ReleaseResources();
++  void ReleaseIdleOutputSlots();
 +  bool DrainDecodedFrames();
 +  void DrainPendingEmits(bool wait_all);
 +  void DiscardPendingEmits();
@@ -953,6 +1181,10 @@
 +  uint64_t waited_emits_ = 0;
 +  bool logged_async_copy_ = false;
 +  bool has_decoder_slot_ = false;
++  uint64_t reserved_vram_bytes_ = 0;
++  uint64_t pending_dpb_vram_bytes_ = 0;
++  uint64_t pending_pool_vram_bytes_ = 0;
++  uint64_t est_frame_vram_bytes_ = 0;
 +  bool initialized_ = false;
 +  bool eos_reached_ = false;
 +  base::WeakPtrFactory<VulkanVideoDecoder> weak_factory_{this};
@@ -963,7 +1195,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,1445 @@
+@@ -0,0 +1,1563 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1016,22 +1248,77 @@
 +
 +namespace {
 +
-+constexpr int kMaxConcurrentDecoders = 8;
-+constexpr size_t kMaxOutputPoolSize = 12;
-+
-+std::atomic<int> g_active_decoders{0};
 +std::atomic<bool> g_drm_prime_map_supported{true};
 +
-+bool TryAcquireDecoderSlot() {
-+  int cur = g_active_decoders.load(std::memory_order_relaxed);
-+  while (cur < kMaxConcurrentDecoders) {
-+    if (g_active_decoders.compare_exchange_weak(
-+            cur, cur + 1, std::memory_order_acq_rel,
-+            std::memory_order_relaxed)) {
-+      return true;
-+    }
++bool IsLikely10BitConfig(const VideoDecoderConfig& config) {
++  return config.profile() == HEVCPROFILE_MAIN10 ||
++         config.profile() == VP9PROFILE_PROFILE2 ||
++         (config.codec() == VideoCodec::kAV1 &&
++          config.color_space_info().IsHDR());
++}
++
++size_t MaxOutputPoolSizeForFrame(const gfx::Size& coded_size) {
++  const int64_t pixels =
++      int64_t{coded_size.width()} * int64_t{coded_size.height()};
++  if (pixels <= 1920LL * 1088LL) {
++    return 12;
 +  }
-+  return false;
++  if (pixels <= 2560LL * 1472LL) {
++    return 10;
++  }
++  if (pixels <= 4096LL * 2304LL) {
++    return 8;
++  }
++  return 6;
++}
++
++struct DecoderVramEstimate {
++  uint64_t frame_bytes = 0;
++  uint64_t dpb_bytes = 0;
++  uint64_t pool_bytes = 0;
++  uint64_t total_bytes() const { return dpb_bytes + pool_bytes; }
++};
++
++DecoderVramEstimate EstimateDecoderSessionVram(
++    const VideoDecoderConfig& config) {
++  gfx::Size size = config.coded_size();
++  if (size.IsEmpty()) {
++    size = config.visible_rect().size();
++  }
++  if (size.IsEmpty()) {
++    size = gfx::Size(1920, 1080);
++  }
++  const uint64_t aligned_w =
++      static_cast<uint64_t>((std::max(16, size.width()) + 63) & ~63);
++  const uint64_t aligned_h =
++      static_cast<uint64_t>((std::max(16, size.height()) + 63) & ~63);
++  const bool is_10bit = IsLikely10BitConfig(config);
++  const uint64_t frame_bytes =
++      is_10bit ? (aligned_w * aligned_h * 3ULL)
++               : ((aligned_w * aligned_h * 3ULL) / 2ULL);
++
++  uint64_t dpb_frames = 16;
++  switch (config.codec()) {
++    case VideoCodec::kH264:
++    case VideoCodec::kHEVC:
++      dpb_frames = 20;
++      break;
++    case VideoCodec::kVP9:
++    case VideoCodec::kAV1:
++      dpb_frames = 13;
++      break;
++    default:
++      dpb_frames = 16;
++      break;
++  }
++
++  constexpr uint64_t kSessionOverheadBytes = 16ULL * 1024ULL * 1024ULL;
++  DecoderVramEstimate est;
++  est.frame_bytes = frame_bytes;
++  est.dpb_bytes = dpb_frames * frame_bytes + kSessionOverheadBytes;
++  est.pool_bytes =
++      static_cast<uint64_t>(MaxOutputPoolSizeForFrame(size)) * frame_bytes;
++  return est;
 +}
 +
 +struct OutputSlot {
@@ -1691,7 +1978,7 @@
 +    frame_converter_->AbortPendingFrames();
 +    frame_converter_.reset();
 +  }
-+  ReleaseResources(/*release_slot=*/true);
++  ReleaseResources();
 +}
 +
 +VideoDecoderType VulkanVideoDecoder::GetDecoderType() const {
@@ -1712,7 +1999,7 @@
 +  InitCB bound_init_cb = base::BindPostTaskToCurrentDefault(std::move(init_cb));
 +
 +  if (!IsSupported(config)) {
-+    ReleaseResources(/*release_slot=*/true);
++    ReleaseResources();
 +    std::move(bound_init_cb).Run(DecoderStatus::Codes::kUnsupportedConfig);
 +    return;
 +  }
@@ -1767,26 +2054,48 @@
 +
 +bool VulkanVideoDecoder::ConfigureVulkanDecoder(
 +    const VideoDecoderConfig& config) {
-+  ReleaseResources(/*release_slot=*/false);
-+
-+  if (!has_decoder_slot_) {
-+    if (!TryAcquireDecoderSlot()) {
-+      VLOG(1) << "VulkanVideoDecoder: max concurrent decoders ("
-+              << kMaxConcurrentDecoders << ") reached; rejecting config";
-+      return false;
-+    }
-+    has_decoder_slot_ = true;
-+  }
++  ReleaseResources();
 +
 +  hw_device_ctx_ = VulkanVideoDevice::GetInstance()->AcquireDevice();
 +  if (!hw_device_ctx_) {
-+    ReleaseResources(/*release_slot=*/true);
++    ReleaseResources();
 +    return false;
 +  }
 +
++  const DecoderVramEstimate est = EstimateDecoderSessionVram(config);
++  int active_decoders = 0;
++  VulkanVramBudget budget;
++  if (!VulkanVideoDevice::GetInstance()->TryAcquireDecoderAdmission(
++          est.total_bytes(), &active_decoders, &budget)) {
++    VLOG(1) << "VulkanVideoDecoder: admission denied (active="
++            << active_decoders
++            << ", est_mib=" << (est.total_bytes() / (1024 * 1024))
++            << ", live_budget=" << budget.live_budget_supported
++            << ", avail_mib=" << (budget.available_bytes / (1024 * 1024))
++            << ") for " << GetCodecName(config.codec()) << " "
++            << config.coded_size().ToString();
++    ReleaseResources();
++    return false;
++  }
++  has_decoder_slot_ = true;
++  reserved_vram_bytes_ = est.total_bytes();
++  pending_dpb_vram_bytes_ = est.dpb_bytes;
++  pending_pool_vram_bytes_ = est.pool_bytes;
++  est_frame_vram_bytes_ = est.frame_bytes;
++  const gfx::Size effective_size = config.coded_size().IsEmpty()
++                                       ? config.visible_rect().size()
++                                       : config.coded_size();
++  VLOG(1) << "VulkanVideoDecoder: admitted decoder (active=" << active_decoders
++          << ", est_mib=" << (est.total_bytes() / (1024 * 1024))
++          << ", live_budget=" << budget.live_budget_supported
++          << ", avail_mib=" << (budget.available_bytes / (1024 * 1024))
++          << ", pool_cap=" << MaxOutputPoolSizeForFrame(effective_size)
++          << ") for " << GetCodecName(config.codec()) << " "
++          << config.coded_size().ToString();
++
 +  codec_context_.reset(avcodec_alloc_context3(nullptr));
 +  if (!codec_context_) {
-+    ReleaseResources(/*release_slot=*/true);
++    ReleaseResources();
 +    return false;
 +  }
 +
@@ -1801,14 +2110,14 @@
 +  if (!codec) {
 +    LOG(ERROR) << "VulkanVideoDecoder: avcodec_find_decoder failed for codec "
 +               << GetCodecName(config.codec());
-+    ReleaseResources(/*release_slot=*/true);
++    ReleaseResources();
 +    return false;
 +  }
 +  int err = avcodec_open2(codec_context_.get(), codec, nullptr);
 +  if (err < 0) {
 +    LOG(ERROR) << "VulkanVideoDecoder: avcodec_open2 failed for codec "
 +               << GetCodecName(config.codec()) << ": " << AVErrorToString(err);
-+    ReleaseResources(/*release_slot=*/true);
++    ReleaseResources();
 +    return false;
 +  }
 +  VLOG(1) << "VulkanVideoDecoder: initialized " << codec->name << " for "
@@ -1817,7 +2126,7 @@
 +  return true;
 +}
 +
-+void VulkanVideoDecoder::ReleaseResources(bool release_slot) {
++void VulkanVideoDecoder::ReleaseResources() {
 +  if (zero_wait_emits_ > 0 || waited_emits_ > 0) {
 +    VLOG(1) << "VulkanVideoDecoder copy stats: zero_wait=" << zero_wait_emits_
 +            << " waited=" << waited_emits_;
@@ -1852,9 +2161,15 @@
 +    hw_device_ctx_ = nullptr;
 +  }
 +  initialized_ = false;
-+  if (release_slot && has_decoder_slot_) {
-+    g_active_decoders.fetch_sub(1, std::memory_order_acq_rel);
++  if (has_decoder_slot_) {
++    VulkanVideoDevice::GetInstance()->ReleaseDecoderAdmission(
++        reserved_vram_bytes_,
++        pending_dpb_vram_bytes_ + pending_pool_vram_bytes_);
 +    has_decoder_slot_ = false;
++    reserved_vram_bytes_ = 0;
++    pending_dpb_vram_bytes_ = 0;
++    pending_pool_vram_bytes_ = 0;
++    est_frame_vram_bytes_ = 0;
 +  }
 +}
 +
@@ -2110,7 +2425,8 @@
 +    }
 +  }
 +
-+  if (!chosen && copy_state_->slots.size() < kMaxOutputPoolSize) {
++  const size_t max_pool_size = MaxOutputPoolSizeForFrame(coded_size);
++  if (!chosen && copy_state_->slots.size() < max_pool_size) {
 +    auto new_slot = CreateDmabufSlot(
 +        hw_device_ctx_, vk_dev, *copy_info, w, h, pixel_format, visible_rect,
 +        natural_size, color_space, config_.hdr_metadata(), pts);
@@ -2121,6 +2437,12 @@
 +                                                new_slot->origin_frame);
 +    copy_state_->slots.push_back(std::move(*new_slot));
 +    chosen = &copy_state_->slots.back();
++    if (pending_pool_vram_bytes_ > 0) {
++      const uint64_t delta =
++          std::min(pending_pool_vram_bytes_, est_frame_vram_bytes_);
++      VulkanVideoDevice::GetInstance()->NotifyDecoderVramAllocated(delta);
++      pending_pool_vram_bytes_ -= delta;
++    }
 +  }
 +
 +  scoped_refptr<FrameResource> resource;
@@ -2208,6 +2530,11 @@
 +}
 +
 +bool VulkanVideoDecoder::EmitFrame(AVFrame* hw_frame) {
++  if (pending_dpb_vram_bytes_ > 0) {
++    VulkanVideoDevice::GetInstance()->NotifyDecoderVramAllocated(
++        pending_dpb_vram_bytes_);
++    pending_dpb_vram_bytes_ = 0;
++  }
 +  const gfx::Size coded_size(hw_frame->width, hw_frame->height);
 +  gfx::Rect visible_rect(coded_size);
 +  if (hw_frame->crop_left || hw_frame->crop_top || hw_frame->crop_right ||
@@ -2394,12 +2721,35 @@
 +  }
 +}
 +
++void VulkanVideoDecoder::ReleaseIdleOutputSlots() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (!copy_state_ || copy_state_->slots.empty()) {
++    return;
++  }
++  size_t reclaimed = 0;
++  for (auto it = copy_state_->slots.begin(); it != copy_state_->slots.end();) {
++    if (!it->in_use) {
++      copy_state_->origin_frames_by_token.erase(it->token);
++      it = copy_state_->slots.erase(it);
++      ++reclaimed;
++    } else {
++      ++it;
++    }
++  }
++  if (reclaimed > 0) {
++    VLOG(1) << "VulkanVideoDecoder: reclaimed " << reclaimed
++            << " idle output slot(s) on Reset (remaining="
++            << copy_state_->slots.size() << ")";
++  }
++}
++
 +void VulkanVideoDecoder::Reset(base::OnceClosure closure) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +  DiscardPendingEmits();
 +  if (frame_converter_) {
 +    frame_converter_->AbortPendingFrames();
 +  }
++  ReleaseIdleOutputSlots();
 +  if (codec_context_) {
 +    avcodec_flush_buffers(codec_context_.get());
 +  }
