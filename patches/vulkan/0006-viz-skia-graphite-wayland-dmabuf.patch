@@ -450,3 +450,45 @@
      return true;
    }
  #endif  // BUILDFLAG(SKIA_USE_DAWN)
+--- a/third_party/dawn/src/dawn/native/vulkan/PhysicalDeviceVk.cpp
++++ b/third_party/dawn/src/dawn/native/vulkan/PhysicalDeviceVk.cpp
+@@ -495,6 +495,19 @@
+     if (allMultiplanarFormatsSupported) {
+         EnableFeature(Feature::DawnMultiPlanarFormats);
+         EnableFeature(Feature::MultiPlanarFormatExtendedUsages);
++        if (unorm16FormatsFilterabilitySupported) {
++            VkFormatProperties p010Props;
++            mVulkanInstance->GetFunctions().GetPhysicalDeviceFormatProperties(
++                mVkPhysicalDevice, VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16, &p010Props);
++            if (IsSubset(static_cast<VkFormatFeatureFlagBits>(
++                             VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
++                             VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
++                             VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
++                             VK_FORMAT_FEATURE_TRANSFER_DST_BIT),
++                         p010Props.optimalTilingFeatures)) {
++                EnableFeature(Feature::MultiPlanarFormatP010);
++            }
++        }
+     }
+ 
+     EnableFeature(Feature::TransientAttachments);
+--- a/third_party/dawn/src/dawn/native/vulkan/SharedTextureMemoryVk.cpp
++++ b/third_party/dawn/src/dawn/native/vulkan/SharedTextureMemoryVk.cpp
+@@ -84,6 +84,8 @@
+ constexpr auto kDrmFormatABGR16161616F =
+     DrmFourccCode('A', 'B', '4', 'H'); /* [63:0] A:B:G:R 16:16:16:16 little endian */
+ constexpr auto kDrmFormatNV12 = DrmFourccCode('N', 'V', '1', '2'); /* 2x2 subsampled Cr:Cb plane */
++constexpr auto kDrmFormatP010 =
++    DrmFourccCode('P', '0', '1', '0'); /* 2x2 subsampled Cr:Cb plane 10 bits per channel */
+ 
+ [[maybe_unused]] ResultOrValError<wgpu::TextureFormat> FormatFromDrmFormat(uint32_t drmFormat) {
+     switch (drmFormat) {
+@@ -103,6 +105,8 @@
+             return wgpu::TextureFormat::RGBA16Float;
+         case kDrmFormatNV12:
+             return wgpu::TextureFormat::R8BG8Biplanar420Unorm;
++        case kDrmFormatP010:
++            return wgpu::TextureFormat::R10X6BG10X6Biplanar420Unorm;
+         default:
+             return DAWN_VALIDATION_ERROR("Unsupported drm format %x.", drmFormat);
+     }

@@ -107,7 +107,7 @@
  #endif  // BUILDFLAG(IS_LINUX)
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_encode_accelerator.h
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,123 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -199,6 +199,7 @@
 +                               AVFrame* hw_frame);
 +  void DrainPackets();
 +  void DrainOutputs();
++  void CompletePendingFlushIfReady();
 +  void ReleaseResources();
 +
 +  std::unique_ptr<MediaLog> media_log_;
@@ -222,6 +223,7 @@
 +  base::circular_deque<OutputBuffer> available_bitstream_buffers_;
 +  base::circular_deque<PendingOutput> pending_outputs_;
 +  base::circular_deque<base::TimeDelta> pending_timestamps_;
++  FlushCallback pending_flush_callback_;
 +
 +  SEQUENCE_CHECKER(sequence_checker_);
 +};
@@ -231,7 +233,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_ENCODE_ACCELERATOR_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_encode_accelerator.cc
-@@ -0,0 +1,1559 @@
+@@ -0,0 +1,1582 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1602,6 +1604,7 @@
 +      region.MapAt(buffer.offset(), buffer.size());
 +  if (!mapping.IsValid()) {
 +    has_error_ = true;
++    CompletePendingFlushIfReady();
 +    client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
 +    return;
 +  }
@@ -1624,6 +1627,7 @@
 +                 << out.data.size() << ") exceeds bitstream buffer ("
 +                 << dst.size << ")";
 +      has_error_ = true;
++      CompletePendingFlushIfReady();
 +      client_->NotifyErrorStatus(EncoderStatus::Codes::kEncoderFailedEncode);
 +      return;
 +    }
@@ -1632,7 +1636,32 @@
 +    BitstreamBufferMetadata metadata(out.data.size(), out.key_frame,
 +                                     out.timestamp);
 +    client_->BitstreamBufferReady(dst.id, metadata);
++    if (has_error_ || !initialized_ || !codec_context_) {
++      break;
++    }
 +  }
++  CompletePendingFlushIfReady();
++}
++
++void VulkanVideoEncodeAccelerator::CompletePendingFlushIfReady() {
++  if (!pending_flush_callback_) {
++    return;
++  }
++  if (!has_error_ && !pending_outputs_.empty()) {
++    return;
++  }
++  if (copy_state_ && hw_device_ctx_) {
++    auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ctx_->data);
++    auto* vk_dev =
++        dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx) : nullptr;
++    const auto* copy_info = VulkanVideoDevice::GetInstance()->GetCopyInfo();
++    if (vk_dev && vk_dev->act_dev && copy_info && copy_info->procs_ready) {
++      for (auto& slot : copy_state_->slots) {
++        ReapEncodeCopySlot(vk_dev, copy_info->procs, slot, /*wait=*/true);
++      }
++    }
++  }
++  std::move(pending_flush_callback_).Run(!has_error_);
 +}
 +
 +void VulkanVideoEncodeAccelerator::RequestEncodingParametersChange(
@@ -1705,19 +1734,12 @@
 +    return;
 +  }
 +  DrainPackets();
-+  DrainOutputs();
-+  if (copy_state_ && hw_device_ctx_) {
-+    auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ctx_->data);
-+    auto* vk_dev =
-+        dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx) : nullptr;
-+    const auto* copy_info = VulkanVideoDevice::GetInstance()->GetCopyInfo();
-+    if (vk_dev && vk_dev->act_dev && copy_info && copy_info->procs_ready) {
-+      for (auto& slot : copy_state_->slots) {
-+        ReapEncodeCopySlot(vk_dev, copy_info->procs, slot, /*wait=*/true);
-+      }
-+    }
++  if (!has_error_ && codec_context_) {
++    avcodec_flush_buffers(codec_context_.get());
 +  }
-+  std::move(flush_callback).Run(!has_error_);
++  pending_flush_callback_ = std::move(flush_callback);
++  DrainOutputs();
++  CompletePendingFlushIfReady();
 +}
 +
 +bool VulkanVideoEncodeAccelerator::IsFlushSupported() {
@@ -1788,6 +1810,9 @@
 +  pending_timestamps_.clear();
 +  initialized_ = false;
 +  logged_zero_copy_ = false;
++  if (pending_flush_callback_) {
++    std::move(pending_flush_callback_).Run(false);
++  }
 +}
 +
 +}  // namespace media
