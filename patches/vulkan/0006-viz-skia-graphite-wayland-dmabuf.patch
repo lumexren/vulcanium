@@ -129,3 +129,324 @@
      std::string status;
      // Features undergoing a finch controlled roll out.
      if (gpu_feature_data.name == "direct_rendering_display_compositor") {
+--- a/gpu/ipc/service/gpu_init.h
++++ b/gpu/ipc/service/gpu_init.h
+@@ -170,6 +170,13 @@
+ #endif
+ };
+ 
++#if BUILDFLAG(ENABLE_VULKAN) && BUILDFLAG(SKIA_USE_DAWN)
++namespace gpu_init_internal {
++std::optional<VulkanInfo> CollectVulkanInfoFromDawn(
++    DawnContextProvider* dawn_context_provider);
++}  // namespace gpu_init_internal
++#endif
++
+ }  // namespace gpu
+ 
+ #endif  // GPU_IPC_SERVICE_GPU_INIT_H_
+--- a/gpu/ipc/service/gpu_init.cc
++++ b/gpu/ipc/service/gpu_init.cc
+@@ -8,10 +8,12 @@
+ #include <cstring>
+ #include <optional>
+ #include <string>
++#include <vector>
+ 
+ #include "base/android/android_info.h"
+ #include "base/base_paths.h"
+ #include "base/command_line.h"
++#include "base/compiler_specific.h"
+ #include "base/debug/dump_without_crashing.h"
+ #include "base/feature_list.h"
+ #include "base/files/file_path.h"
+@@ -53,6 +55,10 @@
+ #include "ui/gl/gl_utils.h"
+ #include "ui/gl/init/gl_factory.h"
+ 
++#if BUILDFLAG(IS_POSIX)
++#include <dlfcn.h>
++#endif
++
+ #if BUILDFLAG(IS_MAC)
+ #include <GLES2/gl2.h>
+ #endif
+@@ -109,6 +115,17 @@
+ #include "third_party/dawn/include/dawn/webgpu_cpp.h"  // nogncheck
+ #endif
+ 
++#if BUILDFLAG(ENABLE_VULKAN) && BUILDFLAG(SKIA_USE_DAWN)
++#include "gpu/vulkan/vulkan_function_pointers.h"
++#include "third_party/dawn/include/dawn/native/VulkanBackend.h"  // nogncheck
++#ifdef Status
++#undef Status
++#endif
++#ifdef False
++#undef False
++#endif
++#endif
++
+ #if BUILDFLAG(SKIA_USE_DAWN) && BUILDFLAG(IS_CHROMEOS)
+ #include "gpu/command_buffer/service/drm_modifiers_filter_dawn.h"
+ #endif
+@@ -360,6 +377,220 @@
+ 
+ }  // namespace
+ 
++#if BUILDFLAG(ENABLE_VULKAN) && BUILDFLAG(SKIA_USE_DAWN)
++namespace gpu_init_internal {
++
++DISABLE_CFI_ICALL
++std::optional<VulkanInfo> CollectVulkanInfoFromDawn(
++    DawnContextProvider* dawn_context_provider) {
++  if (!dawn_context_provider ||
++      dawn_context_provider->backend_type() != wgpu::BackendType::Vulkan) {
++    return std::nullopt;
++  }
++
++  wgpu::Device device = dawn_context_provider->GetDevice();
++  if (!device) {
++    return std::nullopt;
++  }
++
++  VkInstance vk_instance = dawn::native::vulkan::GetInstance(device.Get());
++  if (vk_instance == VK_NULL_HANDLE) {
++    return std::nullopt;
++  }
++
++  auto load_proc = [&](const char* name) {
++    return dawn::native::vulkan::GetInstanceProcAddr(device.Get(), name);
++  };
++
++  auto vk_enumerate_physical_devices =
++      reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
++          load_proc("vkEnumeratePhysicalDevices"));
++  auto vk_get_physical_device_properties =
++      reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
++          load_proc("vkGetPhysicalDeviceProperties"));
++  auto vk_enumerate_device_extension_properties =
++      reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
++          load_proc("vkEnumerateDeviceExtensionProperties"));
++  auto vk_get_physical_device_queue_family_properties =
++      reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
++          load_proc("vkGetPhysicalDeviceQueueFamilyProperties"));
++  if (!vk_enumerate_physical_devices || !vk_get_physical_device_properties ||
++      !vk_enumerate_device_extension_properties ||
++      !vk_get_physical_device_queue_family_properties) {
++    return std::nullopt;
++  }
++
++  auto vk_get_physical_device_features =
++      reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures>(
++          load_proc("vkGetPhysicalDeviceFeatures"));
++  auto vk_get_physical_device_properties2 =
++      reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
++          load_proc("vkGetPhysicalDeviceProperties2"));
++  auto vk_get_physical_device_features2 =
++      reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
++          load_proc("vkGetPhysicalDeviceFeatures2"));
++
++  VulkanInfo vulkan_info;
++  vulkan_info.api_version = VK_API_VERSION_1_1;
++  vulkan_info.used_api_version = VK_API_VERSION_1_1;
++
++  auto get_instance_proc_addr =
++      reinterpret_cast<PFN_vkGetInstanceProcAddr>(
++          load_proc("vkGetInstanceProcAddr"));
++#if BUILDFLAG(IS_POSIX)
++  void* vulkan_lib = nullptr;
++  if (!get_instance_proc_addr &&
++      !dawn_context_provider->is_vulkan_swiftshader_adapter()) {
++    vulkan_lib = dlopen("libvulkan.so.1", RTLD_LAZY | RTLD_NOLOAD);
++    if (vulkan_lib) {
++      get_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
++          dlsym(vulkan_lib, "vkGetInstanceProcAddr"));
++    }
++  }
++#endif  // BUILDFLAG(IS_POSIX)
++
++  if (get_instance_proc_addr) {
++    if (auto vk_enumerate_instance_version =
++            reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
++                get_instance_proc_addr(VK_NULL_HANDLE,
++                                       "vkEnumerateInstanceVersion"))) {
++      uint32_t version = 0;
++      if (vk_enumerate_instance_version(&version) == VK_SUCCESS &&
++          version >= VK_API_VERSION_1_1) {
++        vulkan_info.api_version = version;
++      }
++    }
++
++    if (auto vk_enumerate_instance_extension_properties =
++            reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
++                get_instance_proc_addr(
++                    VK_NULL_HANDLE,
++                    "vkEnumerateInstanceExtensionProperties"))) {
++      uint32_t ext_count = 0;
++      if (vk_enumerate_instance_extension_properties(nullptr, &ext_count,
++                                                     nullptr) == VK_SUCCESS &&
++          ext_count > 0) {
++        vulkan_info.instance_extensions.resize(ext_count);
++        if (vk_enumerate_instance_extension_properties(
++                nullptr, &ext_count, vulkan_info.instance_extensions.data()) !=
++            VK_SUCCESS) {
++          vulkan_info.instance_extensions.clear();
++        } else {
++          vulkan_info.instance_extensions.resize(ext_count);
++        }
++      }
++    }
++
++    if (auto vk_enumerate_instance_layer_properties =
++            reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(
++                get_instance_proc_addr(
++                    VK_NULL_HANDLE, "vkEnumerateInstanceLayerProperties"))) {
++      uint32_t layer_count = 0;
++      if (vk_enumerate_instance_layer_properties(&layer_count, nullptr) ==
++              VK_SUCCESS &&
++          layer_count > 0) {
++        vulkan_info.instance_layers.resize(layer_count);
++        if (vk_enumerate_instance_layer_properties(
++                &layer_count, vulkan_info.instance_layers.data()) !=
++            VK_SUCCESS) {
++          vulkan_info.instance_layers.clear();
++        } else {
++          vulkan_info.instance_layers.resize(layer_count);
++        }
++      }
++    }
++  }
++
++#if BUILDFLAG(IS_POSIX)
++  if (vulkan_lib) {
++    dlclose(vulkan_lib);
++  }
++#endif  // BUILDFLAG(IS_POSIX)
++
++  uint32_t device_count = 0;
++  if (vk_enumerate_physical_devices(vk_instance, &device_count, nullptr) !=
++          VK_SUCCESS ||
++      device_count == 0) {
++    return std::nullopt;
++  }
++
++  std::vector<VkPhysicalDevice> physical_devices(device_count);
++  if (vk_enumerate_physical_devices(vk_instance, &device_count,
++                                    physical_devices.data()) != VK_SUCCESS ||
++      device_count == 0) {
++    return std::nullopt;
++  }
++  physical_devices.resize(device_count);
++
++  vulkan_info.physical_devices.reserve(physical_devices.size());
++  for (VkPhysicalDevice physical_device : physical_devices) {
++    vulkan_info.physical_devices.emplace_back();
++    auto& info = vulkan_info.physical_devices.back();
++    info.device = physical_device;
++
++    vk_get_physical_device_properties(physical_device, &info.properties);
++
++    uint32_t ext_count = 0;
++    if (vk_enumerate_device_extension_properties(
++            physical_device, nullptr, &ext_count, nullptr) == VK_SUCCESS &&
++        ext_count > 0) {
++      info.extensions.resize(ext_count);
++      if (vk_enumerate_device_extension_properties(
++              physical_device, nullptr, &ext_count, info.extensions.data()) !=
++          VK_SUCCESS) {
++        info.extensions.clear();
++      } else {
++        info.extensions.resize(ext_count);
++      }
++    }
++
++    if (info.properties.apiVersion >= VK_API_VERSION_1_1 &&
++        vk_get_physical_device_properties2 &&
++        vk_get_physical_device_features2) {
++      info.driver_properties = VkPhysicalDeviceDriverProperties{
++          .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
++      };
++      VkPhysicalDeviceProperties2 properties2 = {
++          .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
++          .pNext = &info.driver_properties,
++      };
++      vk_get_physical_device_properties2(physical_device, &properties2);
++
++      VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr_conversion_features = {
++          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES};
++      VkPhysicalDeviceProtectedMemoryFeatures protected_memory_feature = {
++          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES};
++      VkPhysicalDeviceFeatures2 features_2 = {
++          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
++      features_2.pNext = &ycbcr_conversion_features;
++      ycbcr_conversion_features.pNext = &protected_memory_feature;
++
++      vk_get_physical_device_features2(physical_device, &features_2);
++      info.features = features_2.features;
++      info.feature_sampler_ycbcr_conversion =
++          ycbcr_conversion_features.samplerYcbcrConversion;
++      info.feature_protected_memory = protected_memory_feature.protectedMemory;
++    } else if (vk_get_physical_device_features) {
++      vk_get_physical_device_features(physical_device, &info.features);
++    }
++
++    uint32_t queue_count = 0;
++    vk_get_physical_device_queue_family_properties(physical_device, &queue_count,
++                                                   nullptr);
++    if (queue_count > 0) {
++      info.queue_families.resize(queue_count);
++      vk_get_physical_device_queue_family_properties(
++          physical_device, &queue_count, info.queue_families.data());
++      info.queue_families.resize(queue_count);
++    }
++  }
++
++  return vulkan_info;
++}
++
++}  // namespace gpu_init_internal
++#endif  // BUILDFLAG(ENABLE_VULKAN) && BUILDFLAG(SKIA_USE_DAWN)
++
+ // static
+ std::unique_ptr<GpuInit> GpuInit::Create() {
+   if (base::FeatureList::IsEnabled(features::kGpuInitOptimization)) {
+@@ -1446,6 +1677,18 @@
+       DawnContextProvider::Create(gpu_preferences_, gpu_feature_info_,
+                                   progress_reporter, validate_adapter_fn);
+   if (dawn_context_provider_) {
++#if BUILDFLAG(ENABLE_VULKAN)
++    if (dawn_context_provider_->backend_type() == wgpu::BackendType::Vulkan &&
++        !gpu_info_.vulkan_info) {
++      if (auto vulkan_info = gpu_init_internal::CollectVulkanInfoFromDawn(
++              dawn_context_provider_.get())) {
++        gpu_info_.vulkan_info = std::move(*vulkan_info);
++        if (!dawn_context_provider_->is_vulkan_swiftshader_adapter()) {
++          gpu_info_.hardware_supports_vulkan = true;
++        }
++      }
++    }
++#endif
+     return true;
+   }
+ #endif  // BUILDFLAG(SKIA_USE_DAWN)
+--- a/gpu/ipc/service/gpu_init_2.cc
++++ b/gpu/ipc/service/gpu_init_2.cc
+@@ -1225,6 +1225,18 @@
+       DawnContextProvider::Create(gpu_preferences_, gpu_feature_info_,
+                                   progress_reporter, validate_adapter_fn);
+   if (dawn_context_provider_) {
++#if BUILDFLAG(ENABLE_VULKAN)
++    if (dawn_context_provider_->backend_type() == wgpu::BackendType::Vulkan &&
++        !gpu_info_.vulkan_info) {
++      if (auto vulkan_info = gpu_init_internal::CollectVulkanInfoFromDawn(
++              dawn_context_provider_.get())) {
++        gpu_info_.vulkan_info = std::move(*vulkan_info);
++        if (!dawn_context_provider_->is_vulkan_swiftshader_adapter()) {
++          gpu_info_.hardware_supports_vulkan = true;
++        }
++      }
++    }
++#endif
+     return true;
+   }
+ #endif  // BUILDFLAG(SKIA_USE_DAWN)
