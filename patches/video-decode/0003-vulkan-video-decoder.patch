@@ -1212,7 +1212,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,2254 @@
+@@ -0,0 +1,2380 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1982,6 +1982,103 @@
 +}
 +
 +NO_SANITIZE("cfi") __attribute__((noinline))
++void QueryDmabufPlaneLayouts(AVVulkanDeviceContext* vk_dev,
++                             const VkCopyProcs& p,
++                             VkImage img,
++                             int w,
++                             bool is_p010,
++                             uint64_t fallback_size,
++                             uint32_t strides[2],
++                             uint64_t offsets[2],
++                             uint64_t sizes[2]) {
++  const VkImageAspectFlags aspects[2] = {
++      VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
++      VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT};
++  const uint32_t bpp = is_p010 ? 2u : 1u;
++  for (int i = 0; i < 2; ++i) {
++    VkImageSubresource sub{.aspectMask = aspects[i]};
++    VkSubresourceLayout lay{};
++    p.vkGetImageSubresourceLayout(vk_dev->act_dev, img, &sub, &lay);
++    strides[i] = lay.rowPitch > 0 ? static_cast<uint32_t>(lay.rowPitch)
++                                  : static_cast<uint32_t>(w) * bpp;
++    offsets[i] = lay.offset;
++    sizes[i] = lay.size > 0 ? lay.size : fallback_size;
++  }
++}
++
++// Verifies that an explicit-modifier DMA-BUF import (matching Chromium's
++// VulkanImage / OzoneImageBacking import path) produces a GPU VA allocation
++// covering the full exported backing and plane subresource range. Some
++// drivers (e.g. NVIDIA block-linear modifiers at non-tile-aligned sizes)
++// report a smaller VkMemoryRequirements::size on explicit import, which
++// causes truncated UV mappings, chroma corruption, and SM MMU faults (Xid 13).
++NO_SANITIZE("cfi") __attribute__((noinline))
++bool IsExplicitDmabufImportCompatible(AVVulkanDeviceContext* vk_dev,
++                                      const VkCopyProcs& p,
++                                      VkFormat vk_format,
++                                      const gfx::Size& import_size,
++                                      uint64_t chosen_mod,
++                                      const VkMemoryRequirements& export_req,
++                                      const uint32_t strides[2],
++                                      const uint64_t offsets[2],
++                                      const uint64_t sizes[2]) {
++  if (chosen_mod == DRM_FORMAT_MOD_LINEAR) {
++    return true;
++  }
++  if (import_size.IsEmpty()) {
++    return false;
++  }
++  const uint64_t max_plane_end =
++      std::max(offsets[0] + sizes[0], offsets[1] + sizes[1]);
++  if (export_req.size < max_plane_end) {
++    return false;
++  }
++
++  VkSubresourceLayout plane_layouts[2] = {
++      {.offset = offsets[0], .size = 0, .rowPitch = strides[0]},
++      {.offset = offsets[1], .size = 0, .rowPitch = strides[1]},
++  };
++  VkImageDrmFormatModifierExplicitCreateInfoEXT explicit_mod{
++      .sType =
++          VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++      .drmFormatModifier = chosen_mod,
++      .drmFormatModifierPlaneCount = 2,
++      .pPlaneLayouts = plane_layouts,
++  };
++  VkExternalMemoryImageCreateInfo ext_info{
++      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
++      .pNext = &explicit_mod,
++      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++  };
++  VkImageCreateInfo import_ci{
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .pNext = &ext_info,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = vk_format,
++      .extent = {static_cast<uint32_t>(import_size.width()),
++                 static_cast<uint32_t>(import_size.height()), 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
++      .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
++               VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++  };
++  VkImage test_img = VK_NULL_HANDLE;
++  if (p.vkCreateImage(vk_dev->act_dev, &import_ci, nullptr, &test_img) !=
++          VK_SUCCESS ||
++      test_img == VK_NULL_HANDLE) {
++    return false;
++  }
++  VkMemoryRequirements import_req{};
++  p.vkGetImageMemoryRequirements(vk_dev->act_dev, test_img, &import_req);
++  p.vkDestroyImage(vk_dev->act_dev, test_img, nullptr);
++  return import_req.size >= export_req.size && import_req.size >= max_plane_end;
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
 +std::optional<OutputSlot> CreateDmabufSlot(
 +    AVBufferRef* dev_ctx_ref,
 +    AVVulkanDeviceContext* vk_dev,
@@ -2073,6 +2170,53 @@
 +    CleanupVkImageMemory(vk_dev, p, dst_img, dst_mem);
 +    return std::nullopt;
 +  }
++
++  VkMemoryRequirements req{};
++  p.vkGetImageMemoryRequirements(vk_dev->act_dev, dst_img, &req);
++
++  uint32_t strides[2]{};
++  uint64_t offsets[2]{};
++  uint64_t sizes[2]{};
++  QueryDmabufPlaneLayouts(vk_dev, p, dst_img, w, is_p010, req.size, strides,
++                          offsets, sizes);
++
++  const gfx::Size import_size(
++      visible_rect.right() > 0 ? visible_rect.right() : w,
++      visible_rect.bottom() > 0 ? visible_rect.bottom() : h);
++  if (chosen_mod != DRM_FORMAT_MOD_LINEAR &&
++      (!IsExplicitDmabufImportCompatible(vk_dev, p, vk_format, coded_size,
++                                         chosen_mod, req, strides, offsets,
++                                         sizes) ||
++       (import_size != coded_size &&
++        !IsExplicitDmabufImportCompatible(vk_dev, p, vk_format, import_size,
++                                          chosen_mod, req, strides, offsets,
++                                          sizes)))) {
++    static std::atomic<bool> logged_incompatible_mod{false};
++    if (!logged_incompatible_mod.exchange(true, std::memory_order_relaxed)) {
++      VLOG(1) << "VulkanVideoDecoder: rejecting explicit-import incompatible "
++                 "modifier=0x"
++              << std::hex << chosen_mod << std::dec << " for "
++              << coded_size.ToString() << " (import=" << import_size.ToString()
++              << "), falling back to linear";
++    }
++    p.vkDestroyImage(vk_dev->act_dev, dst_img, nullptr);
++    dst_img = VK_NULL_HANDLE;
++    mod_list.drmFormatModifierCount = 1;
++    mod_list.pDrmFormatModifiers = &linear_mod;
++    chosen_mod = DRM_FORMAT_MOD_LINEAR;
++    ci_res = p.vkCreateImage(vk_dev->act_dev, &img_ci, nullptr, &dst_img);
++    if (ci_res != VK_SUCCESS) {
++      LOG(WARNING) << "VulkanVideoDecoder: linear vkCreateImage fallback failed: "
++                   << ci_res << " p010=" << is_p010;
++      CleanupVkImageMemory(vk_dev, p, dst_img, dst_mem);
++      return std::nullopt;
++    }
++    req = {};
++    p.vkGetImageMemoryRequirements(vk_dev->act_dev, dst_img, &req);
++    QueryDmabufPlaneLayouts(vk_dev, p, dst_img, w, is_p010, req.size, strides,
++                            offsets, sizes);
++  }
++
 +  if (is_p010) {
 +    static bool logged_p010_slot = false;
 +    if (!logged_p010_slot) {
@@ -2089,8 +2233,6 @@
 +    }
 +  }
 +
-+  VkMemoryRequirements req{};
-+  p.vkGetImageMemoryRequirements(vk_dev->act_dev, dst_img, &req);
 +  uint32_t mem_idx = UINT32_MAX;
 +  for (uint32_t m = 0; m < info.mem_props.memoryTypeCount; ++m) {
 +    if ((req.memoryTypeBits & (1u << m)) &&
@@ -2125,22 +2267,6 @@
 +      p.vkBindImageMemory(vk_dev->act_dev, dst_img, dst_mem, 0) != VK_SUCCESS) {
 +    CleanupVkImageMemory(vk_dev, p, dst_img, dst_mem);
 +    return std::nullopt;
-+  }
-+
-+  VkImageAspectFlags aspects[2] = {VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT,
-+                                   VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT};
-+  uint32_t strides[2]{};
-+  uint64_t offsets[2]{};
-+  uint64_t sizes[2]{};
-+  const uint32_t bpp = is_p010 ? 2u : 1u;
-+  for (int i = 0; i < 2; ++i) {
-+    VkImageSubresource sub{.aspectMask = aspects[i]};
-+    VkSubresourceLayout lay{};
-+    p.vkGetImageSubresourceLayout(vk_dev->act_dev, dst_img, &sub, &lay);
-+    strides[i] = lay.rowPitch > 0 ? static_cast<uint32_t>(lay.rowPitch)
-+                                  : static_cast<uint32_t>(w) * bpp;
-+    offsets[i] = lay.offset;
-+    sizes[i] = lay.size > 0 ? lay.size : req.size;
 +  }
 +
 +  VkMemoryGetFdInfoKHR fd_info{
