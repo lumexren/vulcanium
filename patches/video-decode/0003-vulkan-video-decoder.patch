@@ -25,7 +25,7 @@
  
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.h
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,197 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -36,12 +36,21 @@
 +#include <vulkan/vulkan.h>
 +
 +#include <cstdint>
++#include <memory>
 +#include <vector>
 +
++#include "base/files/scoped_file.h"
++#include "base/functional/callback.h"
++#include "base/memory/scoped_refptr.h"
 +#include "base/no_destructor.h"
 +#include "base/synchronization/lock.h"
++#include "base/threading/thread.h"
 +#include "media/gpu/media_gpu_export.h"
 +#include "ui/gfx/geometry/size.h"
++
++namespace base {
++class SequencedTaskRunner;
++}  // namespace base
 +
 +struct AVBufferRef;
 +struct AVVulkanDeviceContext;
@@ -73,6 +82,9 @@
 +  PFN_vkResetFences vkResetFences = nullptr;
 +  PFN_vkGetFenceStatus vkGetFenceStatus = nullptr;
 +  PFN_vkWaitForFences vkWaitForFences = nullptr;
++  PFN_vkGetFenceFdKHR vkGetFenceFdKHR = nullptr;
++  PFN_vkGetPhysicalDeviceExternalFenceProperties
++      vkGetPhysicalDeviceExternalFenceProperties = nullptr;
 +  PFN_vkQueueSubmit vkQueueSubmit = nullptr;
 +  PFN_vkGetDeviceQueue vkGetDeviceQueue = nullptr;
 +  PFN_vkGetPhysicalDeviceMemoryProperties
@@ -101,6 +113,7 @@
 +  VkQueue copy_queue = VK_NULL_HANDLE;
 +  bool copy_queue_is_dedicated_transfer = false;
 +  bool has_memory_budget = false;
++  bool has_sync_fd_fence = false;
 +  bool procs_ready = false;
 +};
 +
@@ -151,6 +164,9 @@
 +  void NotifyDecoderVramAllocated(uint64_t newly_allocated_bytes);
 +  void ReleaseDecoderAdmission(uint64_t reserved_bytes,
 +                               uint64_t remaining_pending_bytes);
++  void WatchSyncFdReadable(base::ScopedFD fd,
++                           scoped_refptr<base::SequencedTaskRunner> reply_runner,
++                           base::OnceClosure on_readable);
 +
 + private:
 +  friend class base::NoDestructor<VulkanVideoDevice>;
@@ -169,13 +185,21 @@
 +  int active_decoders_ = 0;
 +  uint64_t total_estimated_vram_bytes_ = 0;
 +  uint64_t pending_unallocated_vram_bytes_ = 0;
++
++  base::Lock fence_io_lock_;
++  std::unique_ptr<base::Thread> fence_io_thread_;
 +};
 +
 +MEDIA_GPU_EXPORT bool CreateCopyCmdResources(AVVulkanDeviceContext* vk_dev,
 +                                             const VkCopyInfo& info,
 +                                             VkCommandPool* pool_out,
 +                                             VkCommandBuffer* buf_out,
-+                                             VkFence* fence_out);
++                                             VkFence* fence_out,
++                                             bool export_sync_fd = false);
++
++MEDIA_GPU_EXPORT base::ScopedFD ExportFenceSyncFd(AVVulkanDeviceContext* vk_dev,
++                                                  const VkCopyProcs& procs,
++                                                  VkFence fence);
 +
 +MEDIA_GPU_EXPORT void DestroyCopyCmdResources(AVVulkanDeviceContext* vk_dev,
 +                                              const VkCopyProcs& procs,
@@ -201,7 +225,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DEVICE_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.cc
-@@ -0,0 +1,878 @@
+@@ -0,0 +1,1012 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -217,12 +241,17 @@
 +#include <vector>
 +
 +#include "base/compiler_specific.h"
++#include "base/files/file_descriptor_watcher_posix.h"
++#include "base/functional/bind.h"
 +#include "base/logging.h"
++#include "base/message_loop/message_pump_type.h"
 +#include "base/strings/string_number_conversions.h"
++#include "base/task/sequenced_task_runner.h"
 +#include "media/ffmpeg/ffmpeg_common.h"
 +
 +extern "C" {
 +#include <libavutil/buffer.h>
++#include <libavutil/dict.h>
 +#include <libavutil/hwcontext.h>
 +#include <libavutil/hwcontext_vulkan.h>
 +}
@@ -361,6 +390,7 @@
 +  LOAD_DEV_PROC(vkResetFences);
 +  LOAD_DEV_PROC(vkGetFenceStatus);
 +  LOAD_DEV_PROC(vkWaitForFences);
++  LOAD_DEV_PROC(vkGetFenceFdKHR);
 +  LOAD_DEV_PROC(vkQueueSubmit);
 +  LOAD_DEV_PROC(vkGetDeviceQueue);
 +  LOAD_DEV_PROC(vkGetImageDrmFormatModifierPropertiesEXT);
@@ -386,7 +416,15 @@
 +  LOAD_INST_PROC(vkGetPhysicalDeviceVideoCapabilitiesKHR);
 +  LOAD_INST_PROC(vkGetPhysicalDeviceFormatProperties2);
 +  LOAD_INST_PROC(vkGetPhysicalDeviceImageFormatProperties2);
++  LOAD_INST_PROC(vkGetPhysicalDeviceExternalFenceProperties);
 +#undef LOAD_INST_PROC
++
++  if (!info->procs.vkGetPhysicalDeviceExternalFenceProperties) {
++    info->procs.vkGetPhysicalDeviceExternalFenceProperties =
++        reinterpret_cast<PFN_vkGetPhysicalDeviceExternalFenceProperties>(
++            vk_dev->get_proc_addr(
++                vk_dev->inst, "vkGetPhysicalDeviceExternalFencePropertiesKHR"));
++  }
 +
 +  if (!info->procs.vkGetPhysicalDeviceMemoryProperties2) {
 +    info->procs.vkGetPhysicalDeviceMemoryProperties2 =
@@ -466,8 +504,24 @@
 +  info->preferred_p010_modifiers = ProbeExportable2PlaneModifiers(
 +      vk_dev, p, VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16);
 +
++  info->has_sync_fd_fence = false;
++  if (p.vkGetFenceFdKHR && p.vkGetPhysicalDeviceExternalFenceProperties) {
++    VkPhysicalDeviceExternalFenceInfo efi{
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,
++        .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
++    };
++    VkExternalFenceProperties efp{
++        .sType = VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES,
++    };
++    p.vkGetPhysicalDeviceExternalFenceProperties(vk_dev->phys_dev, &efi, &efp);
++    info->has_sync_fd_fence =
++        (efp.externalFenceFeatures &
++         VK_EXTERNAL_FENCE_FEATURE_EXPORTABLE_BIT) != 0;
++  }
++
 +  VLOG(1) << "VulkanVideoDevice copy queue family=" << info->copy_queue_family
 +          << " dedicated_transfer=" << info->copy_queue_is_dedicated_transfer
++          << " has_sync_fd_fence=" << info->has_sync_fd_fence
 +          << " preferred_nv12_modifiers="
 +          << info->preferred_nv12_modifiers.size()
 +          << " first_nv12=0x" << std::hex
@@ -827,8 +881,16 @@
 +
 +bool VulkanVideoDevice::EnsureInitializedLocked() {
 +  if (!device_ctx_) {
++    AVDictionary* opts = nullptr;
++    av_dict_set(&opts, "device_extensions",
++                VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME, 0);
 +    int err = av_hwdevice_ctx_create(&device_ctx_, AV_HWDEVICE_TYPE_VULKAN,
-+                                     nullptr, nullptr, 0);
++                                     nullptr, opts, 0);
++    av_dict_free(&opts);
++    if (err < 0 || !device_ctx_) {
++      err = av_hwdevice_ctx_create(&device_ctx_, AV_HWDEVICE_TYPE_VULKAN,
++                                   nullptr, nullptr, 0);
++    }
 +    if (err < 0 || !device_ctx_) {
 +      LOG(ERROR) << "VulkanVideoDevice: av_hwdevice_ctx_create failed: "
 +                 << AVErrorToString(err);
@@ -976,12 +1038,71 @@
 +  }
 +}
 +
++void VulkanVideoDevice::WatchSyncFdReadable(
++    base::ScopedFD fd,
++    scoped_refptr<base::SequencedTaskRunner> reply_runner,
++    base::OnceClosure on_readable) {
++  if (!fd.is_valid() || !reply_runner || !on_readable) {
++    return;
++  }
++  scoped_refptr<base::SequencedTaskRunner> io_runner;
++  {
++    base::AutoLock lock(fence_io_lock_);
++    if (!fence_io_thread_) {
++      fence_io_thread_ = std::make_unique<base::Thread>("VulkanFenceIO");
++      base::Thread::Options opts(base::MessagePumpType::IO, 0);
++      if (!fence_io_thread_->StartWithOptions(std::move(opts))) {
++        fence_io_thread_.reset();
++      }
++    }
++    if (fence_io_thread_) {
++      io_runner = fence_io_thread_->task_runner();
++    }
++  }
++  if (!io_runner) {
++    reply_runner->PostTask(FROM_HERE, std::move(on_readable));
++    return;
++  }
++
++  struct SyncFdWatch {
++    base::ScopedFD fd;
++    scoped_refptr<base::SequencedTaskRunner> reply_runner;
++    base::OnceClosure on_readable;
++    std::unique_ptr<base::FileDescriptorWatcher::Controller> controller;
++  };
++  auto* watch = new SyncFdWatch{std::move(fd), std::move(reply_runner),
++                                std::move(on_readable), nullptr};
++  io_runner->PostTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](SyncFdWatch* w) {
++            w->controller = base::FileDescriptorWatcher::WatchReadable(
++                w->fd.get(),
++                base::BindRepeating(
++                    [](SyncFdWatch* sw) {
++                      sw->controller.reset();
++                      sw->fd.reset();
++                      sw->reply_runner->PostTask(FROM_HERE,
++                                                 std::move(sw->on_readable));
++                      delete sw;
++                    },
++                    w));
++            if (!w->controller) {
++              w->fd.reset();
++              w->reply_runner->PostTask(FROM_HERE, std::move(w->on_readable));
++              delete w;
++            }
++          },
++          watch));
++}
++
 +NO_SANITIZE("cfi") __attribute__((noinline))
 +bool CreateCopyCmdResources(AVVulkanDeviceContext* vk_dev,
 +                            const VkCopyInfo& info,
 +                            VkCommandPool* pool_out,
 +                            VkCommandBuffer* buf_out,
-+                            VkFence* fence_out) {
++                            VkFence* fence_out,
++                            bool export_sync_fd) {
 +  if (!vk_dev || !vk_dev->act_dev || !info.procs_ready) {
 +    return false;
 +  }
@@ -1010,17 +1131,54 @@
 +    return false;
 +  }
 +
-+  VkFenceCreateInfo fci{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++  VkExportFenceCreateInfo efci{
++      .sType = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO,
++      .handleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
++  };
++  VkFenceCreateInfo fci{
++      .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
++      .pNext = (export_sync_fd && info.has_sync_fd_fence) ? &efci : nullptr,
++  };
 +  VkFence fence = VK_NULL_HANDLE;
 +  if (p.vkCreateFence(vk_dev->act_dev, &fci, nullptr, &fence) != VK_SUCCESS) {
-+    p.vkDestroyCommandPool(vk_dev->act_dev, pool, nullptr);
-+    return false;
++    if (fci.pNext) {
++      fci.pNext = nullptr;
++      if (p.vkCreateFence(vk_dev->act_dev, &fci, nullptr, &fence) !=
++          VK_SUCCESS) {
++        p.vkDestroyCommandPool(vk_dev->act_dev, pool, nullptr);
++        return false;
++      }
++    } else {
++      p.vkDestroyCommandPool(vk_dev->act_dev, pool, nullptr);
++      return false;
++    }
 +  }
 +
 +  *pool_out = pool;
 +  *buf_out = cb;
 +  *fence_out = fence;
 +  return true;
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++base::ScopedFD ExportFenceSyncFd(AVVulkanDeviceContext* vk_dev,
++                                 const VkCopyProcs& procs,
++                                 VkFence fence) {
++  if (!vk_dev || !vk_dev->act_dev || fence == VK_NULL_HANDLE ||
++      !procs.vkGetFenceFdKHR) {
++    return base::ScopedFD();
++  }
++  VkFenceGetFdInfoKHR get_fd{
++      .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
++      .fence = fence,
++      .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
++  };
++  int fd = -1;
++  if (procs.vkGetFenceFdKHR(vk_dev->act_dev, &get_fd, &fd) != VK_SUCCESS ||
++      fd < 0) {
++    return base::ScopedFD();
++  }
++  return base::ScopedFD(fd);
 +}
 +
 +NO_SANITIZE("cfi") __attribute__((noinline))
@@ -1082,7 +1240,7 @@
 +}  // namespace media
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.h
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,133 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1167,6 +1325,8 @@
 +  void DrainPendingEmits(bool wait_all);
 +  void DiscardPendingEmits();
 +  void PollPendingEmits();
++  void OnSyncFdSignaled();
++  void SchedulePendingEmitWakeup();
 +  bool StepFrontPendingEmit(bool wait_if_busy);
 +  bool EmitFrame(AVFrame* hw_frame);
 +  bool EmitGpuCopyFrameAsync(AVFrame* hw_frame,
@@ -1216,7 +1376,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,2523 @@
+@@ -0,0 +1,2586 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1224,6 +1384,7 @@
 +#include "media/gpu/vulkan/vulkan_video_decoder.h"
 +
 +#include <drm_fourcc.h>
++#include <poll.h>
 +#include <unistd.h>
 +
 +#include <algorithm>
@@ -2724,8 +2885,20 @@
 +  VkCommandPool cmd_pool = VK_NULL_HANDLE;
 +  VkCommandBuffer cmd_buf = VK_NULL_HANDLE;
 +  VkFence fence = VK_NULL_HANDLE;
++  base::ScopedFD sync_fd;
++  bool watch_armed = false;
 +  bool in_flight = false;
 +};
++
++bool IsSyncFdSignaled(int fd) {
++  pollfd pfd{fd, POLLIN, 0};
++  return HANDLE_EINTR(poll(&pfd, 1, 0)) > 0;
++}
++
++void WaitForSyncFd(int fd, int timeout_ms) {
++  pollfd pfd{fd, POLLIN, 0};
++  HANDLE_EINTR(poll(&pfd, 1, timeout_ms));
++}
 +
 +struct PendingGpuEmit {
 +  size_t cmd_idx = 0;
@@ -3176,21 +3349,35 @@
 +
 +  PendingGpuEmit& front = copy_state_->pending_emits.front();
 +  DecodeCopyCmd& cmd = copy_state_->cmds[front.cmd_idx];
-+  VkResult st = GetFenceStatus(vk_dev, copy_info->procs, cmd.fence);
-+  if (st == VK_NOT_READY) {
-+    if (!wait_if_busy) {
-+      return false;
++  if (cmd.sync_fd.is_valid()) {
++    if (!IsSyncFdSignaled(cmd.sync_fd.get())) {
++      if (!wait_if_busy) {
++        return false;
++      }
++      WaitForSyncFd(cmd.sync_fd.get(), 1000);
++      ++waited_emits_;
++    } else {
++      ++zero_wait_emits_;
 +    }
-+    WaitForFence(vk_dev, copy_info->procs, cmd.fence, 1000000000ULL);
-+    ++waited_emits_;
 +  } else {
-+    ++zero_wait_emits_;
++    VkResult st = GetFenceStatus(vk_dev, copy_info->procs, cmd.fence);
++    if (st == VK_NOT_READY) {
++      if (!wait_if_busy) {
++        return false;
++      }
++      WaitForFence(vk_dev, copy_info->procs, cmd.fence, 1000000000ULL);
++      ++waited_emits_;
++    } else {
++      ++zero_wait_emits_;
++    }
 +  }
 +
 +  scoped_refptr<FrameResource> res = std::move(front.resource);
 +  scoped_refptr<SlotSyncState> sync_state = std::move(front.sync_state);
 +  const bool is_pooled = front.is_pooled;
 +  copy_state_->pending_emits.pop_front();
++  cmd.sync_fd.reset();
++  cmd.watch_armed = false;
 +  cmd.in_flight = false;
 +  consecutive_busy_polls_ = 0;
 +
@@ -3222,9 +3409,39 @@
 +
 +void VulkanVideoDecoder::PollPendingEmits() {
 +  DrainPendingEmits(/*wait_all=*/false);
-+  if (copy_state_ && !copy_state_->pending_emits.empty()) {
++  SchedulePendingEmitWakeup();
++}
++
++void VulkanVideoDecoder::OnSyncFdSignaled() {
++  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  DrainPendingEmits(/*wait_all=*/false);
++  SchedulePendingEmitWakeup();
++}
++
++void VulkanVideoDecoder::SchedulePendingEmitWakeup() {
++  if (!copy_state_ || copy_state_->pending_emits.empty()) {
++    return;
++  }
++  DecodeCopyCmd& front_cmd =
++      copy_state_->cmds[copy_state_->pending_emits.front().cmd_idx];
++  if (front_cmd.sync_fd.is_valid()) {
++    if (front_cmd.watch_armed) {
++      return;
++    }
++    base::ScopedFD dup_fd(HANDLE_EINTR(dup(front_cmd.sync_fd.get())));
++    if (dup_fd.is_valid()) {
++      front_cmd.watch_armed = true;
++      VulkanVideoDevice::GetInstance()->WatchSyncFdReadable(
++          std::move(dup_fd), base::SequencedTaskRunner::GetCurrentDefault(),
++          base::BindOnce(&VulkanVideoDecoder::OnSyncFdSignaled,
++                         weak_factory_.GetWeakPtr()));
++      return;
++    }
++  }
++  if (!pending_emit_timer_.IsRunning()) {
 +    ++consecutive_busy_polls_;
-+    const uint32_t shift = std::min<uint32_t>(consecutive_busy_polls_ - 1, 2u);
++    const uint32_t shift =
++        std::min<uint32_t>(consecutive_busy_polls_ - 1, 2u);
 +    const base::TimeDelta delay =
 +        base::Milliseconds(std::min<uint32_t>(4u, 1u << shift));
 +    pending_emit_timer_.Start(FROM_HERE, delay, this,
@@ -3249,11 +3466,15 @@
 +      vk_dev && vk_dev->act_dev && copy_info && copy_info->procs_ready;
 +  for (auto& cmd : copy_state_->cmds) {
 +    if (cmd.in_flight) {
-+      if (can_vk) {
++      if (cmd.sync_fd.is_valid()) {
++        WaitForSyncFd(cmd.sync_fd.get(), 1000);
++      } else if (can_vk) {
 +        WaitForFence(vk_dev, copy_info->procs, cmd.fence, 1000000000ULL);
 +      }
 +      cmd.in_flight = false;
 +    }
++    cmd.sync_fd.reset();
++    cmd.watch_armed = false;
 +  }
 +  copy_state_->pending_emits.clear();
 +}
@@ -3315,7 +3536,7 @@
 +  DecodeCopyCmd& cmd = copy_state_->cmds[cmd_idx];
 +  if (cmd.cmd_pool == VK_NULL_HANDLE) {
 +    if (!CreateCopyCmdResources(vk_dev, *copy_info, &cmd.cmd_pool, &cmd.cmd_buf,
-+                                &cmd.fence)) {
++                                &cmd.fence, copy_info->has_sync_fd_fence)) {
 +      return false;
 +    }
 +  }
@@ -3405,22 +3626,24 @@
 +    is_pooled = false;
 +  }
 +
++  cmd.sync_fd = copy_info->has_sync_fd_fence
++                    ? ExportFenceSyncFd(vk_dev, copy_info->procs, cmd.fence)
++                    : base::ScopedFD();
++  cmd.watch_armed = false;
 +  cmd.in_flight = true;
 +  copy_state_->next_cmd = (cmd_idx + 1) % kDecodeCopyRingSize;
 +  copy_state_->pending_emits.push_back(PendingGpuEmit{
 +      cmd_idx, std::move(resource), std::move(emit_sync_state), is_pooled});
 +  if (!logged_async_copy_) {
 +    logged_async_copy_ = true;
-+    VLOG(1) << "VulkanVideoDecoder: async pipelined GPU copy active (ring=6)";
++    VLOG(1) << "VulkanVideoDecoder: async pipelined GPU copy active (ring=6, "
++               "sync_fd="
++            << (cmd.sync_fd.is_valid() ? 1 : 0) << ")";
 +  }
 +
++  consecutive_busy_polls_ = 0;
 +  DrainPendingEmits(/*wait_all=*/false);
-+  if (copy_state_ && !copy_state_->pending_emits.empty() &&
-+      !pending_emit_timer_.IsRunning()) {
-+    consecutive_busy_polls_ = 0;
-+    pending_emit_timer_.Start(FROM_HERE, base::Milliseconds(1), this,
-+                              &VulkanVideoDecoder::PollPendingEmits);
-+  }
++  SchedulePendingEmitWakeup();
 +  return true;
 +}
 +
