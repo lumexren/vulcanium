@@ -25,7 +25,7 @@
  
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.h
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,173 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -98,6 +98,7 @@
 +  std::vector<uint64_t> preferred_p010_modifiers;
 +  uint64_t total_device_local_vram_bytes = 0;
 +  uint32_t copy_queue_family = 0;
++  VkQueue copy_queue = VK_NULL_HANDLE;
 +  bool copy_queue_is_dedicated_transfer = false;
 +  bool has_memory_budget = false;
 +  bool procs_ready = false;
@@ -200,7 +201,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DEVICE_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_device.cc
-@@ -0,0 +1,877 @@
+@@ -0,0 +1,878 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -457,6 +458,7 @@
 +    }
 +  }
 +  info->copy_queue_family = qf;
++  p.vkGetDeviceQueue(vk_dev->act_dev, qf, 0, &info->copy_queue);
 +  info->copy_queue_is_dedicated_transfer = dedicated_transfer;
 +
 +  info->preferred_nv12_modifiers = ProbeExportable2PlaneModifiers(
@@ -1080,7 +1082,7 @@
 +}  // namespace media
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.h
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,131 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1160,7 +1162,7 @@
 + private:
 +  bool ConfigureVulkanDecoder(const VideoDecoderConfig& config);
 +  void ReleaseResources();
-+  void ReleaseIdleOutputSlots();
++  void ReleaseIdleOutputSlots(size_t keep_slots = 0);
 +  bool DrainDecodedFrames();
 +  void DrainPendingEmits(bool wait_all);
 +  void DiscardPendingEmits();
@@ -1189,6 +1191,8 @@
 +  std::unique_ptr<AVCodecContext, ScopedPtrAVFreeContext> codec_context_;
 +  std::unique_ptr<VulkanCopyState> copy_state_;
 +  base::OneShotTimer pending_emit_timer_;
++  base::OneShotTimer idle_slot_trim_timer_;
++  uint32_t consecutive_busy_polls_ = 0;
 +  AVPacket* reusable_packet_ = nullptr;
 +  AVFrame* reusable_hw_frame_ = nullptr;
 +  FrameResource* current_unpooled_origin_ = nullptr;
@@ -1212,7 +1216,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,2380 @@
+@@ -0,0 +1,2523 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1229,6 +1233,7 @@
 +#include <ios>
 +#include <map>
 +#include <optional>
++#include <tuple>
 +#include <utility>
 +#include <vector>
 +
@@ -1240,6 +1245,7 @@
 +#include "base/memory/ptr_util.h"
 +#include "base/memory/ref_counted.h"
 +#include "base/memory/ref_counted_delete_on_sequence.h"
++#include "base/no_destructor.h"
 +#include "base/numerics/safe_conversions.h"
 +#include "base/posix/eintr_wrapper.h"
 +#include "base/synchronization/lock.h"
@@ -2078,6 +2084,50 @@
 +  return import_req.size >= export_req.size && import_req.size >= max_plane_end;
 +}
 +
++struct ModifierCacheKey {
++  uint32_t vk_format;
++  int coded_w;
++  int coded_h;
++  int import_w;
++  int import_h;
++
++  bool operator<(const ModifierCacheKey& other) const {
++    return std::tie(vk_format, coded_w, coded_h, import_w, import_h) <
++           std::tie(other.vk_format, other.coded_w, other.coded_h,
++                    other.import_w, other.import_h);
++  }
++};
++
++struct ModifierCache {
++  base::Lock lock;
++  std::map<ModifierCacheKey, uint64_t> entries GUARDED_BY(lock);
++};
++
++ModifierCache& GetModifierCache() {
++  static base::NoDestructor<ModifierCache> cache;
++  return *cache;
++}
++
++std::optional<uint64_t> LookupCachedDmabufModifier(
++    const ModifierCacheKey& key) {
++  auto& cache = GetModifierCache();
++  base::AutoLock auto_lock(cache.lock);
++  auto it = cache.entries.find(key);
++  if (it != cache.entries.end()) {
++    return it->second;
++  }
++  return std::nullopt;
++}
++
++void StoreCachedDmabufModifier(const ModifierCacheKey& key, uint64_t mod) {
++  auto& cache = GetModifierCache();
++  base::AutoLock auto_lock(cache.lock);
++  if (cache.entries.size() >= 128) {
++    cache.entries.clear();
++  }
++  cache.entries.emplace(key, mod);
++}
++
 +NO_SANITIZE("cfi") __attribute__((noinline))
 +std::optional<OutputSlot> CreateDmabufSlot(
 +    AVBufferRef* dev_ctx_ref,
@@ -2107,17 +2157,32 @@
 +  VkImage dst_img = VK_NULL_HANDLE;
 +  VkDeviceMemory dst_mem = VK_NULL_HANDLE;
 +
++  const gfx::Size import_size(
++      visible_rect.right() > 0 ? visible_rect.right() : w,
++      visible_rect.bottom() > 0 ? visible_rect.bottom() : h);
++  const ModifierCacheKey cache_key{static_cast<uint32_t>(vk_format), w, h,
++                                   import_size.width(), import_size.height()};
++
 +  uint64_t linear_mod = DRM_FORMAT_MOD_LINEAR;
 +  uint64_t chosen_mod = DRM_FORMAT_MOD_LINEAR;
 +  const auto& preferred_mods =
 +      is_p010 ? info.preferred_p010_modifiers : info.preferred_nv12_modifiers;
-+  const bool try_preferred =
-+      !preferred_mods.empty() &&
++  const bool can_query_mod =
 +      p.vkGetImageDrmFormatModifierPropertiesEXT != nullptr;
++  std::optional<uint64_t> cached_mod =
++      can_query_mod ? LookupCachedDmabufModifier(cache_key) : std::nullopt;
++
++  uint64_t single_mod = cached_mod.value_or(DRM_FORMAT_MOD_LINEAR);
++  const bool try_preferred = !cached_mod.has_value() &&
++                             !preferred_mods.empty() && can_query_mod;
 +  const uint64_t* mod_ptr =
-+      try_preferred ? preferred_mods.data() : &linear_mod;
++      cached_mod.has_value()
++          ? &single_mod
++          : (try_preferred ? preferred_mods.data() : &linear_mod);
 +  const uint32_t mod_count =
-+      try_preferred ? static_cast<uint32_t>(preferred_mods.size()) : 1u;
++      (cached_mod.has_value() || !try_preferred)
++          ? 1u
++          : static_cast<uint32_t>(preferred_mods.size());
 +
 +  VkImageDrmFormatModifierListCreateInfoEXT mod_list{
 +      .sType =
@@ -2144,8 +2209,18 @@
 +      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 +      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 +  };
++
 +  VkResult ci_res = p.vkCreateImage(vk_dev->act_dev, &img_ci, nullptr, &dst_img);
-+  if (ci_res == VK_SUCCESS && try_preferred) {
++  if (cached_mod.has_value()) {
++    if (ci_res == VK_SUCCESS) {
++      chosen_mod = *cached_mod;
++    } else {
++      mod_list.drmFormatModifierCount = 1;
++      mod_list.pDrmFormatModifiers = &linear_mod;
++      chosen_mod = DRM_FORMAT_MOD_LINEAR;
++      ci_res = p.vkCreateImage(vk_dev->act_dev, &img_ci, nullptr, &dst_img);
++    }
++  } else if (ci_res == VK_SUCCESS && try_preferred) {
 +    VkImageDrmFormatModifierPropertiesEXT mod_props{
 +        .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT,
 +    };
@@ -2180,41 +2255,78 @@
 +  QueryDmabufPlaneLayouts(vk_dev, p, dst_img, w, is_p010, req.size, strides,
 +                          offsets, sizes);
 +
-+  const gfx::Size import_size(
-+      visible_rect.right() > 0 ? visible_rect.right() : w,
-+      visible_rect.bottom() > 0 ? visible_rect.bottom() : h);
-+  if (chosen_mod != DRM_FORMAT_MOD_LINEAR &&
-+      (!IsExplicitDmabufImportCompatible(vk_dev, p, vk_format, coded_size,
-+                                         chosen_mod, req, strides, offsets,
-+                                         sizes) ||
-+       (import_size != coded_size &&
-+        !IsExplicitDmabufImportCompatible(vk_dev, p, vk_format, import_size,
-+                                          chosen_mod, req, strides, offsets,
-+                                          sizes)))) {
-+    static std::atomic<bool> logged_incompatible_mod{false};
-+    if (!logged_incompatible_mod.exchange(true, std::memory_order_relaxed)) {
-+      VLOG(1) << "VulkanVideoDecoder: rejecting explicit-import incompatible "
-+                 "modifier=0x"
-+              << std::hex << chosen_mod << std::dec << " for "
-+              << coded_size.ToString() << " (import=" << import_size.ToString()
-+              << "), falling back to linear";
++  if (!cached_mod.has_value()) {
++    const auto is_compatible = [&](uint64_t mod,
++                                   const VkMemoryRequirements& r,
++                                   const uint32_t s[2],
++                                   const uint64_t o[2],
++                                   const uint64_t sz[2]) {
++      return IsExplicitDmabufImportCompatible(vk_dev, p, vk_format, coded_size,
++                                              mod, r, s, o, sz) &&
++             (import_size == coded_size ||
++              IsExplicitDmabufImportCompatible(vk_dev, p, vk_format,
++                                               import_size, mod, r, s, o, sz));
++    };
++
++    if (chosen_mod != DRM_FORMAT_MOD_LINEAR &&
++        !is_compatible(chosen_mod, req, strides, offsets, sizes)) {
++      const uint64_t first_rejected_mod = chosen_mod;
++      p.vkDestroyImage(vk_dev->act_dev, dst_img, nullptr);
++      dst_img = VK_NULL_HANDLE;
++
++      for (uint64_t cand_mod : preferred_mods) {
++        if (cand_mod == first_rejected_mod ||
++            cand_mod == DRM_FORMAT_MOD_LINEAR) {
++          continue;
++        }
++        mod_list.drmFormatModifierCount = 1;
++        mod_list.pDrmFormatModifiers = &cand_mod;
++        if (p.vkCreateImage(vk_dev->act_dev, &img_ci, nullptr, &dst_img) !=
++            VK_SUCCESS) {
++          dst_img = VK_NULL_HANDLE;
++          continue;
++        }
++        req = {};
++        p.vkGetImageMemoryRequirements(vk_dev->act_dev, dst_img, &req);
++        QueryDmabufPlaneLayouts(vk_dev, p, dst_img, w, is_p010, req.size,
++                                strides, offsets, sizes);
++        if (is_compatible(cand_mod, req, strides, offsets, sizes)) {
++          chosen_mod = cand_mod;
++          break;
++        }
++        p.vkDestroyImage(vk_dev->act_dev, dst_img, nullptr);
++        dst_img = VK_NULL_HANDLE;
++      }
++
++      if (dst_img == VK_NULL_HANDLE) {
++        mod_list.drmFormatModifierCount = 1;
++        mod_list.pDrmFormatModifiers = &linear_mod;
++        chosen_mod = DRM_FORMAT_MOD_LINEAR;
++        ci_res = p.vkCreateImage(vk_dev->act_dev, &img_ci, nullptr, &dst_img);
++        if (ci_res != VK_SUCCESS) {
++          LOG(WARNING)
++              << "VulkanVideoDecoder: linear vkCreateImage fallback failed: "
++              << ci_res << " p010=" << is_p010;
++          CleanupVkImageMemory(vk_dev, p, dst_img, dst_mem);
++          return std::nullopt;
++        }
++        req = {};
++        p.vkGetImageMemoryRequirements(vk_dev->act_dev, dst_img, &req);
++        QueryDmabufPlaneLayouts(vk_dev, p, dst_img, w, is_p010, req.size,
++                                strides, offsets, sizes);
++      }
 +    }
-+    p.vkDestroyImage(vk_dev->act_dev, dst_img, nullptr);
-+    dst_img = VK_NULL_HANDLE;
-+    mod_list.drmFormatModifierCount = 1;
-+    mod_list.pDrmFormatModifiers = &linear_mod;
-+    chosen_mod = DRM_FORMAT_MOD_LINEAR;
-+    ci_res = p.vkCreateImage(vk_dev->act_dev, &img_ci, nullptr, &dst_img);
-+    if (ci_res != VK_SUCCESS) {
-+      LOG(WARNING) << "VulkanVideoDecoder: linear vkCreateImage fallback failed: "
-+                   << ci_res << " p010=" << is_p010;
-+      CleanupVkImageMemory(vk_dev, p, dst_img, dst_mem);
-+      return std::nullopt;
++
++    if (can_query_mod) {
++      StoreCachedDmabufModifier(cache_key, chosen_mod);
 +    }
-+    req = {};
-+    p.vkGetImageMemoryRequirements(vk_dev->act_dev, dst_img, &req);
-+    QueryDmabufPlaneLayouts(vk_dev, p, dst_img, w, is_p010, req.size, strides,
-+                            offsets, sizes);
++    const bool fell_back_to_linear =
++        chosen_mod == DRM_FORMAT_MOD_LINEAR && !preferred_mods.empty() &&
++        preferred_mods.front() != DRM_FORMAT_MOD_LINEAR;
++    VLOG(1) << "VulkanVideoDecoder: resolved modifier=0x" << std::hex
++            << chosen_mod << std::dec << " for " << coded_size.ToString()
++            << " (import=" << import_size.ToString()
++            << (fell_back_to_linear ? ", fallback=linear" : "") << ")";
 +  }
 +
 +  if (is_p010) {
@@ -2460,21 +2572,31 @@
 +                              static_cast<uint32_t>((w + 1) / 2)};
 +  const uint32_t heights[2] = {static_cast<uint32_t>(h),
 +                               static_cast<uint32_t>((h + 1) / 2)};
-+  for (int i = 0; i < 2; ++i) {
-+    VkImage src_img = two_imgs ? src_vk->img[i] : src_vk->img[0];
-+    VkImageAspectFlags src_plane_aspect =
-+        two_imgs ? VK_IMAGE_ASPECT_COLOR_BIT
-+                 : (i == 0 ? VK_IMAGE_ASPECT_PLANE_0_BIT
-+                           : VK_IMAGE_ASPECT_PLANE_1_BIT);
-+    VkImageAspectFlags dst_plane_aspect =
-+        (i == 0) ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_PLANE_1_BIT;
-+    VkImageCopy region{
-+        .srcSubresource = {src_plane_aspect, 0, 0, 1},
-+        .dstSubresource = {dst_plane_aspect, 0, 0, 1},
-+        .extent = {widths[i], heights[i], 1},
++  if (two_imgs) {
++    for (int i = 0; i < 2; ++i) {
++      VkImageAspectFlags dst_plane_aspect =
++          (i == 0) ? VK_IMAGE_ASPECT_PLANE_0_BIT : VK_IMAGE_ASPECT_PLANE_1_BIT;
++      VkImageCopy region{
++          .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
++          .dstSubresource = {dst_plane_aspect, 0, 0, 1},
++          .extent = {widths[i], heights[i], 1},
++      };
++      p.vkCmdCopyImage(cb, src_vk->img[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                       dst_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
++                       &region);
++    }
++  } else {
++    VkImageCopy regions[2] = {
++        {.srcSubresource = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0, 1},
++         .dstSubresource = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0, 1},
++         .extent = {widths[0], heights[0], 1}},
++        {.srcSubresource = {VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0, 1},
++         .dstSubresource = {VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0, 1},
++         .extent = {widths[1], heights[1], 1}},
 +    };
-+    p.vkCmdCopyImage(cb, src_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-+                     dst_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++    p.vkCmdCopyImage(cb, src_vk->img[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                     dst_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2,
++                     regions);
 +  }
 +
 +  VkImageMemoryBarrier post{
@@ -2495,8 +2617,10 @@
 +  }
 +
 +  const uint32_t qf = info.copy_queue_family;
-+  VkQueue queue = VK_NULL_HANDLE;
-+  p.vkGetDeviceQueue(vk_dev->act_dev, qf, 0, &queue);
++  VkQueue queue = info.copy_queue;
++  if (queue == VK_NULL_HANDLE) {
++    p.vkGetDeviceQueue(vk_dev->act_dev, qf, 0, &queue);
++  }
 +  VkTimelineSemaphoreSubmitInfo tl_info{
 +      .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
 +      .waitSemaphoreValueCount = sem_count,
@@ -2891,6 +3015,7 @@
 +}
 +
 +void VulkanVideoDecoder::ReleaseResources() {
++  idle_slot_trim_timer_.Stop();
 +  if (zero_wait_emits_ > 0 || waited_emits_ > 0) {
 +    VLOG(1) << "VulkanVideoDecoder copy stats: zero_wait=" << zero_wait_emits_
 +            << " waited=" << waited_emits_;
@@ -2969,6 +3094,7 @@
 +void VulkanVideoDecoder::Decode(scoped_refptr<DecoderBuffer> buffer,
 +                                DecodeCB decode_cb) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  idle_slot_trim_timer_.Stop();
 +  DecodeCB bound_cb = base::BindPostTaskToCurrentDefault(std::move(decode_cb));
 +
 +  if (!initialized_ || !codec_context_) {
@@ -3066,6 +3192,7 @@
 +  const bool is_pooled = front.is_pooled;
 +  copy_state_->pending_emits.pop_front();
 +  cmd.in_flight = false;
++  consecutive_busy_polls_ = 0;
 +
 +  if (frame_converter_ && res) {
 +    auto weak_self = weak_factory_.GetWeakPtr();
@@ -3096,13 +3223,18 @@
 +void VulkanVideoDecoder::PollPendingEmits() {
 +  DrainPendingEmits(/*wait_all=*/false);
 +  if (copy_state_ && !copy_state_->pending_emits.empty()) {
-+    pending_emit_timer_.Start(FROM_HERE, base::Milliseconds(1), this,
++    ++consecutive_busy_polls_;
++    const uint32_t shift = std::min<uint32_t>(consecutive_busy_polls_ - 1, 2u);
++    const base::TimeDelta delay =
++        base::Milliseconds(std::min<uint32_t>(4u, 1u << shift));
++    pending_emit_timer_.Start(FROM_HERE, delay, this,
 +                              &VulkanVideoDecoder::PollPendingEmits);
 +  }
 +}
 +
 +void VulkanVideoDecoder::DiscardPendingEmits() {
 +  pending_emit_timer_.Stop();
++  consecutive_busy_polls_ = 0;
 +  if (!copy_state_) {
 +    return;
 +  }
@@ -3285,6 +3417,7 @@
 +  DrainPendingEmits(/*wait_all=*/false);
 +  if (copy_state_ && !copy_state_->pending_emits.empty() &&
 +      !pending_emit_timer_.IsRunning()) {
++    consecutive_busy_polls_ = 0;
 +    pending_emit_timer_.Start(FROM_HERE, base::Milliseconds(1), this,
 +                              &VulkanVideoDecoder::PollPendingEmits);
 +  }
@@ -3550,18 +3683,24 @@
 +  }
 +}
 +
-+void VulkanVideoDecoder::ReleaseIdleOutputSlots() {
++void VulkanVideoDecoder::ReleaseIdleOutputSlots(size_t keep_slots) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
 +  if (!copy_state_ || copy_state_->slots.empty()) {
 +    return;
 +  }
 +  size_t reclaimed = 0;
++  size_t kept_idle = 0;
 +  for (auto it = copy_state_->slots.begin(); it != copy_state_->slots.end();) {
 +    if (!it->in_use) {
-+      copy_state_->origin_frames_by_token.erase(it->token);
-+      copy_state_->sync_states_by_token.erase(it->token);
-+      it = copy_state_->slots.erase(it);
-+      ++reclaimed;
++      if (kept_idle < keep_slots) {
++        ++kept_idle;
++        ++it;
++      } else {
++        copy_state_->origin_frames_by_token.erase(it->token);
++        copy_state_->sync_states_by_token.erase(it->token);
++        it = copy_state_->slots.erase(it);
++        ++reclaimed;
++      }
 +    } else {
 +      ++it;
 +    }
@@ -3572,7 +3711,7 @@
 +          : (copy_state_->next_slot_cursor % copy_state_->slots.size());
 +  if (reclaimed > 0) {
 +    VLOG(1) << "VulkanVideoDecoder: reclaimed " << reclaimed
-+            << " idle output slot(s) on Reset (remaining="
++            << " idle output slot(s) (remaining="
 +            << copy_state_->slots.size() << ")";
 +  }
 +}
@@ -3583,7 +3722,15 @@
 +  if (frame_converter_) {
 +    frame_converter_->AbortPendingFrames();
 +  }
-+  ReleaseIdleOutputSlots();
++  ReleaseIdleOutputSlots(/*keep_slots=*/4);
++  if (copy_state_ && !copy_state_->slots.empty()) {
++    idle_slot_trim_timer_.Start(
++        FROM_HERE, base::Seconds(3),
++        base::BindOnce(&VulkanVideoDecoder::ReleaseIdleOutputSlots,
++                       base::Unretained(this), 0));
++  } else {
++    idle_slot_trim_timer_.Stop();
++  }
 +  if (codec_context_) {
 +    avcodec_flush_buffers(codec_context_.get());
 +  }
