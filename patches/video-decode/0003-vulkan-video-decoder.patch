@@ -1080,7 +1080,7 @@
 +}  // namespace media
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.h
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,129 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1110,22 +1110,37 @@
 +struct AVFrame;
 +struct AVPacket;
 +
++namespace base {
++class SingleThreadTaskRunner;
++}  // namespace base
++
++namespace gpu {
++class CommandBufferStub;
++}  // namespace gpu
++
 +namespace media {
 +
 +class FrameResource;
++class GpuSlotSync;
 +class MediaLog;
++class SlotSyncState;
 +struct VulkanCopyState;
 +
 +// Hardware video decoder backed by FFmpeg's AV_HWDEVICE_TYPE_VULKAN
 +// (VK_KHR_video_decode_queue), supporting H.264, HEVC, AV1, and VP9 on Linux.
 +class MEDIA_GPU_EXPORT VulkanVideoDecoder : public VideoDecoder {
 + public:
++  using GetCommandBufferStubCB =
++      base::RepeatingCallback<gpu::CommandBufferStub*()>;
++
 +  static bool IsSupported(const VideoDecoderConfig& config);
 +  static SupportedVideoDecoderConfigs GetSupportedConfigs();
 +
 +  explicit VulkanVideoDecoder(
 +      std::unique_ptr<MediaLog> media_log,
-+      std::unique_ptr<FrameResourceConverter> frame_converter = nullptr);
++      std::unique_ptr<FrameResourceConverter> frame_converter = nullptr,
++      scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner = nullptr,
++      GetCommandBufferStubCB get_stub_cb = {});
 +  VulkanVideoDecoder(const VulkanVideoDecoder&) = delete;
 +  VulkanVideoDecoder& operator=(const VulkanVideoDecoder&) = delete;
 +  ~VulkanVideoDecoder() override;
@@ -1177,6 +1192,8 @@
 +  AVPacket* reusable_packet_ = nullptr;
 +  AVFrame* reusable_hw_frame_ = nullptr;
 +  FrameResource* current_unpooled_origin_ = nullptr;
++  scoped_refptr<GpuSlotSync> gpu_slot_sync_;
++  scoped_refptr<SlotSyncState> current_unpooled_sync_state_;
 +  uint64_t zero_wait_emits_ = 0;
 +  uint64_t waited_emits_ = 0;
 +  bool logged_async_copy_ = false;
@@ -1195,7 +1212,7 @@
 +#endif  // MEDIA_GPU_VULKAN_VULKAN_VIDEO_DECODER_H_
 --- /dev/null
 +++ b/media/gpu/vulkan/vulkan_video_decoder.cc
-@@ -0,0 +1,1563 @@
+@@ -0,0 +1,2254 @@
 +// Copyright 2026 The Vulcanium Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -1220,10 +1237,28 @@
 +#include "base/functional/bind.h"
 +#include "base/functional/callback_helpers.h"
 +#include "base/logging.h"
++#include "base/memory/ptr_util.h"
++#include "base/memory/ref_counted.h"
++#include "base/memory/ref_counted_delete_on_sequence.h"
 +#include "base/numerics/safe_conversions.h"
 +#include "base/posix/eintr_wrapper.h"
++#include "base/synchronization/lock.h"
 +#include "base/task/bind_post_task.h"
 +#include "base/task/sequenced_task_runner.h"
++#include "base/task/single_thread_task_runner.h"
++#include "base/thread_annotations.h"
++#include "base/timer/timer.h"
++#include "gpu/command_buffer/client/client_shared_image.h"
++#include "gpu/command_buffer/common/context_result.h"
++#include "gpu/command_buffer/common/sync_token.h"
++#include "gpu/command_buffer/service/graphite_shared_context.h"
++#include "gpu/command_buffer/service/shared_context_state.h"
++#include "gpu/command_buffer/service/vulkan_context_provider.h"
++#include "gpu/ipc/service/command_buffer_stub.h"
++#include "gpu/ipc/service/gpu_channel.h"
++#include "gpu/ipc/service/gpu_channel_manager.h"
++#include "gpu/vulkan/vulkan_device_queue.h"
++#include "gpu/vulkan/vulkan_fence_helper.h"
 +#include "media/base/color_plane_layout.h"
 +#include "media/base/decoder_buffer.h"
 +#include "media/base/media_log.h"
@@ -1232,9 +1267,14 @@
 +#include "media/base/video_frame_layout.h"
 +#include "media/ffmpeg/ffmpeg_common.h"
 +#include "media/gpu/chromeos/video_frame_resource.h"
++#include "media/gpu/command_buffer_helper.h"
 +#include "media/gpu/vulkan/vulkan_video_device.h"
++#include "third_party/skia/include/gpu/ganesh/GrDirectContext.h"
++#include "third_party/skia/include/gpu/graphite/GraphiteTypes.h"
 +#include "ui/gfx/color_space.h"
 +#include "ui/gfx/hdr_metadata.h"
++#include "ui/gl/gl_angle_util_vulkan.h"
++#include "ui/gl/gl_implementation.h"
 +
 +extern "C" {
 +#include <libavcodec/avcodec.h>
@@ -1245,6 +1285,504 @@
 +}
 +
 +namespace media {
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++bool ResolveAngleVkFenceProcs(VkDevice* out_device,
++                              VkQueue* out_queue,
++                              void** out_display,
++                              PFN_vkCreateFence* out_create,
++                              PFN_vkQueueSubmit* out_submit,
++                              PFN_vkGetFenceStatus* out_status,
++                              PFN_vkDestroyFence* out_destroy) {
++  if (gl::GetGLImplementation() != gl::kGLImplementationEGLANGLE ||
++      gl::GetANGLEImplementation() != gl::ANGLEImplementation::kVulkan) {
++    return false;
++  }
++  PFN_vkGetInstanceProcAddr gipa = gl::QueryVkGetInstanceProcAddrFromANGLE();
++  VkInstance vk_instance = gl::QueryVkInstanceFromANGLE();
++  VkDevice vk_device = gl::QueryVkDeviceFromANGLE();
++  VkQueue vk_queue = gl::QueryVkQueueFromANGLE();
++  void* display = gl::QueryDisplayFromANGLE();
++  if (!gipa || vk_instance == VK_NULL_HANDLE || vk_device == VK_NULL_HANDLE ||
++      vk_queue == VK_NULL_HANDLE || !display) {
++    return false;
++  }
++  auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
++      gipa(vk_instance, "vkGetDeviceProcAddr"));
++  if (!gdpa) {
++    return false;
++  }
++  auto pfn_create =
++      reinterpret_cast<PFN_vkCreateFence>(gdpa(vk_device, "vkCreateFence"));
++  auto pfn_submit =
++      reinterpret_cast<PFN_vkQueueSubmit>(gdpa(vk_device, "vkQueueSubmit"));
++  auto pfn_status = reinterpret_cast<PFN_vkGetFenceStatus>(
++      gdpa(vk_device, "vkGetFenceStatus"));
++  auto pfn_destroy =
++      reinterpret_cast<PFN_vkDestroyFence>(gdpa(vk_device, "vkDestroyFence"));
++  if (!pfn_create || !pfn_submit || !pfn_status || !pfn_destroy) {
++    return false;
++  }
++  *out_device = vk_device;
++  *out_queue = vk_queue;
++  *out_display = display;
++  *out_create = pfn_create;
++  *out_submit = pfn_submit;
++  *out_status = pfn_status;
++  *out_destroy = pfn_destroy;
++  return true;
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++VkFence SubmitAngleVkFence(VkDevice dev,
++                           VkQueue queue,
++                           void* display,
++                           PFN_vkCreateFence pfn_create,
++                           PFN_vkQueueSubmit pfn_submit,
++                           PFN_vkDestroyFence pfn_destroy) {
++  if (dev == VK_NULL_HANDLE || queue == VK_NULL_HANDLE || !display ||
++      !pfn_create || !pfn_submit || !pfn_destroy) {
++    return VK_NULL_HANDLE;
++  }
++  VkFenceCreateInfo fci{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++  VkFence fence = VK_NULL_HANDLE;
++  if (pfn_create(dev, &fci, nullptr, &fence) != VK_SUCCESS ||
++      fence == VK_NULL_HANDLE) {
++    return VK_NULL_HANDLE;
++  }
++  gl::LockVkQueueInANGLE(display);
++  VkResult sr = pfn_submit(queue, 0, nullptr, fence);
++  gl::UnlockVkQueueInANGLE(display);
++  if (sr != VK_SUCCESS) {
++    pfn_destroy(dev, fence, nullptr);
++    return VK_NULL_HANDLE;
++  }
++  return fence;
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++VkResult GetAngleVkFenceStatus(VkDevice dev,
++                               PFN_vkGetFenceStatus pfn_status,
++                               VkFence fence) {
++  if (dev == VK_NULL_HANDLE || !pfn_status || fence == VK_NULL_HANDLE) {
++    return VK_SUCCESS;
++  }
++  return pfn_status(dev, fence);
++}
++
++NO_SANITIZE("cfi") __attribute__((noinline))
++void DestroyAngleVkFence(VkDevice dev,
++                         PFN_vkDestroyFence pfn_destroy,
++                         VkFence fence) {
++  if (dev != VK_NULL_HANDLE && pfn_destroy && fence != VK_NULL_HANDLE) {
++    pfn_destroy(dev, fence, nullptr);
++  }
++}
++
++class SlotSyncState : public base::RefCountedThreadSafe<SlotSyncState> {
++ public:
++  SlotSyncState() = default;
++
++  void MarkConverted() {
++    base::AutoLock lock(lock_);
++    ever_converted_ = true;
++    current_emit_converted_ = true;
++  }
++
++  bool WasEverConverted() const {
++    base::AutoLock lock(lock_);
++    return ever_converted_;
++  }
++
++  bool WasCurrentEmitConverted() const {
++    base::AutoLock lock(lock_);
++    return current_emit_converted_;
++  }
++
++  void ResetForReuse() {
++    base::AutoLock lock(lock_);
++    release_sync_tokens_.clear();
++    current_emit_converted_ = false;
++  }
++
++  void SetReleaseSyncTokens(std::vector<gpu::SyncToken> tokens) {
++    base::AutoLock lock(lock_);
++    release_sync_tokens_ = std::move(tokens);
++  }
++
++  std::vector<gpu::SyncToken> GetReleaseSyncTokens() const {
++    base::AutoLock lock(lock_);
++    return release_sync_tokens_;
++  }
++
++ private:
++  friend class base::RefCountedThreadSafe<SlotSyncState>;
++  ~SlotSyncState() = default;
++
++  mutable base::Lock lock_;
++  std::vector<gpu::SyncToken> release_sync_tokens_ GUARDED_BY(lock_);
++  bool ever_converted_ GUARDED_BY(lock_) = false;
++  bool current_emit_converted_ GUARDED_BY(lock_) = false;
++};
++
++// Synchronizes VideoFrame backing cleanup and pooled slot recycling with both
++// GPU scheduler SyncTokens and actual hardware GPU fence completion across
++// GaneshVulkan, GraphiteDawnVulkan, and ANGLE Vulkan WebGL/Canvas contexts.
++class GpuSlotSync : public base::RefCountedDeleteOnSequence<GpuSlotSync> {
++ public:
++  static scoped_refptr<GpuSlotSync> Create(
++      scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner,
++      VulkanVideoDecoder::GetCommandBufferStubCB get_stub_cb) {
++    if (!gpu_task_runner || !get_stub_cb) {
++      return nullptr;
++    }
++    auto sync = base::MakeRefCounted<GpuSlotSync>(std::move(gpu_task_runner),
++                                                  std::move(get_stub_cb));
++    sync->gpu_task_runner_->PostTask(
++        FROM_HERE, base::BindOnce(&GpuSlotSync::EnsureInitializedOnGpuThread,
++                                  base::RetainedRef(sync)));
++    return sync;
++  }
++
++  GpuSlotSync(scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner,
++              VulkanVideoDecoder::GetCommandBufferStubCB get_stub_cb)
++      : base::RefCountedDeleteOnSequence<GpuSlotSync>(gpu_task_runner),
++        gpu_task_runner_(std::move(gpu_task_runner)),
++        get_stub_cb_(std::move(get_stub_cb)) {}
++
++  void RunAfterGpuWork(std::vector<gpu::SyncToken> sync_tokens,
++                       base::OnceClosure done_cb) {
++    if (!done_cb) {
++      return;
++    }
++    if (!gpu_task_runner_) {
++      std::move(done_cb).Run();
++      return;
++    }
++    gpu_task_runner_->PostTask(
++        FROM_HERE,
++        base::BindOnce(&GpuSlotSync::RunAfterGpuWorkOnGpuThread,
++                       scoped_refptr<GpuSlotSync>(this), std::move(sync_tokens),
++                       std::move(done_cb)));
++  }
++
++ private:
++  friend class base::DeleteHelper<GpuSlotSync>;
++  friend class base::RefCountedDeleteOnSequence<GpuSlotSync>;
++
++  struct AnglePendingFence {
++    VkFence fence = VK_NULL_HANDLE;
++    base::OnceClosure done_cb;
++  };
++
++  ~GpuSlotSync() {
++    fence_poll_timer_.Stop();
++    for (auto& entry : pending_angle_fences_) {
++      DestroyAngleVkFence(angle_vk_device_, pfn_angle_destroy_fence_,
++                          entry.fence);
++    }
++    pending_angle_fences_.clear();
++  }
++
++  void EnsureInitializedOnGpuThread() {
++    if (initialized_) {
++      return;
++    }
++    initialized_ = true;
++    gpu::CommandBufferStub* stub =
++        get_stub_cb_ ? get_stub_cb_.Run() : nullptr;
++    get_stub_cb_.Reset();
++    if (!stub || !stub->channel()) {
++      return;
++    }
++    cb_helper_ = CommandBufferHelper::Create(stub);
++    if (auto* mgr = stub->channel()->gpu_channel_manager()) {
++      gpu::ContextResult result = gpu::ContextResult::kTransientFailure;
++      auto shared_context = mgr->GetSharedContextState(&result);
++      if (result == gpu::ContextResult::kSuccess && shared_context) {
++        context_state_ = shared_context->GetWeakPtr();
++      }
++    }
++    const bool using_shared_skia_vk =
++        context_state_ && context_state_->GrContextIsVulkan() &&
++        context_state_->vk_context_provider() != nullptr;
++    if (!using_shared_skia_vk) {
++      angle_vk_ready_ = ResolveAngleVkFenceProcs(
++          &angle_vk_device_, &angle_vk_queue_, &angle_display_,
++          &pfn_angle_create_fence_, &pfn_angle_queue_submit_,
++          &pfn_angle_get_fence_status_, &pfn_angle_destroy_fence_);
++    }
++    static bool logged_sync = false;
++    if (!logged_sync) {
++      logged_sync = true;
++      VLOG(1) << "VulkanVideoDecoder: GPU fence slot sync active (vk="
++              << using_shared_skia_vk
++              << ", graphite="
++              << (context_state_ && context_state_->IsGraphiteDawn())
++              << ", angle_vk=" << angle_vk_ready_ << ")";
++    }
++  }
++
++  void RunAfterGpuWorkOnGpuThread(std::vector<gpu::SyncToken> sync_tokens,
++                                  base::OnceClosure done_cb) {
++    scoped_refptr<GpuSlotSync> keep_alive(this);
++    EnsureInitializedOnGpuThread();
++    std::vector<gpu::SyncToken> valid_tokens;
++    valid_tokens.reserve(sync_tokens.size());
++    for (const auto& token : sync_tokens) {
++      if (token.HasData()) {
++        valid_tokens.push_back(token);
++      }
++    }
++    if (!valid_tokens.empty() && cb_helper_ &&
++        cb_helper_->GetSharedImageStub()) {
++      struct FallbackToFence {
++        FallbackToFence(scoped_refptr<GpuSlotSync> sync_in,
++                        base::OnceClosure cb_in)
++            : sync(std::move(sync_in)), cb(std::move(cb_in)) {}
++        ~FallbackToFence() {
++          if (!cb) {
++            return;
++          }
++          if (sync && sync->gpu_task_runner_) {
++            sync->gpu_task_runner_->PostTask(
++                FROM_HERE,
++                base::BindOnce(&GpuSlotSync::WaitForHardwareFenceOnGpuThread,
++                               sync, std::move(cb)));
++            return;
++          }
++          std::move(cb).Run();
++        }
++        scoped_refptr<GpuSlotSync> sync;
++        base::OnceClosure cb;
++      };
++      auto fallback = std::make_unique<FallbackToFence>(
++          scoped_refptr<GpuSlotSync>(this), std::move(done_cb));
++      cb_helper_->WaitForSyncTokens(
++          std::move(valid_tokens),
++          base::BindOnce(
++              [](scoped_refptr<GpuSlotSync> sync,
++                 std::unique_ptr<FallbackToFence> fb) {
++                base::OnceClosure cb =
++                    fb ? std::move(fb->cb) : base::OnceClosure();
++                if (cb) {
++                  sync->WaitForHardwareFenceOnGpuThread(std::move(cb));
++                }
++              },
++              scoped_refptr<GpuSlotSync>(this), std::move(fallback)));
++      return;
++    }
++    WaitForHardwareFenceOnGpuThread(std::move(done_cb));
++  }
++
++  void WaitForAngleFenceOnGpuThread(base::OnceClosure done_cb) {
++    scoped_refptr<GpuSlotSync> keep_alive(this);
++    if (!done_cb) {
++      return;
++    }
++    if (angle_vk_ready_ && (!context_state_ || !context_state_->context_lost())) {
++      VkFence fence = SubmitAngleVkFence(
++          angle_vk_device_, angle_vk_queue_, angle_display_,
++          pfn_angle_create_fence_, pfn_angle_queue_submit_,
++          pfn_angle_destroy_fence_);
++      if (fence != VK_NULL_HANDLE) {
++        pending_angle_fences_.push_back(
++            AnglePendingFence{fence, std::move(done_cb)});
++        ScheduleFencePollOnGpuThread();
++        return;
++      }
++    }
++    std::move(done_cb).Run();
++  }
++
++  void WaitForHardwareFenceOnGpuThread(base::OnceClosure done_cb) {
++    scoped_refptr<GpuSlotSync> keep_alive(this);
++    if (!done_cb) {
++      return;
++    }
++    if (context_state_ && !context_state_->context_lost() &&
++        context_state_->GrContextIsVulkan() &&
++        context_state_->vk_context_provider()) {
++      auto* vk_queue = context_state_->vk_context_provider()->GetDeviceQueue();
++      auto* fence_helper = vk_queue ? vk_queue->GetFenceHelper() : nullptr;
++      if (!fence_helper) {
++        std::move(done_cb).Run();
++        return;
++      }
++      if (auto* gr = context_state_->gr_context(); gr && !gr->abandoned()) {
++        gr->flushAndSubmit(GrSyncCpu::kNo);
++      }
++      fence_helper->EnqueueCleanupTaskForSubmittedWork(base::BindOnce(
++          [](base::OnceClosure cb, gpu::VulkanDeviceQueue*, bool) {
++            if (cb) {
++              std::move(cb).Run();
++            }
++          },
++          std::move(done_cb)));
++      auto handle = fence_helper->GenerateCleanupFence();
++      if (handle.is_valid()) {
++        pending_vk_fences_.push_back(handle);
++        ScheduleFencePollOnGpuThread();
++      }
++      return;
++    }
++
++    if (context_state_ && !context_state_->context_lost() &&
++        context_state_->IsGraphiteDawn()) {
++      auto* gsc = context_state_->graphite_shared_context();
++      if (gsc && !gsc->IsContextLost() && !gsc->isDeviceLost()) {
++        context_state_->FlushGraphiteRecorder();
++        pending_graphite_fences_.fetch_add(1, std::memory_order_acq_rel);
++        auto* cb_ptr = new base::OnceClosure(base::BindOnce(
++            [](scoped_refptr<GpuSlotSync> sync, base::OnceClosure cb) {
++              sync->pending_graphite_fences_.fetch_sub(
++                  1, std::memory_order_acq_rel);
++              if (sync->gpu_task_runner_ &&
++                  !sync->gpu_task_runner_->BelongsToCurrentThread()) {
++                sync->gpu_task_runner_->PostTask(
++                    FROM_HERE,
++                    base::BindOnce(&GpuSlotSync::WaitForAngleFenceOnGpuThread,
++                                   sync, std::move(cb)));
++                return;
++              }
++              sync->WaitForAngleFenceOnGpuThread(std::move(cb));
++            },
++            scoped_refptr<GpuSlotSync>(this), std::move(done_cb)));
++        skgpu::graphite::SubmitInfo info;
++        info.fSync = skgpu::graphite::SyncToCpu::kNo;
++        info.fFinishedContext = cb_ptr;
++        info.fFinishedProc = [](void* ctx, skgpu::CallbackResult) {
++          auto cb = base::WrapUnique(static_cast<base::OnceClosure*>(ctx));
++          if (*cb) {
++            std::move(*cb).Run();
++          }
++        };
++        gsc->submit(info);
++        context_state_->ScheduleSkiaCleanup();
++        ScheduleFencePollOnGpuThread();
++        return;
++      }
++    }
++
++    WaitForAngleFenceOnGpuThread(std::move(done_cb));
++  }
++
++  void ScheduleFencePollOnGpuThread() {
++    if (fence_poll_timer_.IsRunning()) {
++      return;
++    }
++    if (!pending_vk_fences_.empty() || !pending_angle_fences_.empty() ||
++        pending_graphite_fences_.load(std::memory_order_acquire) > 0) {
++      fence_poll_timer_.Start(
++          FROM_HERE, base::Milliseconds(2),
++          base::BindRepeating(&GpuSlotSync::PollPendingFencesOnGpuThread,
++                              base::Unretained(this)));
++    }
++  }
++
++  void PollPendingFencesOnGpuThread() {
++    scoped_refptr<GpuSlotSync> keep_alive(this);
++    const bool context_lost = context_state_ && context_state_->context_lost();
++
++    if (!context_state_ || context_lost) {
++      pending_vk_fences_.clear();
++      pending_graphite_fences_.store(0, std::memory_order_release);
++    } else {
++      if (!pending_vk_fences_.empty()) {
++        auto* vk_provider = context_state_->vk_context_provider();
++        auto* vk_queue =
++            vk_provider ? vk_provider->GetDeviceQueue() : nullptr;
++        auto* fence_helper = vk_queue ? vk_queue->GetFenceHelper() : nullptr;
++        if (!fence_helper) {
++          pending_vk_fences_.clear();
++        } else {
++          fence_helper->ProcessCleanupTasks();
++          while (!pending_vk_fences_.empty() &&
++                 fence_helper->HasPassed(pending_vk_fences_.front())) {
++            pending_vk_fences_.pop_front();
++          }
++        }
++      }
++
++      if (pending_graphite_fences_.load(std::memory_order_acquire) > 0) {
++        auto* gsc = context_state_->graphite_shared_context();
++        if (gsc && !gsc->IsContextLost() && !gsc->isDeviceLost()) {
++          gsc->checkAsyncWorkCompletion();
++        } else {
++          pending_graphite_fences_.store(0, std::memory_order_release);
++        }
++      }
++    }
++
++    std::vector<base::OnceClosure> completed_angle_cbs;
++    if (context_lost) {
++      while (!pending_angle_fences_.empty()) {
++        DestroyAngleVkFence(angle_vk_device_, pfn_angle_destroy_fence_,
++                            pending_angle_fences_.front().fence);
++        if (pending_angle_fences_.front().done_cb) {
++          completed_angle_cbs.push_back(
++              std::move(pending_angle_fences_.front().done_cb));
++        }
++        pending_angle_fences_.pop_front();
++      }
++    } else {
++      while (!pending_angle_fences_.empty()) {
++        VkResult st = GetAngleVkFenceStatus(angle_vk_device_,
++                                            pfn_angle_get_fence_status_,
++                                            pending_angle_fences_.front().fence);
++        if (st == VK_NOT_READY) {
++          break;
++        }
++        DestroyAngleVkFence(angle_vk_device_, pfn_angle_destroy_fence_,
++                            pending_angle_fences_.front().fence);
++        if (pending_angle_fences_.front().done_cb) {
++          completed_angle_cbs.push_back(
++              std::move(pending_angle_fences_.front().done_cb));
++        }
++        pending_angle_fences_.pop_front();
++        if (st != VK_SUCCESS) {
++          while (!pending_angle_fences_.empty()) {
++            DestroyAngleVkFence(angle_vk_device_, pfn_angle_destroy_fence_,
++                                pending_angle_fences_.front().fence);
++            if (pending_angle_fences_.front().done_cb) {
++              completed_angle_cbs.push_back(
++                  std::move(pending_angle_fences_.front().done_cb));
++            }
++            pending_angle_fences_.pop_front();
++          }
++          break;
++        }
++      }
++    }
++
++    if (pending_vk_fences_.empty() && pending_angle_fences_.empty() &&
++        pending_graphite_fences_.load(std::memory_order_acquire) <= 0) {
++      fence_poll_timer_.Stop();
++    }
++
++    for (auto& cb : completed_angle_cbs) {
++      std::move(cb).Run();
++    }
++  }
++
++  scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner_;
++  VulkanVideoDecoder::GetCommandBufferStubCB get_stub_cb_;
++  bool initialized_ = false;
++  scoped_refptr<CommandBufferHelper> cb_helper_;
++  base::WeakPtr<gpu::SharedContextState> context_state_;
++  bool angle_vk_ready_ = false;
++  VkDevice angle_vk_device_ = VK_NULL_HANDLE;
++  VkQueue angle_vk_queue_ = VK_NULL_HANDLE;
++  void* angle_display_ = nullptr;
++  PFN_vkCreateFence pfn_angle_create_fence_ = nullptr;
++  PFN_vkQueueSubmit pfn_angle_queue_submit_ = nullptr;
++  PFN_vkGetFenceStatus pfn_angle_get_fence_status_ = nullptr;
++  PFN_vkDestroyFence pfn_angle_destroy_fence_ = nullptr;
++  base::circular_deque<gpu::VulkanFenceHelper::FenceHandle> pending_vk_fences_;
++  base::circular_deque<AnglePendingFence> pending_angle_fences_;
++  std::atomic<int> pending_graphite_fences_{0};
++  base::RepeatingTimer fence_poll_timer_;
++};
 +
 +namespace {
 +
@@ -1326,34 +1864,121 @@
 +  VkDeviceMemory mem = VK_NULL_HANDLE;
 +  base::UnguessableToken token;
 +  scoped_refptr<VideoFrameResource> origin_frame;
++  scoped_refptr<SlotSyncState> sync_state;
 +  bool in_use = false;
 +};
 +
-+struct VkSlotAllocation {
-+  AVBufferRef* dev_ctx_ref = nullptr;
-+  VkImage img = VK_NULL_HANDLE;
-+  VkDeviceMemory mem = VK_NULL_HANDLE;
-+  PFN_vkDestroyImage pfn_destroy_image = nullptr;
-+  PFN_vkFreeMemory pfn_free_memory = nullptr;
++NO_SANITIZE("cfi") __attribute__((noinline))
++void FreeVkSlotAllocation(AVBufferRef* dev_ctx_ref,
++                          VkImage img,
++                          VkDeviceMemory mem,
++                          PFN_vkDestroyImage pfn_destroy_image,
++                          PFN_vkFreeMemory pfn_free_memory) {
++  if (!dev_ctx_ref) {
++    return;
++  }
++  auto* dev_ctx = reinterpret_cast<AVHWDeviceContext*>(dev_ctx_ref->data);
++  auto* vk_dev =
++      dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx) : nullptr;
++  if (vk_dev && vk_dev->act_dev) {
++    if (img != VK_NULL_HANDLE && pfn_destroy_image) {
++      pfn_destroy_image(vk_dev->act_dev, img, nullptr);
++    }
++    if (mem != VK_NULL_HANDLE && pfn_free_memory) {
++      pfn_free_memory(vk_dev->act_dev, mem, nullptr);
++    }
++  }
++  av_buffer_unref(&dev_ctx_ref);
++}
++
++// Move-only RAII holder ensuring VkImage/VkDeviceMemory and AVBufferRef are
++// freed even if a pending sync/fence callback is dropped during shutdown.
++class VkSlotAllocation {
++ public:
++  VkSlotAllocation() = default;
++  VkSlotAllocation(AVBufferRef* dev_ctx_ref,
++                   VkImage img,
++                   VkDeviceMemory mem,
++                   PFN_vkDestroyImage pfn_destroy_image,
++                   PFN_vkFreeMemory pfn_free_memory)
++      : dev_ctx_ref_(dev_ctx_ref),
++        img_(img),
++        mem_(mem),
++        pfn_destroy_image_(pfn_destroy_image),
++        pfn_free_memory_(pfn_free_memory) {}
++
++  VkSlotAllocation(const VkSlotAllocation&) = delete;
++  VkSlotAllocation& operator=(const VkSlotAllocation&) = delete;
++
++  VkSlotAllocation(VkSlotAllocation&& other) noexcept
++      : dev_ctx_ref_(std::exchange(other.dev_ctx_ref_, nullptr)),
++        img_(std::exchange(other.img_, VK_NULL_HANDLE)),
++        mem_(std::exchange(other.mem_, VK_NULL_HANDLE)),
++        pfn_destroy_image_(std::exchange(other.pfn_destroy_image_, nullptr)),
++        pfn_free_memory_(std::exchange(other.pfn_free_memory_, nullptr)) {}
++
++  VkSlotAllocation& operator=(VkSlotAllocation&& other) noexcept {
++    if (this != &other) {
++      Reset();
++      dev_ctx_ref_ = std::exchange(other.dev_ctx_ref_, nullptr);
++      img_ = std::exchange(other.img_, VK_NULL_HANDLE);
++      mem_ = std::exchange(other.mem_, VK_NULL_HANDLE);
++      pfn_destroy_image_ = std::exchange(other.pfn_destroy_image_, nullptr);
++      pfn_free_memory_ = std::exchange(other.pfn_free_memory_, nullptr);
++    }
++    return *this;
++  }
++
++  ~VkSlotAllocation() { Reset(); }
++
++  void Reset() {
++    if (dev_ctx_ref_) {
++      AVBufferRef* ref = std::exchange(dev_ctx_ref_, nullptr);
++      VkImage img = std::exchange(img_, VK_NULL_HANDLE);
++      VkDeviceMemory mem = std::exchange(mem_, VK_NULL_HANDLE);
++      PFN_vkDestroyImage destroy_fn = std::exchange(pfn_destroy_image_, nullptr);
++      PFN_vkFreeMemory free_fn = std::exchange(pfn_free_memory_, nullptr);
++      FreeVkSlotAllocation(ref, img, mem, destroy_fn, free_fn);
++    }
++  }
++
++ private:
++  AVBufferRef* dev_ctx_ref_ = nullptr;
++  VkImage img_ = VK_NULL_HANDLE;
++  VkDeviceMemory mem_ = VK_NULL_HANDLE;
++  PFN_vkDestroyImage pfn_destroy_image_ = nullptr;
++  PFN_vkFreeMemory pfn_free_memory_ = nullptr;
 +};
 +
-+NO_SANITIZE("cfi") __attribute__((noinline))
-+void DestroyVkSlotAllocation(VkSlotAllocation alloc) {
-+  if (alloc.dev_ctx_ref) {
-+    auto* dev_ctx =
-+        reinterpret_cast<AVHWDeviceContext*>(alloc.dev_ctx_ref->data);
-+    auto* vk_dev =
-+        dev_ctx ? static_cast<AVVulkanDeviceContext*>(dev_ctx->hwctx) : nullptr;
-+    if (vk_dev && vk_dev->act_dev) {
-+      if (alloc.img != VK_NULL_HANDLE && alloc.pfn_destroy_image) {
-+        alloc.pfn_destroy_image(vk_dev->act_dev, alloc.img, nullptr);
-+      }
-+      if (alloc.mem != VK_NULL_HANDLE && alloc.pfn_free_memory) {
-+        alloc.pfn_free_memory(vk_dev->act_dev, alloc.mem, nullptr);
-+      }
-+    }
-+    av_buffer_unref(&alloc.dev_ctx_ref);
++void PostCleanupAfterGpuWork(scoped_refptr<GpuSlotSync> gpu_slot_sync,
++                             scoped_refptr<SlotSyncState> sync_state,
++                             bool for_backing_destruction,
++                             base::OnceClosure cleanup_cb) {
++  if (!cleanup_cb) {
++    return;
 +  }
++  const bool converted =
++      sync_state && (for_backing_destruction
++                         ? sync_state->WasEverConverted()
++                         : sync_state->WasCurrentEmitConverted());
++  if (!gpu_slot_sync || !converted) {
++    std::move(cleanup_cb).Run();
++    return;
++  }
++  auto run_sync = base::BindOnce(
++      [](scoped_refptr<GpuSlotSync> sync,
++         scoped_refptr<SlotSyncState> state,
++         base::OnceClosure cb) {
++        sync->RunAfterGpuWork(state->GetReleaseSyncTokens(), std::move(cb));
++      },
++      std::move(gpu_slot_sync), std::move(sync_state),
++      std::move(cleanup_cb));
++  if (base::SequencedTaskRunner::HasCurrentDefault()) {
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, std::move(run_sync));
++    return;
++  }
++  std::move(run_sync).Run();
 +}
 +
 +NO_SANITIZE("cfi") __attribute__((noinline))
@@ -1368,7 +1993,8 @@
 +    const gfx::Size& natural_size,
 +    const gfx::ColorSpace& color_space,
 +    const gfx::HDRMetadata& hdr_metadata,
-+    base::TimeDelta pts) {
++    base::TimeDelta pts,
++    scoped_refptr<GpuSlotSync> gpu_slot_sync) {
 +  if (!dev_ctx_ref || !vk_dev || !vk_dev->act_dev || !info.procs_ready ||
 +      w <= 0 || h <= 0) {
 +    return std::nullopt;
@@ -1576,16 +2202,20 @@
 +    return std::nullopt;
 +  }
 +
++  auto sync_state = base::MakeRefCounted<SlotSyncState>();
++  VkSlotAllocation alloc(dev_ref, dst_img, dst_mem, p.vkDestroyImage,
++                         p.vkFreeMemory);
 +  origin_frame->AddDestructionObserver(base::BindOnce(
-+      &DestroyVkSlotAllocation,
-+      VkSlotAllocation{dev_ref, dst_img, dst_mem, p.vkDestroyImage,
-+                       p.vkFreeMemory}));
++      &PostCleanupAfterGpuWork, std::move(gpu_slot_sync), sync_state,
++      /*for_backing_destruction=*/true,
++      base::BindOnce([](VkSlotAllocation a) { a.Reset(); }, std::move(alloc))));
 +
 +  OutputSlot slot;
 +  slot.img = dst_img;
 +  slot.mem = dst_mem;
 +  slot.token = token;
 +  slot.origin_frame = std::move(origin_frame);
++  slot.sync_state = std::move(sync_state);
 +  slot.in_use = false;
 +  return slot;
 +}
@@ -1850,18 +2480,22 @@
 +struct PendingGpuEmit {
 +  size_t cmd_idx = 0;
 +  scoped_refptr<FrameResource> resource;
++  scoped_refptr<SlotSyncState> sync_state;
 +  bool is_pooled = false;
 +};
 +
 +struct VulkanCopyState {
 +  std::array<DecodeCopyCmd, kDecodeCopyRingSize> cmds;
 +  size_t next_cmd = 0;
++  size_t next_slot_cursor = 0;
 +  base::circular_deque<PendingGpuEmit> pending_emits;
 +  gfx::Size pool_size;
 +  VideoPixelFormat pool_format = PIXEL_FORMAT_UNKNOWN;
 +  std::vector<OutputSlot> slots;
 +  std::map<base::UnguessableToken, scoped_refptr<VideoFrameResource>>
 +      origin_frames_by_token;
++  std::map<base::UnguessableToken, scoped_refptr<SlotSyncState>>
++      sync_states_by_token;
 +};
 +
 +// static
@@ -1967,9 +2601,13 @@
 +
 +VulkanVideoDecoder::VulkanVideoDecoder(
 +    std::unique_ptr<MediaLog> media_log,
-+    std::unique_ptr<FrameResourceConverter> frame_converter)
++    std::unique_ptr<FrameResourceConverter> frame_converter,
++    scoped_refptr<base::SingleThreadTaskRunner> gpu_task_runner,
++    GetCommandBufferStubCB get_stub_cb)
 +    : media_log_(std::move(media_log)),
-+      frame_converter_(std::move(frame_converter)) {}
++      frame_converter_(std::move(frame_converter)),
++      gpu_slot_sync_(GpuSlotSync::Create(std::move(gpu_task_runner),
++                                         std::move(get_stub_cb))) {}
 +
 +VulkanVideoDecoder::~VulkanVideoDecoder() {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
@@ -2134,6 +2772,8 @@
 +    waited_emits_ = 0;
 +  }
 +  DiscardPendingEmits();
++  current_unpooled_origin_ = nullptr;
++  current_unpooled_sync_state_.reset();
 +  codec_context_.reset();
 +  av_packet_free(&reusable_packet_);
 +  av_frame_free(&reusable_hw_frame_);
@@ -2296,6 +2936,7 @@
 +  }
 +
 +  scoped_refptr<FrameResource> res = std::move(front.resource);
++  scoped_refptr<SlotSyncState> sync_state = std::move(front.sync_state);
 +  const bool is_pooled = front.is_pooled;
 +  copy_state_->pending_emits.pop_front();
 +  cmd.in_flight = false;
@@ -2304,6 +2945,7 @@
 +    auto weak_self = weak_factory_.GetWeakPtr();
 +    if (!is_pooled) {
 +      current_unpooled_origin_ = res.get();
++      current_unpooled_sync_state_ = std::move(sync_state);
 +    }
 +    frame_converter_->ConvertFrame(std::move(res));
 +    if (!weak_self) {
@@ -2311,6 +2953,7 @@
 +    }
 +    if (!is_pooled) {
 +      current_unpooled_origin_ = nullptr;
++      current_unpooled_sync_state_.reset();
 +    }
 +  }
 +  return true;
@@ -2397,6 +3040,8 @@
 +    DrainPendingEmits(/*wait_all=*/true);
 +    copy_state_->slots.clear();
 +    copy_state_->origin_frames_by_token.clear();
++    copy_state_->sync_states_by_token.clear();
++    copy_state_->next_slot_cursor = 0;
 +    copy_state_->pool_size = coded_size;
 +    copy_state_->pool_format = pixel_format;
 +  }
@@ -2418,10 +3063,16 @@
 +  }
 +
 +  OutputSlot* chosen = nullptr;
-+  for (auto& slot : copy_state_->slots) {
-+    if (!slot.in_use) {
-+      chosen = &slot;
-+      break;
++  if (!copy_state_->slots.empty()) {
++    const size_t count = copy_state_->slots.size();
++    const size_t start = copy_state_->next_slot_cursor % count;
++    for (size_t offset = 0; offset < count; ++offset) {
++      const size_t idx = (start + offset) % count;
++      if (!copy_state_->slots[idx].in_use) {
++        chosen = &copy_state_->slots[idx];
++        copy_state_->next_slot_cursor = (idx + 1) % count;
++        break;
++      }
 +    }
 +  }
 +
@@ -2429,14 +3080,17 @@
 +  if (!chosen && copy_state_->slots.size() < max_pool_size) {
 +    auto new_slot = CreateDmabufSlot(
 +        hw_device_ctx_, vk_dev, *copy_info, w, h, pixel_format, visible_rect,
-+        natural_size, color_space, config_.hdr_metadata(), pts);
++        natural_size, color_space, config_.hdr_metadata(), pts, gpu_slot_sync_);
 +    if (!new_slot) {
 +      return false;
 +    }
 +    copy_state_->origin_frames_by_token.emplace(new_slot->token,
 +                                                new_slot->origin_frame);
++    copy_state_->sync_states_by_token.emplace(new_slot->token,
++                                              new_slot->sync_state);
 +    copy_state_->slots.push_back(std::move(*new_slot));
 +    chosen = &copy_state_->slots.back();
++    copy_state_->next_slot_cursor = 0;
 +    if (pending_pool_vram_bytes_ > 0) {
 +      const uint64_t delta =
 +          std::min(pending_pool_vram_bytes_, est_frame_vram_bytes_);
@@ -2446,6 +3100,7 @@
 +  }
 +
 +  scoped_refptr<FrameResource> resource;
++  scoped_refptr<SlotSyncState> emit_sync_state;
 +  bool is_pooled = false;
 +  if (chosen) {
 +    if (!SubmitCopyVkFrameToVkImage(vk_dev, *copy_info, cmd.cmd_pool,
@@ -2462,18 +3117,23 @@
 +    wrapped->set_color_space(color_space);
 +    wrapped->set_hdr_metadata(config_.hdr_metadata());
 +    wrapped->metadata().power_efficient = true;
++    chosen->sync_state->ResetForReuse();
 +    chosen->in_use = true;
-+    wrapped->AddDestructionObserver(base::BindPostTaskToCurrentDefault(
++    base::OnceClosure release_cb = base::BindPostTaskToCurrentDefault(
 +        base::BindOnce(&VulkanVideoDecoder::ReleaseOutputSlot,
-+                       weak_factory_.GetWeakPtr(), chosen->token)));
++                       weak_factory_.GetWeakPtr(), chosen->token));
++    wrapped->AddDestructionObserver(base::BindOnce(
++        &PostCleanupAfterGpuWork, gpu_slot_sync_, chosen->sync_state,
++        /*for_backing_destruction=*/false, std::move(release_cb)));
 +    resource = std::move(wrapped);
++    emit_sync_state = chosen->sync_state;
 +    is_pooled = true;
 +  } else {
 +    // All pooled slots are currently held downstream; emit a one-shot unpooled
 +    // buffer whose GPU backing is freed as soon as the frame is released.
 +    auto temp_slot = CreateDmabufSlot(
 +        hw_device_ctx_, vk_dev, *copy_info, w, h, pixel_format, visible_rect,
-+        natural_size, color_space, config_.hdr_metadata(), pts);
++        natural_size, color_space, config_.hdr_metadata(), pts, gpu_slot_sync_);
 +    if (!temp_slot) {
 +      return false;
 +    }
@@ -2483,13 +3143,14 @@
 +      return false;
 +    }
 +    resource = temp_slot->origin_frame;
++    emit_sync_state = temp_slot->sync_state;
 +    is_pooled = false;
 +  }
 +
 +  cmd.in_flight = true;
 +  copy_state_->next_cmd = (cmd_idx + 1) % kDecodeCopyRingSize;
-+  copy_state_->pending_emits.push_back(
-+      PendingGpuEmit{cmd_idx, std::move(resource), is_pooled});
++  copy_state_->pending_emits.push_back(PendingGpuEmit{
++      cmd_idx, std::move(resource), std::move(emit_sync_state), is_pooled});
 +  if (!logged_async_copy_) {
 +    logged_async_copy_ = true;
 +    VLOG(1) << "VulkanVideoDecoder: async pipelined GPU copy active (ring=6)";
@@ -2626,18 +3287,28 @@
 +                    base::UnguessableToken::Create();
 +                video_frame->set_color_space(color_space);
 +                video_frame->set_hdr_metadata(config_.hdr_metadata());
-+                video_frame->AddDestructionObserver(base::BindOnce(
-+                    [](AVFrame* frame) { av_frame_free(&frame); }, drm_frame));
++                auto drm_sync_state = base::MakeRefCounted<SlotSyncState>();
++                std::unique_ptr<AVFrame, ScopedPtrAVFreeFrame> owned_drm_frame(
++                    drm_frame);
 +                drm_frame = nullptr;
++                video_frame->AddDestructionObserver(base::BindOnce(
++                    &PostCleanupAfterGpuWork, gpu_slot_sync_, drm_sync_state,
++                    /*for_backing_destruction=*/true,
++                    base::BindOnce(
++                        [](std::unique_ptr<AVFrame, ScopedPtrAVFreeFrame>
++                               frame) { frame.reset(); },
++                        std::move(owned_drm_frame))));
 +                auto resource =
 +                    VideoFrameResource::Create(std::move(video_frame));
 +                if (resource) {
 +                  DrainPendingEmits(/*wait_all=*/true);
 +                  auto weak_self = weak_factory_.GetWeakPtr();
 +                  current_unpooled_origin_ = resource.get();
++                  current_unpooled_sync_state_ = std::move(drm_sync_state);
 +                  frame_converter_->ConvertFrame(std::move(resource));
 +                  if (weak_self) {
 +                    current_unpooled_origin_ = nullptr;
++                    current_unpooled_sync_state_.reset();
 +                  }
 +                  return true;
 +                }
@@ -2716,6 +3387,38 @@
 +
 +void VulkanVideoDecoder::OnFrameConverted(scoped_refptr<VideoFrame> frame) {
 +  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
++  if (frame && frame->HasSharedImage() && !frame->HasReleaseMailboxCB()) {
++    scoped_refptr<SlotSyncState> sync_state;
++    if (copy_state_ && frame->metadata().tracking_token.has_value()) {
++      auto it = copy_state_->sync_states_by_token.find(
++          *frame->metadata().tracking_token);
++      if (it != copy_state_->sync_states_by_token.end()) {
++        sync_state = it->second;
++      }
++    }
++    if (!sync_state) {
++      sync_state = current_unpooled_sync_state_;
++    }
++    if (sync_state) {
++      sync_state->MarkConverted();
++      VideoFrame::ReleaseMailboxCB release_cb = base::BindOnce(
++          [](scoped_refptr<gpu::ClientSharedImage> shared_image,
++             scoped_refptr<SlotSyncState> state,
++             const gpu::SyncToken& sync_token) {
++            if (shared_image) {
++              if (sync_token.HasData()) {
++                shared_image->UpdateDestructionSyncToken(sync_token);
++              }
++              state->SetReleaseSyncTokens(
++                  shared_image->GetSyncTokensForVideoFrame(sync_token));
++            } else if (sync_token.HasData()) {
++              state->SetReleaseSyncTokens({sync_token});
++            }
++          },
++          frame->shared_image(), std::move(sync_state));
++      frame->SetReleaseMailboxCB(std::move(release_cb));
++    }
++  }
 +  if (frame && output_cb_) {
 +    output_cb_.Run(std::move(frame));
 +  }
@@ -2730,12 +3433,17 @@
 +  for (auto it = copy_state_->slots.begin(); it != copy_state_->slots.end();) {
 +    if (!it->in_use) {
 +      copy_state_->origin_frames_by_token.erase(it->token);
++      copy_state_->sync_states_by_token.erase(it->token);
 +      it = copy_state_->slots.erase(it);
 +      ++reclaimed;
 +    } else {
 +      ++it;
 +    }
 +  }
++  copy_state_->next_slot_cursor =
++      copy_state_->slots.empty()
++          ? 0
++          : (copy_state_->next_slot_cursor % copy_state_->slots.size());
 +  if (reclaimed > 0) {
 +    VLOG(1) << "VulkanVideoDecoder: reclaimed " << reclaimed
 +            << " idle output slot(s) on Reset (remaining="
@@ -2761,7 +3469,7 @@
 +}  // namespace media
 --- a/media/gpu/BUILD.gn
 +++ b/media/gpu/BUILD.gn
-@@ -179,6 +179,20 @@
+@@ -179,6 +179,22 @@
      }
    }
  
@@ -2776,6 +3484,8 @@
 +      "//third_party/ffmpeg",
 +      "//third_party/libyuv",
 +      "//third_party/vulkan-headers/src:vulkan_headers",
++      "//gpu/vulkan",
++      "//skia",
 +    ]
 +  }
 +
@@ -2794,7 +3504,7 @@
  
  namespace media {
  
-@@ -167,6 +170,15 @@
+@@ -167,6 +170,16 @@
   protected:
    std::unique_ptr<VideoDecoder> CreatePlatformVideoDecoder(
        VideoDecoderTraits& traits) final {
@@ -2803,14 +3513,15 @@
 +      return std::make_unique<VulkanVideoDecoder>(
 +          traits.media_log->Clone(),
 +          MailboxVideoFrameConverter::Create(
-+              gpu_task_runner_, traits.get_command_buffer_stub_cb));
++              gpu_task_runner_, traits.get_command_buffer_stub_cb),
++          gpu_task_runner_, traits.get_command_buffer_stub_cb);
 +    }
 +#endif
 +
      const auto decoder_type =
          GetActualPlatformDecoderImplementation(gpu_preferences_, gpu_info_);
      // The browser process guarantees this CHECK.
-@@ -204,6 +216,12 @@
+@@ -204,6 +217,12 @@
        mojo::PendingRemote<mojom::VideoDecoder> oop_video_decoder,
        base::OnceCallback<void(mojo::PendingRemote<mojom::VideoDecoder>)> cb)
        final {
@@ -2823,7 +3534,7 @@
      switch (
          GetActualPlatformDecoderImplementation(gpu_preferences_, gpu_info_)) {
        case VideoDecoderType::kOutOfProcess:
-@@ -219,6 +237,11 @@
+@@ -219,6 +238,11 @@
  
    std::optional<SupportedVideoDecoderConfigs>
    GetPlatformSupportedVideoDecoderConfigs() final {
@@ -2835,7 +3546,7 @@
      VideoDecoderType decoder_implementation =
          GetActualPlatformDecoderImplementation(gpu_preferences_, gpu_info_);
      base::UmaHistogramEnumeration("Media.VaapiLinux.SupportedVideoDecoder",
-@@ -235,6 +258,11 @@
+@@ -235,6 +259,11 @@
    }
  
    VideoDecoderType GetPlatformDecoderImplementationType() final {

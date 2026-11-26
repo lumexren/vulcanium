@@ -1,0 +1,113 @@
+--- a/gpu/command_buffer/client/gles2_implementation.cc
++++ b/gpu/command_buffer/client/gles2_implementation.cc
+@@ -189,6 +189,19 @@
+ 
+ bool CanCopySharedImageToGLTextureViaTextureCopy(
+     ClientSharedImage* shared_image) {
++#if BUILDFLAG(IS_LINUX)
++  // On Linux with Vulkan/ANGLE-Vulkan (AngleVulkanImageBacking) and Skia
++  // Graphite, multi-planar DMA-BUF video SharedImages cannot be imported
++  // directly into GLES2 (AngleVulkanImageBacking rejects PrefersExternalSampler
++  // in InitializePassthroughTexture, and per-plane non-linear import drops DRM
++  // modifiers). Return false so WebGL falls back to
++  // CopyVideoFrameTexturesToGLTextureViaIntermediateSI (GPU-to-GPU YUV->RGBA
++  // via Skia GaneshVulkan or GraphiteDawnVulkan into a cached single-plane
++  // RGBA SharedImage).
++  if (shared_image && shared_image->format().is_multi_plane()) {
++    return false;
++  }
++#endif
+   const bool si_format_has_single_texture =
+       shared_image->format().is_single_plane() ||
+       shared_image->format().PrefersExternalSampler();
+@@ -203,7 +216,7 @@
+ }
+ 
+ bool CanCopySharedImageToGLTextureViaSkia(bool is_opaque,
+-                                          uint32_t shared_image_target,
++                                          ClientSharedImage* shared_image,
+                                           uint32_t dst_target,
+                                           uint32_t dst_internal_format,
+                                           uint32_t dst_type,
+@@ -217,7 +230,13 @@
+ #if BUILDFLAG(IS_ANDROID)
+   return false;
+ #else
+-  bool si_usable_by_gles2_interface = shared_image_target != 0;
++#if BUILDFLAG(IS_LINUX)
++  if (shared_image && shared_image->format().is_multi_plane()) {
++    return false;
++  }
++#endif
++  bool si_usable_by_gles2_interface =
++      shared_image && shared_image->GetTextureTarget() != 0;
+   // Since skia always produces premultiply alpha outputs, trying direct
+   // uploading path when the source is opaque or premultiply alpha been
+   // requested.
+@@ -452,8 +471,8 @@
+     SkAlphaType dst_alpha_type) {
+   return CanCopySharedImageToGLTextureViaTextureCopy(shared_image) ||
+          CanCopySharedImageToGLTextureViaSkia(
+-             is_opaque, shared_image->GetTextureTarget(), dst_target,
+-             dst_internal_format, dst_type, dst_level, dst_alpha_type);
++             is_opaque, shared_image, dst_target, dst_internal_format, dst_type,
++             dst_level, dst_alpha_type);
+ }
+ 
+ CopySharedImageSyncCallback
+@@ -525,8 +544,8 @@
+     ShallowFlushCHROMIUM();
+   } else {
+     CHECK(CanCopySharedImageToGLTextureViaSkia(
+-        is_opaque, source_shared_image->GetTextureTarget(), dst_target,
+-        dst_internal_format, dst_type, dst_level, dst_alpha_type));
++        is_opaque, source_shared_image, dst_target, dst_internal_format,
++        dst_type, dst_level, dst_alpha_type));
+     // Do a service-side copy from the SharedImage to the destination texture
+     // via Skia wrapping the destination texture in an SkSurface. Note that
+     // this relies on the service-side GL implementation using a Ganesh/GL
+--- a/gpu/command_buffer/service/shared_image/ozone_image_backing.cc
++++ b/gpu/command_buffer/service/shared_image/ozone_image_backing.cc
+@@ -416,14 +416,19 @@
+   const auto usage = si_info.usage;
+   bool used_by_skia = usage.HasAny(SHARED_IMAGE_USAGE_RASTER_READ |
+                                    SHARED_IMAGE_USAGE_RASTER_WRITE |
+-                                   SHARED_IMAGE_USAGE_DISPLAY_READ);
++                                   SHARED_IMAGE_USAGE_DISPLAY_READ |
++                                   SHARED_IMAGE_USAGE_DISPLAY_WRITE);
+   bool used_by_gl =
+       (HasGLES2ReadOrWriteUsage(usage)) ||
+-      (used_by_skia && context_state_->gr_context_type() == GrContextType::kGL);
+-  bool used_by_vulkan = used_by_skia && context_state_->gr_context_type() ==
+-                                            GrContextType::kVulkan;
+-  bool used_by_webgpu = usage.HasAny(SHARED_IMAGE_USAGE_WEBGPU_READ |
+-                                     SHARED_IMAGE_USAGE_WEBGPU_WRITE);
++      (used_by_skia && context_state_ &&
++       context_state_->gr_context_type() == GrContextType::kGL);
++  bool used_by_vulkan =
++      used_by_skia && context_state_ &&
++      context_state_->gr_context_type() == GrContextType::kVulkan;
++  bool used_by_webgpu =
++      usage.HasAny(SHARED_IMAGE_USAGE_WEBGPU_READ |
++                   SHARED_IMAGE_USAGE_WEBGPU_WRITE) ||
++      (used_by_skia && context_state_ && context_state_->IsGraphiteDawn());
+   write_streams_count_ = 0;
+   if (used_by_gl) {
+     write_streams_count_++;  // gl can write
+--- a/ui/ozone/common/native_pixmap_egl_binding.cc
++++ b/ui/ozone/common/native_pixmap_egl_binding.cc
+@@ -243,6 +243,14 @@
+     attrs.push_back(EGL_NONE);
+   } else {
+     size_t pixmap_plane = plane_index_.value();
++    uint64_t modifier = pixmap->GetFormatModifier();
++    if (modifier != gfx::NativePixmapHandle::kNoModifier && modifier != 0) {
++      LOG(ERROR) << "Refusing per-plane EGL DMA-BUF import for non-linear "
++                    "modifier=0x"
++                 << std::hex << modifier << std::dec
++                 << " plane=" << pixmap_plane;
++      return false;
++    }
+ 
+     attrs.push_back(EGL_DMA_BUF_PLANE0_FD_EXT);
+     attrs.push_back(pixmap->GetDmaBufFd(pixmap_plane));

@@ -12,6 +12,7 @@ vulkan/0003-vulkan-image-no-export-on-dmabuf-import.patch
 vulkan/0004-vulkan-ycbcr-dmabuf-import.patch
 vulkan/0005-gpu-disable-rgb-to-yuv-nvidia-vulkan.patch
 vulkan/0006-viz-skia-graphite-wayland-dmabuf.patch
+vulkan/0007-linux-multiplanar-dmabuf-webgl-fix.patch
 
 # Wayland / Ozone
 wayland/0001-ozone-wayland-vulkan-enable.patch
